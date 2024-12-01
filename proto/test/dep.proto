@@ -1,0 +1,10 @@
+syntax = "proto3";
+
+package test;
+
+import "test/test.proto";
+
+message DependencyMessage {
+    bool is_active = 1;
+    TestMessage test_message = 2;
+}

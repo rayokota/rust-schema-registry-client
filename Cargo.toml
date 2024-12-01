@@ -12,12 +12,74 @@ categories = ["encoding", "parsing"]
 license = "Apache-2.0"
 edition = "2021"
 
+[features]
+rules = ["rules-cel", "rules-encryption-awskms", "rules-encryption-azurekms", "rules-encryption-gcpkms", "rules-encryption-hcvault", "rules-jsonata"]
+rules-cel = ["dep:cel-interpreter", "dep:email_address", "dep:fluent-uri", "dep:hostname-validator"]
+rules-encryption-awskms = ["dep:aws-config", "dep:aws-credential-types", "dep:aws-sdk-kms", "dep:hex", "rules-encryption-tink"]
+rules-encryption-azurekms = ["dep:azure_core", "dep:azure_identity", "dep:azure_security_keyvault", "rules-encryption-tink"]
+rules-encryption-gcpkms = ["dep:google-cloud-auth", "dep:google-cloud-kms-v1", "dep:google-cloud-gax", "rules-encryption-tink"]
+rules-encryption-hcvault = ["dep:vaultrs", "rules-encryption-tink"]
+rules-encryption-localkms = ["rules-encryption-tink"]
+rules-encryption-tink = ["dep:tink-aead", "dep:tink-daead", "dep:tink-proto"]
+rules-jsonata = ["dep:bumpalo", "dep:jsonata-rs"]
+
 [dependencies]
-serde = { version = "^1.0", features = ["derive"] }
-serde_json = "^1.0"
-serde_repr = "^0.1"
-url = "^2.5"
-uuid = { version = "^1.8", features = ["serde", "v4"] }
-reqwest = { version = "^0.12", features = ["json", "multipart"] }
-fastrand = "2.2.0"
-tokio = "1.41.1"
+apache-avro = "0.18.0"
+async-recursion = "1.1.1"
+async-trait = "0.1.83"
+aws-config = { version="1.5.15", features = ["behavior-version-latest"], optional = true }
+aws-credential-types = { version = "1.2.1", features = ["hardcoded-credentials"], optional = true }
+aws-sdk-kms = { version="1.58.0", features = ["behavior-version-latest"], optional = true }
+azure_core = { version = "0.21.0", optional = true }
+azure_identity = { version = "0.21.0", optional = true }
+azure_security_keyvault = { version = "0.21.0", optional = true }
+base64 = "0.22.1"
+bumpalo = { version = "3.9.1", optional = true }
+byteorder = "1.5.0"
+bytes = "1"
+cel-interpreter = { version ="0.9.0", optional = true }
+dashmap = "6.1.0"
+email_address = { version = "0.2.9", optional = true }
+fastrand = "2.3.0"
+fluent-uri = { version = "0.3.2", optional = true }
+futures = "0.3.31"
+google-cloud-auth = { version = "0.18.0", optional = true }
+google-cloud-kms-v1 = { version = "0.1.0", optional = true }
+google-cloud-gax = { version = "0.20.0", optional = true }
+hex = { version = "0.4.3", optional = true }
+hostname-validator = { version ="1.1.1", optional = true }
+integer-encoding = "4.0.2"
+jsonata-rs = { version = "0.3.4", optional = true }
+jsonschema = "0.29.0"
+lazy_static = "1.5.0"
+log = "0.4.8"
+mini-moka = "0.10.3"
+prost = "0.13.5"
+prost-reflect = { version = "0.14.7", features = ["derive", "serde"] }
+prost-types = "0.13.5"
+referencing = "0.29.0"
+regex = "1.11.1"
+reqwest = { version = "0.12", features = ["json", "multipart"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+tink-aead = { version = "0.3.0", optional = true }
+tink-core = "0.3.0"
+tink-daead = { version = "0.3.0", optional = true }
+tink-proto = { version = "0.3.0", optional = true }
+tokio = { version = "1.42", features = ["rt-multi-thread"] }
+trait-variant = "0.1.2"
+url = "2.5"
+uuid = { version = "1.8", features = ["serde", "v4"] }
+vaultrs = { version = "0.7.3", optional = true }
+
+[dev-dependencies]
+chrono = "0.4.0"
+clap = "2.18.0"
+env_logger = "0.9.0"
+rdkafka = "0.37.0"
+tokio = { version = "1.42.0", features = ["macros"] }
+
+[build-dependencies]
+prost-build = "0.13.4"
+prost-reflect-build = "0.14.0"

@@ -1,35 +1,32 @@
-use reqwest::StatusCode;
 use crate::rest::client_config;
+use reqwest::StatusCode;
 use std::time::Duration;
 
-#[derive(Debug, Clone)]
-pub struct RestService {
+#[derive(Clone, Debug)]
+pub(crate) struct RestService {
     config: client_config::ClientConfig,
 }
 
 impl RestService {
     pub fn new(config: client_config::ClientConfig) -> Self {
-        RestService {
-            config: config,
-        }
+        RestService { config }
     }
 
-    pub fn get_config(&self) -> &client_config::ClientConfig {
+    pub fn config(&self) -> &client_config::ClientConfig {
         &self.config
     }
 
-    pub async fn list_subjects(&self) -> Result<reqwest::Response, reqwest::Error> {
-        let client = &self.config.client;
-        let url = "/subjects";
-        self.send_request_urls(&url, reqwest::Method::GET, None)
-    }
-
-    async fn send_request_urls(&self, url: &str, method: reqwest::Method, body: Option<String>)
-        -> Result<reqwest::Response, reqwest::Error> {
-        let base_urls  = &self.config.base_urls;
-        for (i, base_url) in base_urls.enumerate() {
+    pub async fn send_request_urls(
+        &self,
+        url: &str,
+        method: reqwest::Method,
+        query: Option<&[(String, String)]>,
+        body: Option<&str>,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let base_urls = &self.config.base_urls;
+        for (i, base_url) in base_urls.iter().enumerate() {
             let new_url = format!("{}/{}", base_url, url);
-            match self.try_send_request(new_url, method.clone(), body.clone()).await {
+            match self.try_send_request(&new_url, &method, query, body).await {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     if !is_retriable(&e) || i == base_urls.len() - 1 {
@@ -38,13 +35,19 @@ impl RestService {
                 }
             }
         }
+        unreachable!()
     }
 
-    async fn try_send_request(&self, url: &str, method: reqwest::Method, body: Option<String>)
-        -> Result<reqwest::Response, reqwest::Error> {
+    async fn try_send_request(
+        &self,
+        url: &str,
+        method: &reqwest::Method,
+        query: Option<&[(String, String)]>,
+        body: Option<&str>,
+    ) -> Result<reqwest::Response, reqwest::Error> {
         let mut retries = 0;
         loop {
-            match self.send_request(url, method.clone(), body.clone()).await {
+            match self.send_request(url, method, query, body).await {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     if !is_retriable(&e) || retries >= self.config.max_retries {
@@ -63,22 +66,32 @@ impl RestService {
         }
     }
 
-    async fn send_request(&self, url: &str, method: reqwest::Method, body: Option<String>)
-        -> Result<reqwest::Response, reqwest::Error> {
+    async fn send_request(
+        &self,
+        url: &str,
+        method: &reqwest::Method,
+        query: Option<&[(String, String)]>,
+        body: Option<&str>,
+    ) -> Result<reqwest::Response, reqwest::Error> {
         let client = &self.config.client;
-        let request = client.request(method, url);
-        let request = match body {
-            Some(body) => request.body(body),
-            None => request,
-        };
-        request.send()
+        let mut request = client.request(method.clone(), url);
+        if let Some(query) = query {
+            if !query.is_empty() {
+                request = request.query(query);
+            }
+        }
+        if let Some(body) = body {
+            request = request.body(body.to_string());
+        }
+        request.send().await
     }
 }
 
 fn calculate_exponential_backoff(
     initial_backoff: u32,
     retry_attempts: u32,
-    max_backoff: Duration) -> Duration {
+    max_backoff: Duration,
+) -> Duration {
     let result = match 2_u32
         .checked_pow(retry_attempts)
         .map(|power| power * initial_backoff)
@@ -95,12 +108,14 @@ fn calculate_exponential_backoff(
 
 fn is_retriable(e: &reqwest::Error) -> bool {
     match e.status() {
-        Some(status) => status == StatusCode::REQUEST_TIMEOUT
-            || status == StatusCode::TOO_MANY_REQUESTS
-            || status == StatusCode::INTERNAL_SERVER_ERROR
-            || status == StatusCode::BAD_GATEWAY
-            || status == StatusCode::SERVICE_UNAVAILABLE
-            || status == StatusCode::GATEWAY_TIMEOUT,
+        Some(status) => {
+            status == StatusCode::REQUEST_TIMEOUT
+                || status == StatusCode::TOO_MANY_REQUESTS
+                || status == StatusCode::INTERNAL_SERVER_ERROR
+                || status == StatusCode::BAD_GATEWAY
+                || status == StatusCode::SERVICE_UNAVAILABLE
+                || status == StatusCode::GATEWAY_TIMEOUT
+        }
         None => true,
     }
 }
