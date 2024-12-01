@@ -855,10 +855,12 @@ dependencies = [
 name = "schema-registry-client"
 version = "0.1.0"
 dependencies = [
+ "fastrand",
  "reqwest",
  "serde",
  "serde_json",
  "serde_repr",
+ "tokio",
  "url",
  "uuid",
 ]

@@ -19,3 +19,5 @@ serde_repr = "^0.1"
 url = "^2.5"
 uuid = { version = "^1.8", features = ["serde", "v4"] }
 reqwest = { version = "^0.12", features = ["json", "multipart"] }
+fastrand = "2.2.0"
+tokio = "1.41.1"
