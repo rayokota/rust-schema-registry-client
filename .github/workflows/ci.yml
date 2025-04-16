@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ master ]
 
+env:
+  PROTOC_VERSION: '3.25.3'
+
 jobs:
   ci:
     runs-on: ubuntu-latest
@@ -13,6 +16,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: sudo apt-get install -y protobuf-compiler
 
       - name: Rust Toolchain
         uses: dtolnay/rust-toolchain@nightly
@@ -23,7 +29,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Rust Build
-        run: cargo build --all-features --all-targets
+        run: export PROTOC=/usr/bin/protoc && cargo build --all-features --all-targets
 
       - name: Rust Test
         run: RUST_BACKTRACE=1 cargo test --all-features
