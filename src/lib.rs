@@ -1,28 +1,28 @@
 //!A fully asynchronous Rust client library for interacting with the
 //![Confluent Schema Registry](https://github.com/confluentinc/schema-registry).
 //!
-//!## The library
+//!# The library
 //!
 //!`rust-schema-registry-client` provides a Schema Registry client, along with serdes (serializers/deserializers) for
 //!Avro, Protobuf, and JSON Schema.
 //!
 //!
-//!### Features
+//!## Features
 //!
 //!- Support for Avro, Protobuf, and JSON Schema formats
-//!- Specify data quality rules using Google Common Expression Language (CEL) expressions
-//!- Specify schema migration rules using JSONata expressions
-//!- Enforce client-side field-level encryption (CSFLE) rules using AWS KMS, Azure Key Vault, Google Cloud KMS, or HashiCorp Vault
+//!- Data quality rules using Google Common Expression Language (CEL) expressions
+//!- Schema migration rules using JSONata expressions
+//!- Client-side field-level encryption (CSFLE) rules using AWS KMS, Azure Key Vault, Google Cloud KMS, or HashiCorp Vault
 //!
 //!This library can be used with [rust-rdkafka](https://github.com/fede1024/rust-rdkafka) but does not depend on it.
 //!
-//!### Serdes
+//!## Serdes
 //!
 //!- [`AvroSerializer`] and [`AvroDeserializer`] - serdes that use `apache-avro`
 //!- [`ProtobufSerializer`] and [`ProtobufDeserializer`] - serdes that use `prost` and `prost-reflect`
 //!- [`JsonSerializer`] and [`JsonDeserializer`] - serdes that use `jsonschema`
 //!
-//!## Installation
+//!# Installation
 //!
 //!Add this to your `Cargo.toml`:
 //!
@@ -49,7 +49,7 @@
 //!schema-registry-client = { version = "0.1", features = ["rules", "rules-encryption-awskms"] }
 //!```
 //!
-//!## Examples
+//!# Examples
 //!
 //!You can find examples in the [`examples`] folder. To run them:
 //!

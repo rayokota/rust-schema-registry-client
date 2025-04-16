@@ -25,6 +25,11 @@ jobs:
         with:
           components: rustfmt
 
+      - name: Run cargo-rdme
+        run: |
+          cargo install cargo-rdme
+          cargo rdme --check
+
       - name: Rust Format
         run: cargo fmt --all -- --check
 

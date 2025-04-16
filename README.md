@@ -8,7 +8,7 @@
 <!-- cargo-rdme start -->
 
 A fully asynchronous Rust client library for interacting with the
-[Confluent Schema Registry](https://github.com/confluentinc/schema-registry).  
+[Confluent Schema Registry](https://github.com/confluentinc/schema-registry).
 
 ## The library
 
@@ -18,7 +18,7 @@ Avro, Protobuf, and JSON Schema.
 
 ### Features
 
-- Support for Avro, Protobuf, and JSON Schema
+- Support for Avro, Protobuf, and JSON Schema formats
 - Data quality rules using Google Common Expression Language (CEL) expressions
 - Schema migration rules using JSONata expressions
 - Client-side field-level encryption (CSFLE) rules using AWS KMS, Azure Key Vault, Google Cloud KMS, or HashiCorp Vault
