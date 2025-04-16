@@ -29,7 +29,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Rust Build
-        run: export PROTOC=/usr/bin/protoc && cargo build --all-features --all-targets
+        run: export PROTOC=/usr/bin/protoc && cargo build --all-features
 
       - name: Rust Test
         run: RUST_BACKTRACE=1 cargo test --all-features
