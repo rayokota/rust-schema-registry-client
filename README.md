@@ -5,6 +5,8 @@
 [![docs.rs](https://docs.rs/schema-registry-client/badge.svg)](https://docs.rs/schema-registry-client/)
 [![Build Status](https://github.com/rayokota/rust-schema-registry-client/actions/workflows/ci.yml/badge.svg)](https://github.com/rayokota/rust-schema-registry-client/actions/workflows/ci.yml)
 
+<!-- cargo-rdme start -->
+
 A fully asynchronous Rust client library for interacting with the
 [Confluent Schema Registry](https://github.com/confluentinc/schema-registry).  
 
@@ -26,8 +28,8 @@ This library can be used with [rust-rdkafka](https://github.com/fede1024/rust-rd
 ### Serdes
 
 - [`AvroSerializer`] and [`AvroDeserializer`] - serdes that use `apache-avro`
-- [`ProtobufSerializer`] and [`ProtobufDeserializer`] - serdes that use `prost` and `prost-reflect`. In particular, the Protobuf objects must implement the `ReflectMessage` trait.
-- [`JsonSchemaSerializer`] and [`JsonSchemaDeserializer`] - serdes that use `jsonschema`
+- [`ProtobufSerializer`] and [`ProtobufDeserializer`] - serdes that use `prost` and `prost-reflect`
+- [`JsonSerializer`] and [`JsonDeserializer`] - serdes that use `jsonschema`
 
 ## Installation
 
@@ -66,4 +68,12 @@ cargo run --example <example_name> -- <example_args>
 
 Further information can be found in this [blog](https://yokota.blog/2025/04/16/using-data-contracts-with-the-rust-schema-registry-client/).
 
+[`AvroSerializer`]: https://docs.rs/schema-registry-client/*/schema_registry_client/serdes/avro/struct.AvroSerializer.html
+[`AvroDeserializer`]: https://docs.rs/schema-registry-client/*/schema_registry_client/serdes/avro/struct.AvroDeserializer.html
+[`ProtobufSerializer`]: https://docs.rs/schema-registry-client/*/schema_registry_client/serdes/protobuf/struct.ProtobufSerializer.html
+[`ProtobufDeserializer`]: https://docs.rs/schema-registry-client/*/schema_registry_client/serdes/protobuf/struct.ProtobufDeserializer.html
+[`JsonSerializer`]: https://docs.rs/schema-registry-client/*/schema_registry_client/serdes/json/struct.JsonSerializer.html
+[`JsonDeserializer`]: https://docs.rs/schema-registry-client/*/schema_registry_client/serdes/json/struct.JsonDeserializer.html
 [`examples`]: https://github.com/rayokota/rust-schema-registry-client/blob/master/examples/
+
+<!-- cargo-rdme end -->
