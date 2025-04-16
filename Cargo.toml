@@ -26,15 +26,15 @@ rules-jsonata = ["dep:bumpalo", "dep:jsonata-rs"]
 [dependencies]
 apache-avro = "0.18.0"
 async-recursion = "1.1.1"
-async-trait = "0.1.83"
-aws-config = { version="1.5.15", features = ["behavior-version-latest"], optional = true }
-aws-credential-types = { version = "1.2.1", features = ["hardcoded-credentials"], optional = true }
-aws-sdk-kms = { version="1.58.0", features = ["behavior-version-latest"], optional = true }
+async-trait = "0.1.88"
+aws-config = { version="1.6.1", features = ["behavior-version-latest"], optional = true }
+aws-credential-types = { version = "1.2.2", features = ["hardcoded-credentials"], optional = true }
+aws-sdk-kms = { version="1.65.0", features = ["behavior-version-latest"], optional = true }
 azure_core = { version = "0.21.0", optional = true }
 azure_identity = { version = "0.21.0", optional = true }
 azure_security_keyvault = { version = "0.21.0", optional = true }
 base64 = "0.22.1"
-bumpalo = { version = "3.9.1", optional = true }
+bumpalo = { version = "3.17.0", optional = true }
 byteorder = "1.5.0"
 bytes = "1"
 cel-interpreter = { version ="0.9.0", optional = true }
@@ -50,14 +50,14 @@ hex = { version = "0.4.3", optional = true }
 hostname-validator = { version ="1.1.1", optional = true }
 integer-encoding = "4.0.2"
 jsonata-rs = { version = "0.3.4", optional = true }
-jsonschema = "0.29.0"
+jsonschema = "0.29.1"
 lazy_static = "1.5.0"
-log = "0.4.8"
+log = "0.4.27"
 mini-moka = "0.10.3"
 prost = "0.13.5"
-prost-reflect = { version = "0.14.7", features = ["derive", "serde"] }
+prost-reflect = { version = "0.15.1", features = ["derive", "serde"] }
 prost-types = "0.13.5"
-referencing = "0.29.0"
+referencing = "0.29.1"
 regex = "1.11.1"
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -67,19 +67,19 @@ tink-aead = { version = "0.3.0", optional = true }
 tink-core = "0.3.0"
 tink-daead = { version = "0.3.0", optional = true }
 tink-proto = { version = "0.3.0", optional = true }
-tokio = { version = "1.42", features = ["rt-multi-thread"] }
+tokio = { version = "1.44", features = ["rt-multi-thread"] }
 trait-variant = "0.1.2"
 url = "2.5"
-uuid = { version = "1.8", features = ["serde", "v4"] }
-vaultrs = { version = "0.7.3", optional = true }
+uuid = { version = "1.16", features = ["serde", "v4"] }
+vaultrs = { version = "0.7.4", optional = true }
 
 [dev-dependencies]
 chrono = "0.4.0"
 clap = "2.18.0"
 env_logger = "0.9.0"
 rdkafka = "0.37.0"
-tokio = { version = "1.42.0", features = ["macros"] }
+tokio = { version = "1.44", features = ["macros"] }
 
 [build-dependencies]
-prost-build = "0.13.4"
-prost-reflect-build = "0.14.0"
+prost-build = "0.13.5"
+prost-reflect-build = "0.15.0"
