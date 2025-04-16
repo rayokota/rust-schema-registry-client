@@ -60,4 +60,6 @@ You can find examples in the [`examples`] folder. To run them:
 cargo run --example <example_name> -- <example_args>
 ```
 
+More examples can be found in this [blog](https://yokota.blog/2025/04/16/using-data-contracts-with-the-rust-schema-registry-client/).
+
 [`examples`]: https://github.com/rayokota/rust-schema-registry-client/blob/master/examples/
