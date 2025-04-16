@@ -4,6 +4,7 @@
 [![crates.io](https://img.shields.io/crates/v/schema-registry-client.svg)](https://crates.io/crates/schema-registry-client)
 [![docs.rs](https://docs.rs/schema-registry-client/badge.svg)](https://docs.rs/schema-registry-client/)
 [![Build Status](https://github.com/rayokota/rust-schema-registry-client/actions/workflows/ci.yml/badge.svg)](https://github.com/rayokota/rust-schema-registry-client/actions/workflows/ci.yml)
+![license](https://shields.io/badge/license-Apache--2.0-blue)
 
 <!-- cargo-rdme start -->
 
