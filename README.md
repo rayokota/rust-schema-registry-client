@@ -38,7 +38,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-schema-registry-client = { version = "0.1" }
+schema-registry-client = { version = "0.2.0" }
 ```
 
 The following features are available:
@@ -56,7 +56,7 @@ For example, to use CSFLE with the AWS KMS, add this to your `Cargo.toml`:
 ```toml
 
 [dependencies]
-schema-registry-client = { version = "0.1", features = ["rules", "rules-encryption-awskms"] }
+schema-registry-client = { version = "0.2.0", features = ["rules", "rules-encryption-awskms"] }
 ```
 
 ## Examples
