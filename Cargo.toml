@@ -17,7 +17,7 @@ rules = ["rules-cel", "rules-encryption-awskms", "rules-encryption-azurekms", "r
 rules-cel = ["dep:cel-interpreter", "dep:email_address", "dep:fluent-uri", "dep:hostname-validator"]
 rules-encryption-awskms = ["dep:aws-config", "dep:aws-credential-types", "dep:aws-sdk-kms", "dep:hex", "rules-encryption-tink"]
 rules-encryption-azurekms = ["dep:azure_core", "dep:azure_identity", "dep:azure_security_keyvault", "rules-encryption-tink"]
-rules-encryption-gcpkms = ["dep:google-cloud-auth", "dep:google-cloud-kms-v1", "dep:google-cloud-gax", "rules-encryption-tink"]
+rules-encryption-gcpkms = ["dep:google-cloud-auth", "dep:google-cloud-kms-v1", "dep:google-cloud-gax", "dep:google-cloud-lro", "rules-encryption-tink"]
 rules-encryption-hcvault = ["dep:vaultrs", "rules-encryption-tink"]
 rules-encryption-localkms = ["rules-encryption-tink"]
 rules-encryption-tink = ["dep:tink-aead", "dep:tink-daead", "dep:tink-proto"]
@@ -46,6 +46,7 @@ futures = "0.3.31"
 google-cloud-auth = { version = "0.18.0", optional = true }
 google-cloud-kms-v1 = { version = "0.1.0", optional = true }
 google-cloud-gax = { version = "0.20.0", optional = true }
+google-cloud-lro = { version = "0.1.0", optional = true }
 hex = { version = "0.4.3", optional = true }
 hostname-validator = { version ="1.1.1", optional = true }
 integer-encoding = "4.0.2"
