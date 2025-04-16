@@ -76,7 +76,8 @@ impl RestService {
         let client = &self.config.client;
         let mut request = client.request(method.clone(), url);
         request = request.header(
-            reqwest::header::CONTENT_TYPE, "application/vnd.schemaregistry.v1+json"
+            reqwest::header::CONTENT_TYPE,
+            "application/vnd.schemaregistry.v1+json",
         );
         if let Some((username, password)) = &self.config.basic_auth {
             request = request.basic_auth(username, password.as_deref());
