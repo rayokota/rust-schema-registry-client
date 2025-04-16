@@ -1,0 +1,29 @@
+name: Rust Continuous Integration
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rust Toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - name: Rust Format
+        run: cargo fmt --all -- --check
+
+      - name: Rust Build
+        run: cargo build --all-features --all-targets
+
+      - name: Rust Test
+        run: RUST_BACKTRACE=1 cargo test --all-features
