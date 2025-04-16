@@ -3,6 +3,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/schema-registry-client.svg)](https://crates.io/crates/schema-registry-client)
 [![docs.rs](https://docs.rs/schema-registry-client/badge.svg)](https://docs.rs/schema-registry-client/)
+[![Build Status](https://github.com/rayokota/rust-schema-registry-client/actions/workflows/ci.yml/badge.svg)](https://github.com/rayokota/rust-schema-registry-client/actions/workflows/ci.yml)
 
 A fully asynchronous Rust client library for interacting with the
 [Confluent Schema Registry](https://github.com/confluentinc/schema-registry).  
