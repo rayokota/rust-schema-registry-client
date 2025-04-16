@@ -75,6 +75,14 @@ impl RestService {
     ) -> Result<reqwest::Response, reqwest::Error> {
         let client = &self.config.client;
         let mut request = client.request(method.clone(), url);
+        request = request.header(
+            reqwest::header::CONTENT_TYPE, "application/vnd.schemaregistry.v1+json"
+        );
+        if let Some((username, password)) = &self.config.basic_auth {
+            request = request.basic_auth(username, password.as_deref());
+        } else if let Some(token) = &self.config.bearer_access_token {
+            request = request.bearer_auth(token);
+        }
         if let Some(query) = query {
             if !query.is_empty() {
                 request = request.query(query);
