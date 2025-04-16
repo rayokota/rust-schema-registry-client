@@ -1,4 +1,4 @@
-name: Rust Continuous Integration
+name: CI 
 on:
   workflow_dispatch:
   push:
