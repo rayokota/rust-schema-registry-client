@@ -28,7 +28,7 @@
 //!
 //!```toml
 //![dependencies]
-//!schema-registry-client = { version = "0.2.0" }
+//!schema-registry-client = { version = "0.2.1" }
 //!```
 //!
 //!The following features are available:
@@ -46,7 +46,7 @@
 //!```toml
 //!
 //![dependencies]
-//!schema-registry-client = { version = "0.2.0", features = ["rules", "rules-encryption-awskms"] }
+//!schema-registry-client = { version = "0.2.1", features = ["rules", "rules-encryption-awskms"] }
 //!```
 //!
 //!# Examples
