@@ -1,4 +1,3 @@
-use google_cloud_gax::options::ClientConfig;
 use google_cloud_kms_v1::client::KeyManagementService;
 use google_cloud_kms_v1::model;
 use log::error;
