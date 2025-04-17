@@ -1,7 +1,6 @@
 use crate::rules::encryption::gcpkms::gcp_aead::GcpAead;
 use crate::rules::encryption::gcpkms::gcp_driver::GcpCredentials;
-use google_cloud_auth::credentials::{create_access_token_credential, Credential};
-use google_cloud_gax::options::ClientConfig;
+use google_cloud_auth::credentials::{create_access_token_credentials, Credentials};
 use google_cloud_kms_v1::client::KeyManagementService;
 use log::error;
 use std::sync::mpsc;
@@ -20,7 +19,7 @@ pub struct GcpClient {
 impl GcpClient {
     /// Return a new GCP KMS client which will use default credentials to handle keys with
     /// `uri_prefix` prefix. `uri_prefix` must have the following format: `gcp-kms://[:path]`.
-    pub fn new(uri_prefix: &str, creds: Credential) -> Result<GcpClient, TinkError> {
+    pub fn new(uri_prefix: &str, creds: Credentials) -> Result<GcpClient, TinkError> {
         if !uri_prefix.to_lowercase().starts_with(GCP_PREFIX) {
             return Err(format!("uri_prefix must start with {GCP_PREFIX}").into());
         }
@@ -39,11 +38,12 @@ impl GcpClient {
 }
 
 async fn get_client(
-    creds: Credential,
+    creds: Credentials,
     sender: mpsc::SyncSender<Result<KeyManagementService, TinkError>>,
 ) {
-    let client_conf = ClientConfig::new().set_credential(creds);
-    let result = KeyManagementService::new_with_config(client_conf)
+    let result = KeyManagementService::builder()
+        .with_credentials(creds)
+        .build()
         .await
         .map_err(|e| wrap_err("failed to create GCP KMS client", e));
     if result.is_err() {

@@ -1,7 +1,7 @@
 use crate::rules::encryption::gcpkms::gcp_client::GcpClient;
 use crate::rules::encryption::kms_driver::KmsDriver;
 use crate::serdes::serde::SerdeError;
-use google_cloud_auth::credentials::{create_access_token_credential, Credential};
+use google_cloud_auth::credentials::{create_access_token_credentials, Credentials};
 use log::error;
 use std::collections::HashMap;
 use std::sync::mpsc::SyncSender;
@@ -76,7 +76,7 @@ impl KmsDriver for GcpKmsDriver {
     }
 }
 
-fn get_creds(conf: &HashMap<String, String>, key_url: &str) -> Result<Credential, TinkError> {
+fn get_creds(conf: &HashMap<String, String>, key_url: &str) -> Result<Credentials, TinkError> {
     let (sender, receiver) = mpsc::sync_channel(1);
     tokio::spawn(get_creds_async(conf.clone(), key_url.to_string(), sender));
     receiver
@@ -87,9 +87,9 @@ fn get_creds(conf: &HashMap<String, String>, key_url: &str) -> Result<Credential
 async fn get_creds_async(
     conf: HashMap<String, String>,
     key_url: String,
-    sender: SyncSender<Result<Credential, TinkError>>,
+    sender: SyncSender<Result<Credentials, TinkError>>,
 ) {
-    let creds = create_access_token_credential()
+    let creds = create_access_token_credentials()
         .await
         .map_err(|e| TinkError::new(format!("failed to get creds: {}", e).as_str()));
     if creds.is_err() {
