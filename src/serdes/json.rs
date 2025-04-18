@@ -5,9 +5,9 @@ use crate::serdes::config::{DeserializerConfig, SerializerConfig};
 use crate::serdes::rule_registry::RuleRegistry;
 use crate::serdes::serde::SerdeError::Serialization;
 use crate::serdes::serde::{
-    get_executor, get_executors, BaseDeserializer, BaseSerializer, FieldTransformer, FieldType,
-    RuleContext, Serde, SerdeError, SerdeSchema, SerdeType, SerdeValue, SerializationContext,
-    SubjectNameStrategy,
+    BaseDeserializer, BaseSerializer, FieldTransformer, FieldType, RuleContext, Serde, SerdeError,
+    SerdeSchema, SerdeType, SerdeValue, SerializationContext, SubjectNameStrategy, get_executor,
+    get_executors,
 };
 use async_recursion::async_recursion;
 use base64::Engine;
@@ -15,7 +15,7 @@ use byteorder::{BigEndian, ByteOrder, ReadBytesExt};
 use dashmap::DashMap;
 use futures::future::FutureExt;
 use integer_encoding::{VarInt, VarIntReader};
-use jsonschema::{validator_for, ValidationError, Validator};
+use jsonschema::{ValidationError, Validator, validator_for};
 use referencing::{Draft, Registry, Resolver, Resource};
 use serde::Serialize;
 use serde_json::Value;
@@ -708,7 +708,7 @@ mod tests {
     use crate::rules::encryption::encrypt_executor::{FakeClock, FieldEncryptionExecutor};
     use crate::rules::encryption::localkms::local_driver::LocalKmsDriver;
     use crate::serdes::config::SchemaSelector;
-    use crate::serdes::serde::{topic_name_strategy, SerdeFormat};
+    use crate::serdes::serde::{SerdeFormat, topic_name_strategy};
     use std::collections::BTreeMap;
 
     #[tokio::test]

@@ -4,8 +4,8 @@ use crate::serdes::serde::SerdeError;
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
-use tink_core::registry::KmsClient;
 use tink_core::TinkError;
+use tink_core::registry::KmsClient;
 
 const PREFIX: &str = "local-kms://";
 const SECRET: &str = "secret";

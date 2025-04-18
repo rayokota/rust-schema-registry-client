@@ -1,15 +1,15 @@
 use azure_core::auth::TokenCredential;
+use azure_security_keyvault::KeyClient;
 use azure_security_keyvault::prelude::{
     CryptographParamtersEncryption, DecryptParameters, EncryptParameters,
 };
-use azure_security_keyvault::KeyClient;
 use log::error;
 use std::future::IntoFuture;
 use std::sync::mpsc::SyncSender;
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::{cell::RefCell, rc::Rc};
-use tink_core::utils::wrap_err;
 use tink_core::TinkError;
+use tink_core::utils::wrap_err;
 use url::Url;
 
 /// `AzureAead` represents a Azure KMS service to a particular URI.

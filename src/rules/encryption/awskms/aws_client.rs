@@ -2,7 +2,7 @@ use crate::rules::encryption::awskms::aws_aead::AwsAead;
 use aws_credential_types::provider::ProvideCredentials;
 use aws_sdk_kms::config::Region;
 use regex::Regex;
-use tink_core::{utils::wrap_err, TinkError};
+use tink_core::{TinkError, utils::wrap_err};
 
 /// Prefix for any AWS-KMS key URIs.
 pub const AWS_PREFIX: &str = "aws-kms://";

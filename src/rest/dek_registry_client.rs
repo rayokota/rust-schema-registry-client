@@ -1,4 +1,4 @@
-use crate::rest::apis::{urlencode, Error, ResponseContent};
+use crate::rest::apis::{Error, ResponseContent, urlencode};
 use crate::rest::models::dek::Algorithm;
 use crate::rest::models::{CreateDekRequest, CreateKekRequest, Dek, Kek};
 use crate::rest::{client_config, rest_service};

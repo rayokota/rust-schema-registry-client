@@ -5,18 +5,18 @@ use crate::rest::models::{Kind, Mode, RegisteredSchema, Rule, RuleSet, Schema};
 use crate::rest::schema_registry_client::Client;
 use crate::serdes::config::{DeserializerConfig, SchemaSelector, SerializerConfig};
 use crate::serdes::rule_registry::{
-    get_rule_action, get_rule_actions, get_rule_executor, get_rule_executors, get_rule_override,
-    get_rule_overrides, RuleOverride, RuleRegistry,
+    RuleOverride, RuleRegistry, get_rule_action, get_rule_actions, get_rule_executor,
+    get_rule_executors, get_rule_override, get_rule_overrides,
 };
 use crate::serdes::serde::SerdeError::Serialization;
 use crate::serdes::wildcard_matcher::wildcard_match;
 use async_trait::async_trait;
-use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use dashmap::DashMap;
 use futures::future::BoxFuture;
-use prost::bytes::Bytes;
 use prost::Message;
+use prost::bytes::Bytes;
 use referencing::Registry;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};

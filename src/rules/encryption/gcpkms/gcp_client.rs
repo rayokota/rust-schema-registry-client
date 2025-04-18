@@ -1,10 +1,10 @@
 use crate::rules::encryption::gcpkms::gcp_aead::GcpAead;
 use crate::rules::encryption::gcpkms::gcp_driver::GcpCredentials;
-use google_cloud_auth::credentials::{create_access_token_credentials, Credentials};
+use google_cloud_auth::credentials::{Credentials, create_access_token_credentials};
 use google_cloud_kms_v1::client::KeyManagementService;
 use log::error;
 use std::sync::mpsc;
-use tink_core::{utils::wrap_err, TinkError};
+use tink_core::{TinkError, utils::wrap_err};
 
 /// Prefix for any GCP-KMS key URIs.
 pub const GCP_PREFIX: &str = "gcp-kms://";

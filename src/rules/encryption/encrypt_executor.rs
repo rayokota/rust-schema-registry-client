@@ -10,18 +10,18 @@ use crate::serdes::serde::{
     FieldContext, FieldRuleExecutor, FieldType, RuleBase, RuleContext, SerdeError, SerdeValue,
 };
 use async_trait::async_trait;
-use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use byteorder::{BigEndian, ByteOrder, ReadBytesExt};
 use log::warn;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 use tink_aead::{AES_GCM_KEY_VERSION, AES_GCM_TYPE_URL};
-use tink_core::registry::KmsClient;
 use tink_core::Aead;
+use tink_core::registry::KmsClient;
 use tink_daead::{AES_SIV_KEY_VERSION, AES_SIV_TYPE_URL};
 use tink_proto::OutputPrefixType::Raw;
-use tink_proto::{prost::Message, KeyTemplate};
+use tink_proto::{KeyTemplate, prost::Message};
 
 const ENCRYPT_KEK_NAME: &str = "encrypt.kek.name";
 const ENCRYPT_KMS_KEY_ID: &str = "encrypt.kms.key.id";
@@ -827,11 +827,10 @@ impl<T: Client> FieldEncryptionExecutorTransform<'_, T> {
         kek_url: &str,
     ) -> Result<Arc<dyn KmsClient>, SerdeError> {
         let driver = get_kms_driver(kek_url)?;
-        match get_kms_client(kek_url) { Ok(kms_client) => {
-            Ok(kms_client)
-        } _ => {
-            Ok(self.register_kms_client(driver, config, kek_url)?)
-        }}
+        match get_kms_client(kek_url) {
+            Ok(kms_client) => Ok(kms_client),
+            _ => Ok(self.register_kms_client(driver, config, kek_url)?),
+        }
     }
 
     fn register_kms_client(

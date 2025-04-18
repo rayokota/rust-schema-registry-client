@@ -21,7 +21,7 @@ use schema_registry_client::rules::encryption::localkms::local_driver::LocalKmsD
 use schema_registry_client::serdes::avro::AvroSerializer;
 use schema_registry_client::serdes::config::{SchemaSelector, SerializerConfig};
 use schema_registry_client::serdes::serde::{
-    topic_name_strategy, SerdeFormat, SerdeType, SerializationContext,
+    SerdeFormat, SerdeType, SerializationContext, topic_name_strategy,
 };
 
 mod example_utils;

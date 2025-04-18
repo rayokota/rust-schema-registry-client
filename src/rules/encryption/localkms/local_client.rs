@@ -1,6 +1,6 @@
 use prost::Message;
 use tink_aead::AES_GCM_TYPE_URL;
-use tink_core::registry::{primitive_from_key_data, KmsClient};
+use tink_core::registry::{KmsClient, primitive_from_key_data};
 use tink_core::subtle::compute_hkdf;
 use tink_core::utils::wrap_err;
 use tink_core::{Aead, TinkError};

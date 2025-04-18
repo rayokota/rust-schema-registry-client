@@ -1,11 +1,11 @@
-use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use log::error;
 use std::sync::mpsc::SyncSender;
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::{cell::RefCell, rc::Rc, str};
-use tink_core::utils::wrap_err;
 use tink_core::TinkError;
+use tink_core::utils::wrap_err;
 use vaultrs::client::VaultClient;
 use vaultrs::transit::data;
 

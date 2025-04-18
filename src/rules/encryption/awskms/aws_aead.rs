@@ -3,8 +3,8 @@ use log::error;
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::mpsc::SyncSender;
-use tink_core::utils::wrap_err;
 use tink_core::TinkError;
+use tink_core::utils::wrap_err;
 
 /// `AwsAead` represents a AWS KMS service to a particular URI.
 #[derive(Clone)]

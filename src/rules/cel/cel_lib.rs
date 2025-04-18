@@ -1,5 +1,5 @@
-use cel_interpreter::extractors::This;
 use cel_interpreter::Context;
+use cel_interpreter::extractors::This;
 use email_address::EmailAddress;
 use fluent_uri::{Uri, UriRef};
 use std::net::IpAddr;

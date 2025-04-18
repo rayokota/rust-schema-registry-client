@@ -15,7 +15,7 @@ use schema_registry_client::rest::schema_registry_client::{Client, SchemaRegistr
 use schema_registry_client::serdes::avro::AvroSerializer;
 use schema_registry_client::serdes::config::SerializerConfig;
 use schema_registry_client::serdes::serde::{
-    topic_name_strategy, SerdeFormat, SerdeType, SerializationContext,
+    SerdeFormat, SerdeType, SerializationContext, topic_name_strategy,
 };
 use serde::{Deserialize, Serialize};
 

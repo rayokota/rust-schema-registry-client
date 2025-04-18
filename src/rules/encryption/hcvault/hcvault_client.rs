@@ -1,6 +1,6 @@
 use crate::rules::encryption::hcvault::hcvault_aead::HcVaultAead;
 use std::sync::Arc;
-use tink_core::{utils::wrap_err, TinkError};
+use tink_core::{TinkError, utils::wrap_err};
 use url::Url;
 use vaultrs::client::{VaultClient, VaultClientSettingsBuilder};
 

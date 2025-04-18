@@ -1,3 +1,4 @@
+use crate::DESCRIPTOR_POOL;
 use crate::rest::models::{Kind, Mode};
 use crate::rest::models::{Schema, SchemaReference};
 use crate::rest::schema_registry_client::Client;
@@ -5,21 +6,20 @@ use crate::serdes::config::{DeserializerConfig, SerializerConfig};
 use crate::serdes::rule_registry::RuleRegistry;
 use crate::serdes::serde::SerdeError::Serialization;
 use crate::serdes::serde::{
-    get_executor, get_executors, BaseDeserializer, BaseSerializer, FieldTransformer, FieldType,
-    RuleContext, Serde, SerdeError, SerdeSchema, SerdeType, SerdeValue, SerializationContext,
-    SubjectNameStrategy,
+    BaseDeserializer, BaseSerializer, FieldTransformer, FieldType, RuleContext, Serde, SerdeError,
+    SerdeSchema, SerdeType, SerdeValue, SerializationContext, SubjectNameStrategy, get_executor,
+    get_executors,
 };
-use crate::DESCRIPTOR_POOL;
 use async_recursion::async_recursion;
-use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use byteorder::{BigEndian, ByteOrder, ReadBytesExt};
 use bytes::{BufMut, Bytes};
 use dashmap::DashMap;
 use futures::future::FutureExt;
 use integer_encoding::{VarInt, VarIntReader};
 use log::error;
-use prost::{bytes, Message};
+use prost::{Message, bytes};
 use prost_reflect::prost_types::{DescriptorProto, FileDescriptorProto};
 use prost_reflect::{
     DescriptorPool, DynamicMessage, FieldDescriptor, FileDescriptor, MessageDescriptor,
@@ -840,6 +840,7 @@ fn is_builtin(name: &str) -> bool {
 #[cfg(feature = "rules")]
 mod tests {
     use super::*;
+    use crate::TEST_FILE_DESCRIPTOR_SET;
     use crate::rest::client_config::ClientConfig;
     use crate::rest::mock_dek_registry_client::MockDekRegistryClient;
     use crate::rest::mock_schema_registry_client::MockSchemaRegistryClient;
@@ -848,12 +849,11 @@ mod tests {
     use crate::rules::encryption::encrypt_executor::{FakeClock, FieldEncryptionExecutor};
     use crate::rules::encryption::localkms::local_driver::LocalKmsDriver;
     use crate::serdes::config::SchemaSelector;
-    use crate::serdes::protobuf::tests::test::author::PiiOneof;
     use crate::serdes::protobuf::tests::test::Author;
     use crate::serdes::protobuf::tests::test::DependencyMessage;
     use crate::serdes::protobuf::tests::test::TestMessage;
-    use crate::serdes::serde::{topic_name_strategy, SerdeFormat};
-    use crate::TEST_FILE_DESCRIPTOR_SET;
+    use crate::serdes::protobuf::tests::test::author::PiiOneof;
+    use crate::serdes::serde::{SerdeFormat, topic_name_strategy};
     use std::collections::BTreeMap;
 
     pub(crate) mod test {

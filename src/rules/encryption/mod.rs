@@ -2,8 +2,8 @@ use crate::rules::encryption::kms_driver::KmsDriver;
 use crate::serdes::serde::SerdeError;
 use lazy_static::lazy_static;
 use std::sync::{Arc, RwLock};
-use tink_core::registry::KmsClient;
 use tink_core::TinkError;
+use tink_core::registry::KmsClient;
 
 #[cfg(feature = "rules-encryption-awskms")]
 pub mod awskms;

@@ -1,4 +1,4 @@
-use crate::rules::cel::cel_executor::{from_serde_value, CelExecutor};
+use crate::rules::cel::cel_executor::{CelExecutor, from_serde_value};
 use crate::serdes::serde::{FieldRuleExecutor, RuleBase, RuleContext, SerdeError, SerdeValue};
 use async_trait::async_trait;
 use cel_interpreter::Value;

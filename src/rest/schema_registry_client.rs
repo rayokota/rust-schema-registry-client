@@ -1,4 +1,4 @@
-use crate::rest::apis::{urlencode, Error, ResponseContent};
+use crate::rest::apis::{Error, ResponseContent, urlencode};
 use crate::rest::models::{RegisteredSchema, Schema, ServerConfig};
 use crate::rest::{client_config, rest_service};
 use mini_moka::sync::Cache;

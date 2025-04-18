@@ -1,5 +1,5 @@
-use crate::rest::apis::error_message::ErrorMessage;
 use crate::rest::apis::Error::ResponseError;
+use crate::rest::apis::error_message::ErrorMessage;
 use crate::rest::apis::{Error, ResponseContent};
 use crate::rest::client_config;
 use crate::rest::models::{RegisteredSchema, Schema, ServerConfig};

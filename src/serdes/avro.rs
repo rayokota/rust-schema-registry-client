@@ -5,17 +5,17 @@ use crate::serdes::config::{DeserializerConfig, SerializerConfig};
 use crate::serdes::rule_registry::RuleRegistry;
 use crate::serdes::serde::SerdeError::Serialization;
 use crate::serdes::serde::{
-    get_executor, get_executors, BaseDeserializer, BaseSerializer, FieldTransformer, FieldType,
-    RuleContext, Serde, SerdeError, SerdeSchema, SerdeType, SerdeValue, SerializationContext,
-    SubjectNameStrategy,
+    BaseDeserializer, BaseSerializer, FieldTransformer, FieldType, RuleContext, Serde, SerdeError,
+    SerdeSchema, SerdeType, SerdeValue, SerializationContext, SubjectNameStrategy, get_executor,
+    get_executors,
 };
 use apache_avro::schema::{Name, RecordField, RecordSchema, UnionSchema};
 use apache_avro::types::Value;
 use async_recursion::async_recursion;
 use byteorder::{BigEndian, ByteOrder, ReadBytesExt};
 use dashmap::DashMap;
-use futures::future::FutureExt;
 use futures::StreamExt;
+use futures::future::FutureExt;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Cursor;
@@ -722,7 +722,7 @@ mod tests {
     use crate::rules::encryption::localkms::local_driver::LocalKmsDriver;
     use crate::rules::jsonata::jsonata_executor::JsonataExecutor;
     use crate::serdes::config::SchemaSelector;
-    use crate::serdes::serde::{topic_name_strategy, SerdeFormat};
+    use crate::serdes::serde::{SerdeFormat, topic_name_strategy};
     use apache_avro::types::Value::{Record, Union};
     use std::collections::BTreeMap;
 

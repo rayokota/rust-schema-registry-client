@@ -1,13 +1,13 @@
 use crate::rules::encryption::gcpkms::gcp_client::GcpClient;
 use crate::rules::encryption::kms_driver::KmsDriver;
 use crate::serdes::serde::SerdeError;
-use google_cloud_auth::credentials::{create_access_token_credentials, Credentials};
+use google_cloud_auth::credentials::{Credentials, create_access_token_credentials};
 use log::error;
 use std::collections::HashMap;
 use std::sync::mpsc::SyncSender;
-use std::sync::{mpsc, Arc};
-use tink_core::registry::KmsClient;
+use std::sync::{Arc, mpsc};
 use tink_core::TinkError;
+use tink_core::registry::KmsClient;
 
 const PREFIX: &str = "gcp-kms://";
 const ACCOUNT_TYPE: &str = "account.type";

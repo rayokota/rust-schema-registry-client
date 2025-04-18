@@ -3,8 +3,8 @@ use google_cloud_kms_v1::model;
 use log::error;
 use serde::{Deserialize, Serialize};
 use std::sync::mpsc::SyncSender;
-use std::sync::{mpsc, Arc};
-use tink_core::{utils::wrap_err, TinkError};
+use std::sync::{Arc, mpsc};
+use tink_core::{TinkError, utils::wrap_err};
 
 /// `GcpAead` represents a GCP KMS service to a particular URI.
 #[derive(Clone)]

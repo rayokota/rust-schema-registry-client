@@ -3,8 +3,8 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use crate::example_utils::setup_logger;
-use crate::test::author::PiiOneof;
 use crate::test::Author;
+use crate::test::author::PiiOneof;
 use clap::{App, Arg};
 use log::info;
 use prost::EncodeError;
@@ -24,10 +24,10 @@ use schema_registry_client::rules::encryption::hcvault::hcvault_driver::HcVaultD
 use schema_registry_client::rules::encryption::localkms::local_driver::LocalKmsDriver;
 use schema_registry_client::serdes::config::{SchemaSelector, SerializerConfig};
 use schema_registry_client::serdes::protobuf::{
-    default_reference_subject_name_strategy, ProtobufSerializer,
+    ProtobufSerializer, default_reference_subject_name_strategy,
 };
 use schema_registry_client::serdes::serde::{
-    topic_name_strategy, SerdeFormat, SerdeType, SerializationContext,
+    SerdeFormat, SerdeType, SerializationContext, topic_name_strategy,
 };
 
 mod example_utils;
