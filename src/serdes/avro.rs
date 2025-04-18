@@ -634,7 +634,7 @@ fn to_avro_value(input: &Value, value: &serde_json::Value) -> Result<Value, Serd
     let result = match value {
         serde_json::Value::Null => Value::Null,
         serde_json::Value::Bool(b) => (*b).into(),
-        serde_json::Value::Number(ref n) => match input {
+        serde_json::Value::Number(n) => match input {
             Value::Long(_l) => Value::Long(n.as_i64().unwrap()),
             Value::Float(_f) => Value::Float(n.as_f64().unwrap() as f32),
             Value::Double(_d) => Value::Double(n.as_f64().unwrap()),

@@ -827,11 +827,11 @@ impl<T: Client> FieldEncryptionExecutorTransform<'_, T> {
         kek_url: &str,
     ) -> Result<Arc<dyn KmsClient>, SerdeError> {
         let driver = get_kms_driver(kek_url)?;
-        if let Ok(kms_client) = get_kms_client(kek_url) {
+        match get_kms_client(kek_url) { Ok(kms_client) => {
             Ok(kms_client)
-        } else {
+        } _ => {
             Ok(self.register_kms_client(driver, config, kek_url)?)
-        }
+        }}
     }
 
     fn register_kms_client(

@@ -10,7 +10,7 @@ readme = "README.md"
 keywords = ["kafka", "schema", "avro", "protobuf", "jsonschema"]
 categories = ["encoding", "parsing"]
 license = "Apache-2.0"
-edition = "2021"
+edition = "2024"
 
 [features]
 rules = ["rules-cel", "rules-encryption-awskms", "rules-encryption-azurekms", "rules-encryption-gcpkms", "rules-encryption-hcvault", "rules-jsonata"]

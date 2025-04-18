@@ -710,7 +710,7 @@ async fn transform(
             }
             return Ok(Value::Map(result));
         }
-        Value::Message(ref message) => {
+        Value::Message(message) => {
             let mut result = message.clone();
             for fd in descriptor.fields() {
                 let field =
