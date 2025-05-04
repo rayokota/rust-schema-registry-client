@@ -862,8 +862,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_guid_in_header() {
-        let client_conf = ClientConfig::new(vec!["http://localhost:8081".to_string()]);
-        let client = SchemaRegistryClient::new(client_conf);
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
         let mut ser_conf = SerializerConfig::default();
         ser_conf.schema_id_serializer = header_schema_id_serializer;
         let obj = Author {
@@ -888,7 +888,6 @@ mod tests {
             headers: Some(SerdeHeaders::default()),
         };
         let bytes = ser.serialize(&ser_ctx, &obj).await.unwrap();
-        client.clear_caches();
 
         let deser = ProtobufDeserializer::new(
             &client,
