@@ -22,9 +22,7 @@ use schema_registry_client::rules::encryption::hcvault::hcvault_driver::HcVaultD
 use schema_registry_client::rules::encryption::localkms::local_driver::LocalKmsDriver;
 use schema_registry_client::serdes::config::DeserializerConfig;
 use schema_registry_client::serdes::protobuf::ProtobufDeserializer;
-use schema_registry_client::serdes::serde::{
-    SerdeFormat, SerdeType, SerializationContext, topic_name_strategy,
-};
+use schema_registry_client::serdes::serde::{SerdeFormat, SerdeType, SerializationContext};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -80,7 +78,7 @@ async fn consume_and_print(brokers: &str, group_id: &str, topics: &[&str], url: 
     //]);
     let rule_conf = HashMap::new();
     let deser_conf = DeserializerConfig::new(None, false, rule_conf);
-    let deser = ProtobufDeserializer::new(&client, topic_name_strategy, None, deser_conf)
+    let deser = ProtobufDeserializer::new(&client, None, deser_conf)
         .expect("Failed to create deserializer");
 
     let context = CustomContext;

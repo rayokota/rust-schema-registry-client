@@ -25,7 +25,7 @@ impl RestService {
     ) -> Result<reqwest::Response, reqwest::Error> {
         let base_urls = &self.config.base_urls;
         for (i, base_url) in base_urls.iter().enumerate() {
-            let new_url = format!("{}/{}", base_url, url);
+            let new_url = base_url.to_string() + url;
             match self.try_send_request(&new_url, &method, query, body).await {
                 Ok(response) => return Ok(response),
                 Err(e) => {

@@ -13,17 +13,139 @@ use crate::serdes::wildcard_matcher::wildcard_match;
 use async_trait::async_trait;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
+use byteorder::{BigEndian, ByteOrder, ReadBytesExt};
 use dashmap::DashMap;
 use futures::future::BoxFuture;
-use prost::Message;
+use integer_encoding::{VarInt, VarIntReader};
 use prost::bytes::Bytes;
 use referencing::Registry;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fmt::{Debug, Display, Formatter};
+use std::io::{Cursor, Seek};
 use std::sync::{Arc, Mutex};
-use std::{fmt, io};
 use tink_core::TinkError;
+
+const MAGIC_BYTE_V0: u8 = 0;
+const MAGIC_BYTE_V1: u8 = 1;
+const KEY_SCHEMA_ID_HEADER: &str = "__key_schema_id";
+const VALUE_SCHEMA_ID_HEADER: &str = "__value_schema_id";
+
+pub struct SchemaId {
+    pub serde_format: SerdeFormat,
+    pub id: Option<i32>,
+    pub guid: Option<uuid::Uuid>,
+    pub message_indexes: Option<Vec<i32>>,
+}
+
+impl SchemaId {
+    pub fn new(
+        serde_format: SerdeFormat,
+        id: Option<i32>,
+        guid: Option<String>,
+        message_indexes: Option<Vec<i32>>,
+    ) -> Result<SchemaId, SerdeError> {
+        let uuid = if let Some(guid) = guid {
+            Some(uuid::Uuid::try_parse(&guid)?)
+        } else {
+            None
+        };
+        Ok(SchemaId {
+            serde_format,
+            id,
+            guid: uuid,
+            message_indexes,
+        })
+    }
+
+    pub fn read_from_bytes(&mut self, bytes: &[u8]) -> Result<usize, SerdeError> {
+        let mut total_bytes_read;
+        let magic = bytes[0];
+        if magic == MAGIC_BYTE_V0 {
+            let mut buf = &bytes[1..5];
+            let id = buf
+                .read_i32::<BigEndian>()
+                .map_err(|e| Serialization("could not read schema ID".to_string()))?;
+            self.id = Some(id);
+            total_bytes_read = 5;
+        } else if magic == MAGIC_BYTE_V1 {
+            let uuid = uuid::Uuid::from_slice(&bytes[1..17])?;
+            self.guid = Some(uuid);
+            total_bytes_read = 17;
+        } else {
+            return Err(Serialization("invalid magic byte".to_string()));
+        }
+        if self.serde_format == SerdeFormat::Protobuf {
+            let (msg_index, bytes_read) =
+                self.read_index_array_and_data(&bytes[total_bytes_read..]);
+            self.message_indexes = Some(msg_index);
+            total_bytes_read += bytes_read
+        }
+        Ok(total_bytes_read)
+    }
+
+    fn read_index_array_and_data(&self, buf: &[u8]) -> (Vec<i32>, usize) {
+        if buf[0] == 0 {
+            return (vec![0], 1);
+        }
+        let mut msg_idx = Vec::new();
+        let mut reader = Cursor::new(buf);
+        let len = reader.read_varint().unwrap();
+        for _ in 0..len {
+            msg_idx.push(reader.read_varint().unwrap());
+        }
+        let pos = reader.stream_position().unwrap() as usize;
+        (msg_idx, pos)
+    }
+
+    pub fn id_to_bytes(&self) -> Result<Vec<u8>, SerdeError> {
+        let mut bytes = Vec::new();
+        if let Some(id) = self.id {
+            bytes.push(MAGIC_BYTE_V0);
+            let mut buf = [0u8; 4];
+            BigEndian::write_i32(&mut buf, id);
+            bytes.extend_from_slice(&buf);
+            if let Some(msg_idx) = self.to_encoded_index_array() {
+                bytes.extend_from_slice(&msg_idx);
+            }
+            Ok(bytes)
+        } else {
+            Err(Serialization("schema ID is not set".to_string()))
+        }
+    }
+
+    pub fn guid_to_bytes(&self) -> Result<Vec<u8>, SerdeError> {
+        let mut bytes = Vec::new();
+        if let Some(guid) = self.guid {
+            bytes.push(MAGIC_BYTE_V1);
+            bytes.extend_from_slice(guid.as_bytes());
+            if let Some(msg_idx) = self.to_encoded_index_array() {
+                bytes.extend_from_slice(&msg_idx);
+            }
+            Ok(bytes)
+        } else {
+            Err(Serialization("schema GUID is not set".to_string()))
+        }
+    }
+
+    fn to_encoded_index_array(&self) -> Option<Vec<u8>> {
+        if let Some(msg_idx) = &self.message_indexes {
+            let index_bytes = if msg_idx.len() == 1 && msg_idx[0] == 0 {
+                vec![0u8]
+            } else {
+                let mut result = (msg_idx.len() as i32).encode_var_vec();
+                for i in msg_idx {
+                    result.append(&mut i.encode_var_vec());
+                }
+                result
+            };
+            Some(index_bytes)
+        } else {
+            None
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum SerdeFormat {
@@ -155,7 +277,97 @@ pub struct SerializationContext {
     pub topic: String,
     pub serde_type: SerdeType,
     pub serde_format: SerdeFormat,
-    pub headers: Option<HashMap<String, Vec<u8>>>,
+    pub headers: Option<SerdeHeaders>,
+}
+
+/// Kafka message headers.
+#[derive(Clone, Debug, Default)]
+pub struct SerdeHeaders {
+    pub headers: Arc<Mutex<Vec<SerdeHeader>>>,
+}
+
+impl SerdeHeaders {
+    pub fn new(headers: Vec<SerdeHeader>) -> SerdeHeaders {
+        SerdeHeaders {
+            headers: Arc::new(Mutex::new(headers)),
+        }
+    }
+
+    pub fn count(&self) -> usize {
+        self.headers.lock().unwrap().len()
+    }
+
+    pub fn get(&self, idx: usize) -> SerdeHeader {
+        self.try_get(idx).unwrap_or_else(|| {
+            panic!(
+                "headers index out of bounds: the count is {} but the index is {}",
+                self.count(),
+                idx,
+            )
+        })
+    }
+
+    pub fn try_get(&self, idx: usize) -> Option<SerdeHeader> {
+        let headers = self.headers.lock().unwrap();
+        if idx < headers.len() {
+            Some(headers[idx].clone())
+        } else {
+            None
+        }
+    }
+
+    fn iter(&self) -> SerdeHeadersIter<'_>
+    where
+        Self: Sized,
+    {
+        SerdeHeadersIter {
+            headers: self,
+            index: 0,
+        }
+    }
+
+    pub fn insert(&self, header: SerdeHeader) {
+        self.headers.lock().unwrap().push(header)
+    }
+
+    pub fn last_header(&self, key: &str) -> Option<SerdeHeader> {
+        let headers = self.headers.lock().unwrap();
+        headers.iter().rfind(|h| h.key == key).cloned()
+    }
+
+    pub fn remove(&self, key: &str) {
+        let mut headers = self.headers.lock().unwrap();
+        headers.retain(|h| h.key != key)
+    }
+}
+
+/// A Kafka message header.
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+pub struct SerdeHeader {
+    /// The header's key.
+    pub key: String,
+    /// The header's value.
+    pub value: Option<Vec<u8>>,
+}
+
+/// An iterator over [`SerdeHeaders`].
+pub struct SerdeHeadersIter<'a> {
+    headers: &'a SerdeHeaders,
+    index: usize,
+}
+
+impl Iterator for SerdeHeadersIter<'_> {
+    type Item = SerdeHeader;
+
+    fn next(&mut self) -> Option<SerdeHeader> {
+        if self.index < self.headers.count() {
+            let item = self.headers.get(self.index);
+            self.index += 1;
+            Some(item)
+        } else {
+            None
+        }
+    }
 }
 
 pub type SubjectNameStrategy =
@@ -172,22 +384,88 @@ pub fn topic_name_strategy(
     }
 }
 
+pub type SchemaIdSerializer = fn(
+    payload: &[u8],
+    ser_ctx: &SerializationContext,
+    schema_id: &SchemaId,
+) -> Result<Vec<u8>, SerdeError>;
+
+pub fn header_schema_id_serializer(
+    payload: &[u8],
+    ser_ctx: &SerializationContext,
+    schema_id: &SchemaId,
+) -> Result<Vec<u8>, SerdeError> {
+    if let Some(headers) = &ser_ctx.headers {
+        let header_key = match ser_ctx.serde_type {
+            SerdeType::Key => KEY_SCHEMA_ID_HEADER,
+            SerdeType::Value => VALUE_SCHEMA_ID_HEADER,
+        };
+        let header_value = schema_id.guid_to_bytes()?;
+        let header = SerdeHeader {
+            key: header_key.to_string(),
+            value: Some(header_value),
+        };
+        headers.insert(header);
+        Ok(payload.to_vec())
+    } else {
+        Err(SerdeError::Serialization("headers are not set".to_string()))
+    }
+}
+
+pub fn prefix_schema_id_serializer(
+    payload: &[u8],
+    _ser_ctx: &SerializationContext,
+    schema_id: &SchemaId,
+) -> Result<Vec<u8>, SerdeError> {
+    let mut bytes = schema_id.id_to_bytes()?;
+    bytes.extend_from_slice(payload);
+    Ok(bytes)
+}
+
+pub type SchemaIdDeserializer = fn(
+    payload: &[u8],
+    ser_ctx: &SerializationContext,
+    schema_id: &mut SchemaId,
+) -> Result<usize, SerdeError>;
+
+pub fn dual_schema_id_deserializer(
+    payload: &[u8],
+    ser_ctx: &SerializationContext,
+    schema_id: &mut SchemaId,
+) -> Result<usize, SerdeError> {
+    if let Some(headers) = &ser_ctx.headers {
+        let header_key = match ser_ctx.serde_type {
+            SerdeType::Key => KEY_SCHEMA_ID_HEADER,
+            SerdeType::Value => VALUE_SCHEMA_ID_HEADER,
+        };
+        if let Some(header) = headers.last_header(header_key) {
+            if let Some(header_value) = header.value {
+                schema_id.read_from_bytes(&header_value)?;
+                return Ok(0);
+            }
+        }
+    }
+    schema_id.read_from_bytes(payload)
+}
+
+pub fn prefix_schema_id_deserializer(
+    payload: &[u8],
+    _ser_ctx: &SerializationContext,
+    schema_id: &mut SchemaId,
+) -> Result<usize, SerdeError> {
+    schema_id.read_from_bytes(payload)
+}
+
 #[derive(Clone)]
 pub(crate) struct Serde<'a, T: Client> {
     pub client: &'a T,
-    pub subject_name_strategy: SubjectNameStrategy,
     pub rule_registry: Option<RuleRegistry>,
 }
 
 impl<'a, T: Client> Serde<'a, T> {
-    pub fn new(
-        client: &'a T,
-        subject_name_strategy: SubjectNameStrategy,
-        rule_registry: Option<RuleRegistry>,
-    ) -> Serde<'a, T> {
+    pub fn new(client: &'a T, rule_registry: Option<RuleRegistry>) -> Serde<'a, T> {
         Serde {
             client,
-            subject_name_strategy,
             rule_registry,
         }
     }
@@ -606,6 +884,31 @@ pub(crate) struct BaseDeserializer<'a, T: Client> {
 impl<'a, T: Client> BaseDeserializer<'a, T> {
     pub fn new(serde: Serde<'a, T>, config: DeserializerConfig) -> BaseDeserializer<'a, T> {
         BaseDeserializer { serde, config }
+    }
+
+    pub(crate) async fn get_writer_schema(
+        &self,
+        schema_id: &SchemaId,
+        subject: Option<&str>,
+        format: Option<&str>,
+    ) -> Result<Schema, SerdeError> {
+        if let Some(id) = schema_id.id {
+            Ok(self
+                .serde
+                .client
+                .get_by_subject_and_id(subject, id, format)
+                .await?)
+        } else if let Some(guid) = &schema_id.guid {
+            Ok(self
+                .serde
+                .client
+                .get_by_guid(&guid.to_string(), format)
+                .await?)
+        } else {
+            Err(SerdeError::Serialization(
+                "schema ID or GUID are not set".to_string(),
+            ))
+        }
     }
 }
 
@@ -1047,5 +1350,86 @@ pub(crate) fn get_overrides(rule_registry: Option<&RuleRegistry>) -> Vec<RuleOve
         rule_registry.get_overrides()
     } else {
         get_rule_overrides()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_schema_guid() {
+        let mut schema_id = SchemaId::new(SerdeFormat::Avro, None, None, None).unwrap();
+        let input = [
+            0x01, 0x89, 0x79, 0x17, 0x62, 0x23, 0x36, 0x41, 0x86, 0x96, 0x74, 0x29, 0x9b, 0x90,
+            0xa8, 0x02, 0xe2,
+        ];
+        schema_id.read_from_bytes(&input);
+        let guid_str = schema_id.guid.unwrap().to_string();
+        assert_eq!("89791762-2336-4186-9674-299b90a802e2", guid_str);
+        let output = schema_id.guid_to_bytes().unwrap();
+        // compare input and output
+        assert_eq!(input.len(), output.len());
+        for i in 0..input.len() {
+            assert_eq!(input[i], output[i]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_schema_id() {
+        let mut schema_id = SchemaId::new(SerdeFormat::Avro, None, None, None).unwrap();
+        let input = [0x00, 0x00, 0x00, 0x00, 0x01];
+        schema_id.read_from_bytes(&input);
+        assert_eq!(1, schema_id.id.unwrap());
+        let output = schema_id.id_to_bytes().unwrap();
+        // compare input and output
+        assert_eq!(input.len(), output.len());
+        for i in 0..input.len() {
+            assert_eq!(input[i], output[i]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_schema_guid_with_message_indexes() {
+        let mut schema_id = SchemaId::new(SerdeFormat::Protobuf, None, None, None).unwrap();
+        let input = [
+            0x01, 0x89, 0x79, 0x17, 0x62, 0x23, 0x36, 0x41, 0x86, 0x96, 0x74, 0x29, 0x9b, 0x90,
+            0xa8, 0x02, 0xe2, 0x06, 0x02, 0x04, 0x06,
+        ];
+        schema_id.read_from_bytes(&input);
+        let guid_str = schema_id.guid.unwrap().to_string();
+        assert_eq!("89791762-2336-4186-9674-299b90a802e2", guid_str);
+        let expected_indexes = vec![1, 2, 3];
+        let indexes = schema_id.message_indexes.clone().unwrap();
+        assert_eq!(expected_indexes.len(), indexes.len());
+        for i in 0..expected_indexes.len() {
+            assert_eq!(expected_indexes[i], indexes[i]);
+        }
+        let output = schema_id.guid_to_bytes().unwrap();
+        // compare input and output
+        assert_eq!(input.len(), output.len());
+        for i in 0..input.len() {
+            assert_eq!(input[i], output[i]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_schema_id_with_message_indexes() {
+        let mut schema_id = SchemaId::new(SerdeFormat::Protobuf, None, None, None).unwrap();
+        let input = [0x00, 0x00, 0x00, 0x00, 0x01, 0x06, 0x02, 0x04, 0x06];
+        schema_id.read_from_bytes(&input);
+        assert_eq!(1, schema_id.id.unwrap());
+        let expected_indexes = vec![1, 2, 3];
+        let indexes = schema_id.message_indexes.clone().unwrap();
+        assert_eq!(expected_indexes.len(), indexes.len());
+        for i in 0..expected_indexes.len() {
+            assert_eq!(expected_indexes[i], indexes[i]);
+        }
+        let output = schema_id.id_to_bytes().unwrap();
+        // compare input and output
+        assert_eq!(input.len(), output.len());
+        for i in 0..input.len() {
+            assert_eq!(input[i], output[i]);
+        }
     }
 }

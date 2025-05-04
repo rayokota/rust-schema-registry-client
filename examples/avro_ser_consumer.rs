@@ -15,9 +15,7 @@ use schema_registry_client::rest::dek_registry_client::DekRegistryClient;
 use schema_registry_client::rest::schema_registry_client::{Client, SchemaRegistryClient};
 use schema_registry_client::serdes::avro::AvroDeserializer;
 use schema_registry_client::serdes::config::DeserializerConfig;
-use schema_registry_client::serdes::serde::{
-    SerdeFormat, SerdeType, SerializationContext, topic_name_strategy,
-};
+use schema_registry_client::serdes::serde::{SerdeFormat, SerdeType, SerializationContext};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -59,8 +57,8 @@ async fn consume_and_print(brokers: &str, group_id: &str, topics: &[&str], url: 
     let client = SchemaRegistryClient::new(client_conf);
 
     let deser_conf = DeserializerConfig::new(None, false, HashMap::new());
-    let deser = AvroDeserializer::new(&client, topic_name_strategy, None, deser_conf)
-        .expect("Failed to create deserializer");
+    let deser =
+        AvroDeserializer::new(&client, None, deser_conf).expect("Failed to create deserializer");
 
     let context = CustomContext;
 

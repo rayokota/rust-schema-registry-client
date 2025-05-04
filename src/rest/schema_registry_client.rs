@@ -21,6 +21,7 @@ pub trait Client {
         id: i32,
         format: Option<&str>,
     ) -> Result<Schema, Error>;
+    async fn get_by_guid(&self, guid: &str, format: Option<&str>) -> Result<Schema, Error>;
     async fn get_by_schema(
         &self,
         subject: &str,
@@ -140,7 +141,7 @@ impl Client for SchemaRegistryClient {
             let mut store = self.store.lock().unwrap();
             let rs: RegisteredSchema = serde_json::from_str(&content)?;
             // The registered schema may not be fully populated
-            store.set_schema(subject, rs.id, schema);
+            store.set_schema(Some(subject.to_string()), rs.id, rs.guid.clone(), schema);
             Ok(rs)
         } else {
             let entity = serde_json::from_str(&content).ok();
@@ -161,8 +162,8 @@ impl Client for SchemaRegistryClient {
     ) -> Result<Schema, Error> {
         {
             let store = self.store.lock().unwrap();
-            let schema = store.get_schema_by_id(subject.unwrap_or_default(), id);
-            if let Some(schema) = schema {
+            let result = store.get_schema_by_id(subject.unwrap_or_default(), id);
+            if let Some((_, schema)) = result {
                 return Ok(schema.clone());
             }
         }
@@ -183,8 +184,46 @@ impl Client for SchemaRegistryClient {
         let content = resp.text().await?;
         if !status.is_client_error() && !status.is_server_error() {
             let mut store = self.store.lock().unwrap();
-            let s: Schema = serde_json::from_str(&content)?;
-            store.set_schema(subject.unwrap_or_default(), id, &s);
+            let rs: RegisteredSchema = serde_json::from_str(&content)?;
+            let s: Schema = rs.to_schema();
+            store.set_schema(subject.map(|s| s.to_string()), Some(id), rs.guid, &s);
+            Ok(s)
+        } else {
+            let entity = serde_json::from_str(&content).ok();
+            let error = ResponseContent {
+                status,
+                content,
+                entity,
+            };
+            Err(Error::ResponseError(error))
+        }
+    }
+
+    async fn get_by_guid(&self, guid: &str, format: Option<&str>) -> Result<Schema, Error> {
+        {
+            let store = self.store.lock().unwrap();
+            let schema = store.get_schema_by_guid(guid);
+            if let Some(schema) = schema {
+                return Ok(schema.clone());
+            }
+        }
+
+        let url = format!("/schemas/guids/{}", guid);
+        let mut query = Vec::new();
+        if let Some(format) = format {
+            query.push(("format".to_string(), format.to_string()));
+        }
+        let resp = self
+            .rest_service
+            .send_request_urls(&url, reqwest::Method::GET, Some(&query), None)
+            .await?;
+        let status = resp.status();
+        let content = resp.text().await?;
+        if !status.is_client_error() && !status.is_server_error() {
+            let mut store = self.store.lock().unwrap();
+            let rs: RegisteredSchema = serde_json::from_str(&content)?;
+            let s: Schema = rs.to_schema();
+            store.set_schema(None, rs.id, rs.guid, &s);
             Ok(s)
         } else {
             let entity = serde_json::from_str(&content).ok();
@@ -228,7 +267,8 @@ impl Client for SchemaRegistryClient {
             let mut store = self.store.lock().unwrap();
             let result: RegisteredSchema = serde_json::from_str(&content)?;
             // Ensure the schema matches the input
-            let rs = schema.to_registered_schema(result.id, result.subject, result.version);
+            let rs =
+                schema.to_registered_schema(result.id, result.guid, result.subject, result.version);
             store.set_registered_schema(schema, &rs);
             Ok(rs)
         } else {
@@ -621,7 +661,8 @@ impl Client for SchemaRegistryClient {
 }
 
 pub(crate) struct SchemaStore {
-    schema_id_index: HashMap<String, HashMap<i32, Schema>>,
+    schema_id_index: HashMap<String, HashMap<i32, (Option<String>, Schema)>>,
+    schema_guid_index: HashMap<String, Schema>,
     schema_index: HashMap<String, HashMap<Schema, i32>>,
     rs_id_index: HashMap<String, HashMap<i32, RegisteredSchema>>,
     rs_version_index: HashMap<String, HashMap<i32, RegisteredSchema>>,
@@ -632,6 +673,7 @@ impl SchemaStore {
     pub fn new() -> Self {
         SchemaStore {
             schema_id_index: HashMap::new(),
+            schema_guid_index: HashMap::new(),
             schema_index: HashMap::new(),
             rs_id_index: HashMap::new(),
             rs_version_index: HashMap::new(),
@@ -639,63 +681,81 @@ impl SchemaStore {
         }
     }
 
-    pub fn set_schema(&mut self, subject: &str, schema_id: i32, schema: &Schema) {
-        self.schema_id_index
-            .entry(subject.to_string())
-            .and_modify(|m| {
-                m.insert(schema_id, schema.clone());
-            })
-            .or_insert_with(|| {
-                let mut m = HashMap::new();
-                m.insert(schema_id, schema.clone());
-                m
-            });
-        self.schema_index
-            .entry(subject.to_string())
-            .and_modify(|m| {
-                m.insert(schema.clone(), schema_id);
-            })
-            .or_insert_with(|| {
-                let mut m = HashMap::new();
-                m.insert(schema.clone(), schema_id);
-                m
-            });
+    pub fn set_schema(
+        &mut self,
+        subject: Option<String>,
+        schema_id: Option<i32>,
+        schema_guid: Option<String>,
+        schema: &Schema,
+    ) {
+        let subject = subject.unwrap_or_default();
+        if let Some(id) = schema_id {
+            self.schema_id_index
+                .entry(subject.clone())
+                .and_modify(|m| {
+                    m.insert(id, (schema_guid.clone(), schema.clone()));
+                })
+                .or_insert_with(|| {
+                    let mut m = HashMap::new();
+                    m.insert(id, (schema_guid.clone(), schema.clone()));
+                    m
+                });
+            self.schema_index
+                .entry(subject.clone())
+                .and_modify(|m| {
+                    m.insert(schema.clone(), id);
+                })
+                .or_insert_with(|| {
+                    let mut m = HashMap::new();
+                    m.insert(schema.clone(), id);
+                    m
+                });
+        }
+        if let Some(guid) = schema_guid {
+            self.schema_guid_index.insert(guid, schema.clone());
+        }
     }
 
     pub fn set_registered_schema(&mut self, schema: &Schema, rs: &RegisteredSchema) {
         let schema_id = rs.id;
+        let schema_guid = rs.guid.clone();
         let subject = rs.subject.clone().unwrap_or_default();
         let version = rs.version.unwrap_or_default();
-        self.schema_id_index
-            .entry(subject.clone())
-            .and_modify(|m| {
-                m.insert(schema_id, schema.clone());
-            })
-            .or_insert_with(|| {
-                let mut m = HashMap::new();
-                m.insert(schema_id, schema.clone());
-                m
-            });
-        self.schema_index
-            .entry(subject.clone())
-            .and_modify(|m| {
-                m.insert(schema.clone(), schema_id);
-            })
-            .or_insert_with(|| {
-                let mut m = HashMap::new();
-                m.insert(schema.clone(), schema_id);
-                m
-            });
-        self.rs_id_index
-            .entry(subject.clone())
-            .and_modify(|m| {
-                m.insert(schema_id, rs.clone());
-            })
-            .or_insert_with(|| {
-                let mut m = HashMap::new();
-                m.insert(schema_id, rs.clone());
-                m
-            });
+        if let Some(id) = schema_id {
+            self.schema_id_index
+                .entry(subject.clone())
+                .and_modify(|m| {
+                    m.insert(id, (schema_guid.clone(), schema.clone()));
+                })
+                .or_insert_with(|| {
+                    let mut m = HashMap::new();
+                    m.insert(id, (schema_guid.clone(), schema.clone()));
+                    m
+                });
+            self.schema_index
+                .entry(subject.clone())
+                .and_modify(|m| {
+                    m.insert(schema.clone(), id);
+                })
+                .or_insert_with(|| {
+                    let mut m = HashMap::new();
+                    m.insert(schema.clone(), id);
+                    m
+                });
+            self.rs_id_index
+                .entry(subject.clone())
+                .and_modify(|m| {
+                    m.insert(id, rs.clone());
+                })
+                .or_insert_with(|| {
+                    let mut m = HashMap::new();
+                    m.insert(id, rs.clone());
+                    m
+                });
+        }
+        if let Some(guid) = schema_guid {
+            self.schema_guid_index.insert(guid, schema.clone());
+        }
         self.rs_version_index
             .entry(subject.clone())
             .and_modify(|m| {
@@ -718,9 +778,17 @@ impl SchemaStore {
             });
     }
 
-    pub fn get_schema_by_id(&self, subject: &str, schema_id: i32) -> Option<Schema> {
+    pub fn get_schema_by_id(
+        &self,
+        subject: &str,
+        schema_id: i32,
+    ) -> Option<(Option<String>, Schema)> {
         let s = self.schema_id_index.get(subject);
         s.and_then(|m| m.get(&schema_id).cloned())
+    }
+
+    pub fn get_schema_by_guid(&self, guid: &str) -> Option<Schema> {
+        self.schema_guid_index.get(guid).cloned()
     }
 
     pub fn get_id_by_schema(&self, subject: &str, schema: &Schema) -> Option<i32> {
@@ -753,6 +821,7 @@ impl SchemaStore {
 
     pub fn clear(&mut self) {
         self.schema_id_index.clear();
+        self.schema_guid_index.clear();
         self.schema_index.clear();
         self.rs_id_index.clear();
         self.rs_version_index.clear();

@@ -14,9 +14,7 @@ use schema_registry_client::rest::models::{Kind, Mode, Rule, RuleSet, Schema};
 use schema_registry_client::rest::schema_registry_client::{Client, SchemaRegistryClient};
 use schema_registry_client::serdes::avro::AvroSerializer;
 use schema_registry_client::serdes::config::SerializerConfig;
-use schema_registry_client::serdes::serde::{
-    SerdeFormat, SerdeType, SerializationContext, topic_name_strategy,
-};
+use schema_registry_client::serdes::serde::{SerdeFormat, SerdeType, SerializationContext};
 
 mod example_utils;
 
@@ -46,7 +44,7 @@ async fn produce(brokers: &str, topic_name: &str, url: &str) {
     };
 
     let ser_conf = SerializerConfig::new(true, None, true, false, HashMap::new());
-    let ser = AvroSerializer::new(&client, Some(&schema), topic_name_strategy, None, ser_conf)
+    let ser = AvroSerializer::new(&client, Some(&schema), None, ser_conf)
         .expect("Failed to create serializer");
     let ser_ctx = SerializationContext {
         topic: topic_name.to_string(),

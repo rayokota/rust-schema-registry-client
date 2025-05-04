@@ -7,6 +7,7 @@ use crate::rest::schema_registry_client::Client;
 use reqwest::StatusCode;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct MockSchemaRegistryClient {
@@ -42,7 +43,8 @@ impl Client for MockSchemaRegistryClient {
         let version = latest_schema.map_or(1, |rs| rs.version.unwrap_or_default() + 1);
 
         let registered_schema = RegisteredSchema {
-            id: 1,
+            id: Some(1),
+            guid: Some(Uuid::new_v4().to_string()),
             subject: Some(subject.to_string()),
             version: Some(version),
             schema_type: schema.schema_type.clone(),
@@ -75,6 +77,18 @@ impl Client for MockSchemaRegistryClient {
         }))
     }
 
+    async fn get_by_guid(&self, guid: &str, _format: Option<&str>) -> Result<Schema, Error> {
+        let store = self.store.lock().unwrap();
+        let schema = store.get_schema_by_guid(guid);
+        schema.ok_or(ResponseError(ResponseContent {
+            status: StatusCode::NOT_FOUND,
+            content: String::new(),
+            entity: Some(ErrorMessage {
+                error_code: Some(40400),
+                message: Some("schema not found".to_string()),
+            }),
+        }))
+    }
     async fn get_by_schema(
         &self,
         subject: &str,
@@ -235,6 +249,7 @@ impl Client for MockSchemaRegistryClient {
 struct SchemaStore {
     schemas: HashMap<String, Vec<RegisteredSchema>>,
     schema_id_index: HashMap<i32, RegisteredSchema>,
+    schema_guid_index: HashMap<String, RegisteredSchema>,
     schema_index: HashMap<String, RegisteredSchema>,
 }
 
@@ -243,13 +258,19 @@ impl SchemaStore {
         SchemaStore {
             schemas: HashMap::new(),
             schema_id_index: HashMap::new(),
+            schema_guid_index: HashMap::new(),
             schema_index: HashMap::new(),
         }
     }
 
     pub fn set_registered_schema(&mut self, schema: &RegisteredSchema) {
         let subject = schema.subject.clone().unwrap_or_default();
-        self.schema_id_index.insert(schema.id, schema.clone());
+        if let Some(id) = schema.id {
+            self.schema_id_index.insert(id, schema.clone());
+        }
+        if let Some(guid) = &schema.guid {
+            self.schema_guid_index.insert(guid.clone(), schema.clone());
+        }
         self.schema_index.insert(subject.clone(), schema.clone());
         match self.schemas.get_mut(&subject) {
             Some(schemas) => schemas.push(schema.clone()),
@@ -261,6 +282,11 @@ impl SchemaStore {
 
     pub fn get_schema_by_id(&self, schema_id: i32) -> Option<Schema> {
         let rs = self.schema_id_index.get(&schema_id);
+        rs.map(|rs| rs.to_schema())
+    }
+
+    pub fn get_schema_by_guid(&self, guid: &str) -> Option<Schema> {
+        let rs = self.schema_guid_index.get(guid);
         rs.map(|rs| rs.to_schema())
     }
 
@@ -343,7 +369,9 @@ impl SchemaStore {
         if let Some(schemas) = self.schemas.remove(subject) {
             for rs in schemas {
                 versions.push(rs.version.unwrap_or_default());
-                self.schema_id_index.remove(&rs.id);
+                if let Some(id) = rs.id {
+                    self.schema_id_index.remove(&id);
+                }
                 self.schema_index.remove(&rs.schema.unwrap_or_default());
             }
         }
@@ -353,6 +381,7 @@ impl SchemaStore {
     pub fn clear(&mut self) {
         self.schemas.clear();
         self.schema_id_index.clear();
+        self.schema_guid_index.clear();
         self.schema_index.clear();
     }
 }
