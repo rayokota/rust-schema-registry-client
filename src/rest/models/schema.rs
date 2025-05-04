@@ -33,12 +33,14 @@ impl Schema {
 
     pub fn to_registered_schema(
         &self,
-        id: i32,
+        id: Option<i32>,
+        guid: Option<String>,
         subject: Option<String>,
         version: Option<i32>,
     ) -> models::RegisteredSchema {
         models::RegisteredSchema {
             id,
+            guid,
             subject,
             version,
             schema_type: self.schema_type.clone(),

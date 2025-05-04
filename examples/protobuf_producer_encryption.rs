@@ -23,12 +23,8 @@ use schema_registry_client::rules::encryption::gcpkms::gcp_driver::GcpKmsDriver;
 use schema_registry_client::rules::encryption::hcvault::hcvault_driver::HcVaultDriver;
 use schema_registry_client::rules::encryption::localkms::local_driver::LocalKmsDriver;
 use schema_registry_client::serdes::config::{SchemaSelector, SerializerConfig};
-use schema_registry_client::serdes::protobuf::{
-    ProtobufSerializer, default_reference_subject_name_strategy,
-};
-use schema_registry_client::serdes::serde::{
-    SerdeFormat, SerdeType, SerializationContext, topic_name_strategy,
-};
+use schema_registry_client::serdes::protobuf::ProtobufSerializer;
+use schema_registry_client::serdes::serde::{SerdeFormat, SerdeType, SerializationContext};
 
 mod example_utils;
 
@@ -132,14 +128,8 @@ message Pizza {
         false,
         rule_conf,
     );
-    let ser = ProtobufSerializer::new(
-        &client,
-        topic_name_strategy,
-        default_reference_subject_name_strategy,
-        None,
-        ser_conf,
-    )
-    .expect("Failed to create serializer");
+    let ser =
+        ProtobufSerializer::new(&client, None, ser_conf).expect("Failed to create serializer");
     let ser_ctx = SerializationContext {
         topic: topic_name.to_string(),
         serde_type: SerdeType::Value,

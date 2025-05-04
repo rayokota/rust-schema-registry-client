@@ -38,17 +38,14 @@ impl AwsClient {
             .build();
 
         let kms = aws_sdk_kms::Client::from_conf(config);
-        Self::new_with_kms(uri_prefix, kms)
+        Self::with_kms(uri_prefix, kms)
     }
 
     /// Return a new AWS KMS client with user created KMS client.  Client is responsible for keeping
     /// the region consistency between key URI and KMS client.  `uri_prefix` must have the
     /// following format: `aws-kms://arn:<partition>:kms:<region>:[:path]`
     /// See <http://docs.aws.amazon.com/general/latest/gr/aws-arns-and-namespaces.html>.
-    pub fn new_with_kms(
-        uri_prefix: &str,
-        kms: aws_sdk_kms::Client,
-    ) -> Result<AwsClient, TinkError> {
+    pub fn with_kms(uri_prefix: &str, kms: aws_sdk_kms::Client) -> Result<AwsClient, TinkError> {
         if !uri_prefix.to_lowercase().starts_with(AWS_PREFIX) {
             return Err(
                 format!("uri_prefix must start with {AWS_PREFIX}, but got {uri_prefix}").into(),

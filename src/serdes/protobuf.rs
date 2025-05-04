@@ -6,19 +6,15 @@ use crate::serdes::config::{DeserializerConfig, SerializerConfig};
 use crate::serdes::rule_registry::RuleRegistry;
 use crate::serdes::serde::SerdeError::Serialization;
 use crate::serdes::serde::{
-    BaseDeserializer, BaseSerializer, FieldTransformer, FieldType, RuleContext, Serde, SerdeError,
-    SerdeSchema, SerdeType, SerdeValue, SerializationContext, SubjectNameStrategy, get_executor,
-    get_executors,
+    BaseDeserializer, BaseSerializer, FieldTransformer, FieldType, RuleContext, SchemaId, Serde,
+    SerdeError, SerdeFormat, SerdeSchema, SerdeType, SerdeValue, SerializationContext,
+    get_executor, get_executors,
 };
 use async_recursion::async_recursion;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
-use byteorder::{BigEndian, ByteOrder, ReadBytesExt};
-use bytes::{BufMut, Bytes};
 use dashmap::DashMap;
 use futures::future::FutureExt;
-use integer_encoding::{VarInt, VarIntReader};
-use log::error;
 use prost::{Message, bytes};
 use prost_reflect::prost_types::{DescriptorProto, FileDescriptorProto};
 use prost_reflect::{
@@ -26,10 +22,8 @@ use prost_reflect::{
     ReflectMessage, SerializeOptions, Value,
 };
 use prost_types::FileDescriptorSet;
-use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufReader, Cursor};
-use std::ops::Deref;
 use std::sync::Arc;
 
 pub mod confluent {
@@ -60,7 +54,19 @@ pub fn default_reference_subject_name_strategy(ref_name: &str, serde_type: &Serd
 impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
     pub fn new(
         client: &'a T,
-        subject_name_strategy: SubjectNameStrategy,
+        rule_registry: Option<RuleRegistry>,
+        serializer_config: SerializerConfig,
+    ) -> Result<ProtobufSerializer<'a, T>, SerdeError> {
+        Self::with_reference_subject_name_strategy(
+            client,
+            default_reference_subject_name_strategy,
+            rule_registry,
+            serializer_config,
+        )
+    }
+
+    pub fn with_reference_subject_name_strategy(
+        client: &'a T,
         reference_subject_name_strategy: ReferenceSubjectNameStrategy,
         rule_registry: Option<RuleRegistry>,
         serializer_config: SerializerConfig,
@@ -70,10 +76,7 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
         }
         Ok(ProtobufSerializer {
             reference_subject_name_strategy,
-            base: BaseSerializer::new(
-                Serde::new(client, subject_name_strategy, rule_registry),
-                serializer_config,
-            ),
+            base: BaseSerializer::new(Serde::new(client, rule_registry), serializer_config),
             serde: ProtobufSerde {
                 parsed_schemas: DashMap::new(),
             },
@@ -112,7 +115,7 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
         value: &M,
         md: &MessageDescriptor,
     ) -> Result<Vec<u8>, SerdeError> {
-        let strategy = self.base.serde.subject_name_strategy;
+        let strategy = self.base.config.subject_name_strategy;
         // TODO pass schema (instead of None) to strategy later?
         let subject = strategy(&ctx.topic, &ctx.serde_type, None);
         let subject = subject.ok_or(Serialization(
@@ -124,9 +127,9 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
             .get_reader_schema(&subject, Some("serialized"), &self.base.config.use_schema)
             .await?;
 
-        let schema_id;
+        let mut schema_id;
         if let Some(ref schema) = latest_schema {
-            schema_id = schema.id;
+            schema_id = SchemaId::new(SerdeFormat::Protobuf, schema.id, schema.guid.clone(), None)?;
         } else {
             let references = self.resolve_dependencies(ctx, &md.parent_file()).await?;
             let schema = Schema {
@@ -143,7 +146,7 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
                     .client
                     .register_schema(&subject, &schema, self.base.config.normalize_schemas)
                     .await?;
-                schema_id = rs.id;
+                schema_id = SchemaId::new(SerdeFormat::Protobuf, rs.id, rs.guid.clone(), None)?;
             } else {
                 let rs = self
                     .base
@@ -151,7 +154,7 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
                     .client
                     .get_by_schema(&subject, &schema, self.base.config.normalize_schemas, false)
                     .await?;
-                schema_id = rs.id;
+                schema_id = SchemaId::new(SerdeFormat::Protobuf, rs.id, rs.guid.clone(), None)?;
             }
         }
 
@@ -190,13 +193,9 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
             value.encode(&mut encoded_bytes)?;
         }
 
-        let mut payload = vec![0u8];
-        let mut buf = [0u8; 4];
-        BigEndian::write_u32(&mut buf, schema_id as u32);
-        payload.extend_from_slice(&buf);
-        payload.extend_from_slice(&self.to_encoded_index_array(md)?);
-        payload.extend_from_slice(&encoded_bytes);
-        Ok(payload)
+        schema_id.message_indexes = Some(self.to_index_array(md)?);
+        let id_ser = self.base.config.schema_id_serializer;
+        id_ser(&encoded_bytes, ctx, &schema_id)
     }
 
     #[async_recursion]
@@ -243,7 +242,7 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
         Ok(references)
     }
 
-    fn to_encoded_index_array(&self, desc: &MessageDescriptor) -> Result<Vec<u8>, SerdeError> {
+    fn to_index_array(&self, desc: &MessageDescriptor) -> Result<Vec<i32>, SerdeError> {
         let mut msg_idx = VecDeque::new();
 
         // Walk the nested MessageDescriptor tree up to the root.
@@ -283,17 +282,7 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
                 "MessageDescriptor not found in file".to_string(),
             ));
         }
-
-        let index_bytes = if msg_idx.len() == 1 && msg_idx[0] == 0 {
-            vec![0u8]
-        } else {
-            let mut result = (msg_idx.len() as i32).encode_var_vec();
-            for i in msg_idx {
-                result.append(&mut i.encode_var_vec());
-            }
-            result
-        };
-        Ok(index_bytes)
+        Ok(msg_idx.into_iter().collect())
     }
 
     async fn get_parsed_schema(
@@ -393,7 +382,6 @@ pub struct ProtobufDeserializer<'a, T: Client> {
 impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
     pub fn new(
         client: &'a T,
-        subject_name_strategy: SubjectNameStrategy,
         rule_registry: Option<RuleRegistry>,
         deserializer_config: DeserializerConfig,
     ) -> Result<ProtobufDeserializer<'a, T>, SerdeError> {
@@ -401,10 +389,7 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
             executor.configure(client.config(), &deserializer_config.rule_config)?;
         }
         Ok(ProtobufDeserializer {
-            base: BaseDeserializer::new(
-                Serde::new(client, subject_name_strategy, rule_registry),
-                deserializer_config,
-            ),
+            base: BaseDeserializer::new(Serde::new(client, rule_registry), deserializer_config),
             serde: ProtobufSerde {
                 parsed_schemas: DashMap::new(),
             },
@@ -416,16 +401,7 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
         ctx: &SerializationContext,
         data: &[u8],
     ) -> Result<M, SerdeError> {
-        if data.len() <= 5 {
-            return Err(Serialization(format!(
-                "invalid payload length: {}",
-                data.len()
-            )));
-        }
-        if data[0] != 0 {
-            return Err(Serialization(format!("unexpected magic byte: {}", data[0])));
-        }
-        let strategy = self.base.serde.subject_name_strategy;
+        let strategy = self.base.config.subject_name_strategy;
         let mut subject = strategy(&ctx.topic, &ctx.serde_type, None);
         let mut latest_schema = None;
         let has_subject = subject.is_some();
@@ -441,17 +417,15 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
                 .await?;
         }
 
-        let mut buf = &data[1..5];
-        let id = buf
-            .read_u32::<BigEndian>()
-            .map_err(|e| Serialization("could not read schema ID".to_string()))?;
-        let (msg_index, data) = self.read_index_array_and_data(&data[5..]);
+        let mut schema_id = SchemaId::new(SerdeFormat::Protobuf, None, None, None)?;
+        let id_deser = self.base.config.schema_id_deserializer;
+        let bytes_read = id_deser(data, ctx, &mut schema_id)?;
+        let msg_index = schema_id.message_indexes.clone().unwrap_or_default();
+        let data = &data[bytes_read..];
 
         let writer_schema_raw = self
             .base
-            .serde
-            .client
-            .get_by_subject_and_id(None, id as i32, Some("serialized"))
+            .get_writer_schema(&schema_id, subject.as_deref(), Some("serialized"))
             .await?;
         let (mut writer_schema, mut pool) = self.get_parsed_schema(&writer_schema_raw).await?;
         let writer_desc = self.get_message_desc(&pool, &writer_schema, &msg_index)?;
@@ -494,7 +468,7 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
 
         let mut msg: DynamicMessage;
         if !migrations.is_empty() {
-            let reader = Cursor::new(&data);
+            let reader = Cursor::new(data);
             msg = DynamicMessage::decode(writer_desc, reader)?;
             let mut serializer = serde_json::Serializer::new(vec![]);
             let options = SerializeOptions::new().skip_default_fields(false);
@@ -542,19 +516,6 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
 
         let result: M = msg.transcode_to()?;
         Ok(result)
-    }
-
-    fn read_index_array_and_data(&self, buf: &[u8]) -> (Vec<i32>, Vec<u8>) {
-        if buf[0] == 0 {
-            return (vec![0], buf[1..].to_vec());
-        }
-        let mut msg_idx = Vec::new();
-        let mut reader = BufReader::with_capacity(buf.len(), buf);
-        let len = reader.read_varint().unwrap();
-        for _ in 0..len {
-            msg_idx.push(reader.read_varint().unwrap());
-        }
-        (msg_idx, reader.buffer().to_vec())
     }
 
     fn get_message_desc(
@@ -845,6 +806,7 @@ mod tests {
     use crate::rest::mock_dek_registry_client::MockDekRegistryClient;
     use crate::rest::mock_schema_registry_client::MockSchemaRegistryClient;
     use crate::rest::models::{Rule, RuleSet};
+    use crate::rest::schema_registry_client::SchemaRegistryClient;
     use crate::rules::cel::cel_field_executor::CelFieldExecutor;
     use crate::rules::encryption::encrypt_executor::{FakeClock, FieldEncryptionExecutor};
     use crate::rules::encryption::localkms::local_driver::LocalKmsDriver;
@@ -853,7 +815,7 @@ mod tests {
     use crate::serdes::protobuf::tests::test::DependencyMessage;
     use crate::serdes::protobuf::tests::test::TestMessage;
     use crate::serdes::protobuf::tests::test::author::PiiOneof;
-    use crate::serdes::serde::{SerdeFormat, topic_name_strategy};
+    use crate::serdes::serde::{SerdeFormat, SerdeHeaders, header_schema_id_serializer};
     use std::collections::BTreeMap;
 
     pub(crate) mod test {
@@ -873,9 +835,8 @@ mod tests {
             pii_oneof: Some(PiiOneof::OneofString("oneof".to_string())),
         };
         let rule_registry = RuleRegistry::new();
-        let ser = ProtobufSerializer::new(
+        let ser = ProtobufSerializer::with_reference_subject_name_strategy(
             &client,
-            topic_name_strategy,
             default_reference_subject_name_strategy,
             Some(rule_registry.clone()),
             ser_conf,
@@ -891,7 +852,46 @@ mod tests {
 
         let deser = ProtobufDeserializer::new(
             &client,
-            topic_name_strategy,
+            Some(rule_registry.clone()),
+            DeserializerConfig::default(),
+        )
+        .unwrap();
+        let obj2: Author = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        assert_eq!(obj2, obj);
+    }
+
+    #[tokio::test]
+    async fn test_guid_in_header() {
+        let client_conf = ClientConfig::new(vec!["http://localhost:8081".to_string()]);
+        let client = SchemaRegistryClient::new(client_conf);
+        let mut ser_conf = SerializerConfig::default();
+        ser_conf.schema_id_serializer = header_schema_id_serializer;
+        let obj = Author {
+            name: "Kafka".to_string(),
+            id: 123,
+            picture: vec![1u8, 2u8, 3u8],
+            works: vec!["Metamorphosis".to_string(), "The Trial".to_string()],
+            pii_oneof: Some(PiiOneof::OneofString("oneof".to_string())),
+        };
+        let rule_registry = RuleRegistry::new();
+        let ser = ProtobufSerializer::with_reference_subject_name_strategy(
+            &client,
+            default_reference_subject_name_strategy,
+            Some(rule_registry.clone()),
+            ser_conf,
+        )
+        .unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Protobuf,
+            headers: Some(SerdeHeaders::default()),
+        };
+        let bytes = ser.serialize(&ser_ctx, &obj).await.unwrap();
+        client.clear_caches();
+
+        let deser = ProtobufDeserializer::new(
+            &client,
             Some(rule_registry.clone()),
             DeserializerConfig::default(),
         )
@@ -913,9 +913,8 @@ mod tests {
             pii_oneof: Some(PiiOneof::OneofString("oneof".to_string())),
         };
         let rule_registry = RuleRegistry::new();
-        let ser = ProtobufSerializer::new(
+        let ser = ProtobufSerializer::with_reference_subject_name_strategy(
             &client,
-            topic_name_strategy,
             default_reference_subject_name_strategy,
             Some(rule_registry.clone()),
             ser_conf,
@@ -935,7 +934,6 @@ mod tests {
 
         let deser = ProtobufDeserializer::new(
             &client,
-            topic_name_strategy,
             Some(rule_registry.clone()),
             DeserializerConfig::default(),
         )
@@ -971,9 +969,8 @@ mod tests {
             test_message: Some(msg),
         };
         let rule_registry = RuleRegistry::new();
-        let ser = ProtobufSerializer::new(
+        let ser = ProtobufSerializer::with_reference_subject_name_strategy(
             &client,
-            topic_name_strategy,
             default_reference_subject_name_strategy,
             Some(rule_registry.clone()),
             ser_conf,
@@ -989,7 +986,6 @@ mod tests {
 
         let deser = ProtobufDeserializer::new(
             &client,
-            topic_name_strategy,
             Some(rule_registry.clone()),
             DeserializerConfig::default(),
         )
@@ -1046,9 +1042,8 @@ mod tests {
             .unwrap();
         let rule_registry = RuleRegistry::new();
         rule_registry.register_executor(CelFieldExecutor::new());
-        let ser = ProtobufSerializer::new(
+        let ser = ProtobufSerializer::with_reference_subject_name_strategy(
             &client,
-            topic_name_strategy,
             default_reference_subject_name_strategy,
             Some(rule_registry.clone()),
             ser_conf,
@@ -1064,7 +1059,6 @@ mod tests {
 
         let deser = ProtobufDeserializer::new(
             &client,
-            topic_name_strategy,
             Some(rule_registry.clone()),
             DeserializerConfig::default(),
         )
@@ -1136,9 +1130,8 @@ mod tests {
         rule_registry.register_executor(FieldEncryptionExecutor::<MockDekRegistryClient>::new(
             FakeClock::new(0),
         ));
-        let ser = ProtobufSerializer::new(
+        let ser = ProtobufSerializer::with_reference_subject_name_strategy(
             &client,
-            topic_name_strategy,
             default_reference_subject_name_strategy,
             Some(rule_registry.clone()),
             ser_conf,
@@ -1152,13 +1145,8 @@ mod tests {
         };
         let bytes = ser.serialize(&ser_ctx, &obj).await.unwrap();
 
-        let deser = ProtobufDeserializer::new(
-            &client,
-            topic_name_strategy,
-            Some(rule_registry.clone()),
-            deser_conf,
-        )
-        .unwrap();
+        let deser =
+            ProtobufDeserializer::new(&client, Some(rule_registry.clone()), deser_conf).unwrap();
 
         obj = Author {
             name: "Kafka".to_string(),

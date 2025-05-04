@@ -4,9 +4,12 @@ use serde::{Deserialize, Serialize};
 /// RegisteredSchema : Registered schema
 #[derive(Clone, Default, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct RegisteredSchema {
-    /// Globally unique identifier of the schema
+    /// Unique identifier of the schema
     #[serde(rename = "id")]
-    pub id: i32,
+    pub id: Option<i32>,
+    /// Globally unique identifier of the schema
+    #[serde(rename = "guid")]
+    pub guid: Option<String>,
     /// Subject
     #[serde(rename = "subject", skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
@@ -31,7 +34,8 @@ pub struct RegisteredSchema {
 impl RegisteredSchema {
     pub fn new(id: i32) -> RegisteredSchema {
         RegisteredSchema {
-            id,
+            id: Some(id),
+            guid: None,
             subject: None,
             version: None,
             schema_type: None,

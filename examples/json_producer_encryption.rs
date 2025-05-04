@@ -20,9 +20,7 @@ use schema_registry_client::rules::encryption::hcvault::hcvault_driver::HcVaultD
 use schema_registry_client::rules::encryption::localkms::local_driver::LocalKmsDriver;
 use schema_registry_client::serdes::config::{SchemaSelector, SerializerConfig};
 use schema_registry_client::serdes::json::JsonSerializer;
-use schema_registry_client::serdes::serde::{
-    SerdeFormat, SerdeType, SerializationContext, topic_name_strategy,
-};
+use schema_registry_client::serdes::serde::{SerdeFormat, SerdeType, SerializationContext};
 
 mod example_utils;
 
@@ -97,8 +95,8 @@ async fn produce(
         false,
         rule_conf,
     );
-    let ser = JsonSerializer::new(&client, None, topic_name_strategy, None, ser_conf)
-        .expect("Failed to create serializer");
+    let ser =
+        JsonSerializer::new(&client, None, None, ser_conf).expect("Failed to create serializer");
     let ser_ctx = SerializationContext {
         topic: topic_name.to_string(),
         serde_type: SerdeType::Value,

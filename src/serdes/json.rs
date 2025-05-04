@@ -5,22 +5,18 @@ use crate::serdes::config::{DeserializerConfig, SerializerConfig};
 use crate::serdes::rule_registry::RuleRegistry;
 use crate::serdes::serde::SerdeError::Serialization;
 use crate::serdes::serde::{
-    BaseDeserializer, BaseSerializer, FieldTransformer, FieldType, RuleContext, Serde, SerdeError,
-    SerdeSchema, SerdeType, SerdeValue, SerializationContext, SubjectNameStrategy, get_executor,
-    get_executors,
+    BaseDeserializer, BaseSerializer, FieldTransformer, FieldType, RuleContext, SchemaId, Serde,
+    SerdeError, SerdeFormat, SerdeSchema, SerdeType, SerdeValue, SerializationContext,
+    get_executor, get_executors,
 };
 use async_recursion::async_recursion;
 use base64::Engine;
-use byteorder::{BigEndian, ByteOrder, ReadBytesExt};
 use dashmap::DashMap;
 use futures::future::FutureExt;
-use integer_encoding::{VarInt, VarIntReader};
 use jsonschema::{ValidationError, Validator, validator_for};
 use referencing::{Draft, Registry, Resolver, Resource};
-use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::ops::Deref;
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -40,7 +36,6 @@ impl<'a, T: Client + Sync> JsonSerializer<'a, T> {
     pub fn new(
         client: &'a T,
         schema: Option<&'a Schema>,
-        subject_name_strategy: SubjectNameStrategy,
         rule_registry: Option<RuleRegistry>,
         serializer_config: SerializerConfig,
     ) -> Result<JsonSerializer<'a, T>, SerdeError> {
@@ -49,10 +44,7 @@ impl<'a, T: Client + Sync> JsonSerializer<'a, T> {
         }
         Ok(JsonSerializer {
             schema,
-            base: BaseSerializer::new(
-                Serde::new(client, subject_name_strategy, rule_registry),
-                serializer_config,
-            ),
+            base: BaseSerializer::new(Serde::new(client, rule_registry), serializer_config),
             serde: JsonSerde {
                 parsed_schemas: DashMap::new(),
                 validators: DashMap::new(),
@@ -66,7 +58,7 @@ impl<'a, T: Client + Sync> JsonSerializer<'a, T> {
         value: Value,
     ) -> Result<Vec<u8>, SerdeError> {
         let mut value = value;
-        let strategy = self.base.serde.subject_name_strategy;
+        let strategy = self.base.config.subject_name_strategy;
         let subject = strategy(&ctx.topic, &ctx.serde_type, self.schema);
         let subject = subject.ok_or(Serialization(
             "subject name strategy returned None".to_string(),
@@ -79,7 +71,7 @@ impl<'a, T: Client + Sync> JsonSerializer<'a, T> {
 
         let schema_id;
         if let Some(ref schema) = latest_schema {
-            schema_id = schema.id;
+            schema_id = SchemaId::new(SerdeFormat::Json, schema.id, schema.guid.clone(), None)?;
         } else {
             let schema = self
                 .schema
@@ -91,7 +83,7 @@ impl<'a, T: Client + Sync> JsonSerializer<'a, T> {
                     .client
                     .register_schema(&subject, schema, self.base.config.normalize_schemas)
                     .await?;
-                schema_id = rs.id;
+                schema_id = SchemaId::new(SerdeFormat::Json, rs.id, rs.guid.clone(), None)?;
             } else {
                 let rs = self
                     .base
@@ -99,7 +91,7 @@ impl<'a, T: Client + Sync> JsonSerializer<'a, T> {
                     .client
                     .get_by_schema(&subject, schema, self.base.config.normalize_schemas, false)
                     .await?;
-                schema_id = rs.id;
+                schema_id = SchemaId::new(SerdeFormat::Json, rs.id, rs.guid.clone(), None)?;
             }
         }
 
@@ -150,12 +142,8 @@ impl<'a, T: Client + Sync> JsonSerializer<'a, T> {
         }
 
         let encoded_bytes = serde_json::to_vec(&value)?;
-        let mut payload = vec![0u8];
-        let mut buf = [0u8; 4];
-        BigEndian::write_u32(&mut buf, schema_id as u32);
-        payload.extend_from_slice(&buf);
-        payload.extend_from_slice(&encoded_bytes);
-        Ok(payload)
+        let id_ser = self.base.config.schema_id_serializer;
+        id_ser(&encoded_bytes, ctx, &schema_id)
     }
 
     async fn get_parsed_schema(&self, schema: &Schema) -> Result<(Value, Registry), SerdeError> {
@@ -240,7 +228,6 @@ pub struct JsonDeserializer<'a, T: Client> {
 impl<'a, T: Client + Sync> JsonDeserializer<'a, T> {
     pub fn new(
         client: &'a T,
-        subject_name_strategy: SubjectNameStrategy,
         rule_registry: Option<RuleRegistry>,
         deserializer_config: DeserializerConfig,
     ) -> Result<JsonDeserializer<'a, T>, SerdeError> {
@@ -248,10 +235,7 @@ impl<'a, T: Client + Sync> JsonDeserializer<'a, T> {
             executor.configure(client.config(), &deserializer_config.rule_config)?;
         }
         Ok(JsonDeserializer {
-            base: BaseDeserializer::new(
-                Serde::new(client, subject_name_strategy, rule_registry),
-                deserializer_config,
-            ),
+            base: BaseDeserializer::new(Serde::new(client, rule_registry), deserializer_config),
             serde: JsonSerde {
                 parsed_schemas: DashMap::new(),
                 validators: DashMap::new(),
@@ -264,16 +248,7 @@ impl<'a, T: Client + Sync> JsonDeserializer<'a, T> {
         ctx: &SerializationContext,
         data: &[u8],
     ) -> Result<Value, SerdeError> {
-        if data.len() <= 5 {
-            return Err(Serialization(format!(
-                "invalid payload length: {}",
-                data.len()
-            )));
-        }
-        if data[0] != 0 {
-            return Err(Serialization(format!("unexpected magic byte: {}", data[0])));
-        }
-        let strategy = self.base.serde.subject_name_strategy;
+        let strategy = self.base.config.subject_name_strategy;
         let mut subject = strategy(&ctx.topic, &ctx.serde_type, None);
         let mut latest_schema = None;
         let has_subject = subject.is_some();
@@ -289,15 +264,14 @@ impl<'a, T: Client + Sync> JsonDeserializer<'a, T> {
                 .await?;
         }
 
-        let mut buf = &data[1..5];
-        let id = buf
-            .read_u32::<BigEndian>()
-            .map_err(|e| Serialization("could not read schema ID".to_string()))?;
+        let mut schema_id = SchemaId::new(SerdeFormat::Json, None, None, None)?;
+        let id_deser = self.base.config.schema_id_deserializer;
+        let bytes_read = id_deser(data, ctx, &mut schema_id)?;
+        let data = &data[bytes_read..];
+
         let writer_schema_raw = self
             .base
-            .serde
-            .client
-            .get_by_subject_and_id(None, id as i32, None)
+            .get_writer_schema(&schema_id, subject.as_deref(), None)
             .await?;
         let (writer_schema, writer_ref_registry) =
             self.get_parsed_schema(&writer_schema_raw).await?;
@@ -334,7 +308,7 @@ impl<'a, T: Client + Sync> JsonDeserializer<'a, T> {
             reader_ref_registry = writer_ref_registry.clone();
         }
 
-        let mut value = serde_json::from_slice(&data[5..])?;
+        let mut value = serde_json::from_slice(data)?;
         if !migrations.is_empty() {
             let serde_value = self
                 .base
@@ -708,7 +682,7 @@ mod tests {
     use crate::rules::encryption::encrypt_executor::{FakeClock, FieldEncryptionExecutor};
     use crate::rules::encryption::localkms::local_driver::LocalKmsDriver;
     use crate::serdes::config::SchemaSelector;
-    use crate::serdes::serde::{SerdeFormat, topic_name_strategy};
+    use crate::serdes::serde::{SerdeFormat, SerdeHeaders, header_schema_id_serializer};
     use std::collections::BTreeMap;
 
     #[tokio::test]
@@ -756,7 +730,6 @@ mod tests {
         let ser = JsonSerializer::new(
             &client,
             Some(&schema),
-            topic_name_strategy,
             Some(rule_registry.clone()),
             ser_conf,
         )
@@ -771,7 +744,74 @@ mod tests {
 
         let deser = JsonDeserializer::new(
             &client,
-            topic_name_strategy,
+            Some(rule_registry.clone()),
+            DeserializerConfig::default(),
+        )
+        .unwrap();
+        let obj2 = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        assert_eq!(obj2, obj);
+    }
+
+    #[tokio::test]
+    async fn test_guid_in_header() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let mut ser_conf = SerializerConfig::default();
+        ser_conf.schema_id_serializer = header_schema_id_serializer;
+        let schema_str = r#"
+        {
+            "type": "object",
+            "properties": {
+                "intField": {"type": "integer"},
+                "doubleField": {"type": "number"},
+                "stringField": {
+                    "type": "string",
+                    "confluent:tags": ["PII"]
+                },
+                "booleanField": {"type": "boolean"},
+                "bytesField": {
+                    "type": "string",
+                    "contentEncoding": "base64",
+                    "confluent:tags": ["PII"]
+                }
+            }
+        }
+        "#;
+        let schema = Schema {
+            schema_type: Some("JSON".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: None,
+            schema: schema_str.to_string(),
+        };
+        let obj_str = r#"
+        {
+            "intField": 123,
+            "doubleField": 45.67,
+            "stringField": "hi",
+            "booleanField": true,
+            "bytesField": "Zm9vYmFy"
+        }
+        "#;
+        let obj: Value = serde_json::from_str(obj_str).unwrap();
+        let rule_registry = RuleRegistry::new();
+        let ser = JsonSerializer::new(
+            &client,
+            Some(&schema),
+            Some(rule_registry.clone()),
+            ser_conf,
+        )
+        .unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Json,
+            headers: Some(SerdeHeaders::default()),
+        };
+        let bytes = ser.serialize(&ser_ctx, obj.clone()).await.unwrap();
+
+        let deser = JsonDeserializer::new(
+            &client,
             Some(rule_registry.clone()),
             DeserializerConfig::default(),
         )
@@ -860,14 +900,8 @@ mod tests {
         "#;
         let obj: Value = serde_json::from_str(obj_str).unwrap();
         let rule_registry = RuleRegistry::new();
-        let ser = JsonSerializer::new(
-            &client,
-            None,
-            topic_name_strategy,
-            Some(rule_registry.clone()),
-            ser_conf,
-        )
-        .unwrap();
+        let ser =
+            JsonSerializer::new(&client, None, Some(rule_registry.clone()), ser_conf).unwrap();
         let ser_ctx = SerializationContext {
             topic: "test".to_string(),
             serde_type: SerdeType::Value,
@@ -878,7 +912,6 @@ mod tests {
 
         let deser = JsonDeserializer::new(
             &client,
-            topic_name_strategy,
             Some(rule_registry.clone()),
             DeserializerConfig::default(),
         )
@@ -957,14 +990,8 @@ mod tests {
         let mut obj: Value = serde_json::from_str(obj_str).unwrap();
         let rule_registry = RuleRegistry::new();
         rule_registry.register_executor(CelFieldExecutor::new());
-        let ser = JsonSerializer::new(
-            &client,
-            None,
-            topic_name_strategy,
-            Some(rule_registry.clone()),
-            ser_conf,
-        )
-        .unwrap();
+        let ser =
+            JsonSerializer::new(&client, None, Some(rule_registry.clone()), ser_conf).unwrap();
         let ser_ctx = SerializationContext {
             topic: "test".to_string(),
             serde_type: SerdeType::Value,
@@ -975,7 +1002,6 @@ mod tests {
 
         let deser = JsonDeserializer::new(
             &client,
-            topic_name_strategy,
             Some(rule_registry.clone()),
             DeserializerConfig::default(),
         )
@@ -1074,14 +1100,8 @@ mod tests {
         rule_registry.register_executor(FieldEncryptionExecutor::<MockDekRegistryClient>::new(
             FakeClock::new(0),
         ));
-        let ser = JsonSerializer::new(
-            &client,
-            None,
-            topic_name_strategy,
-            Some(rule_registry.clone()),
-            ser_conf,
-        )
-        .unwrap();
+        let ser =
+            JsonSerializer::new(&client, None, Some(rule_registry.clone()), ser_conf).unwrap();
         let ser_ctx = SerializationContext {
             topic: "test".to_string(),
             serde_type: SerdeType::Value,
@@ -1091,7 +1111,6 @@ mod tests {
         let bytes = ser.serialize(&ser_ctx, obj.clone()).await.unwrap();
         let deser = JsonDeserializer::new(
             &client,
-            topic_name_strategy,
             Some(rule_registry.clone()),
             DeserializerConfig::default(),
         )
@@ -1208,14 +1227,8 @@ mod tests {
         rule_registry.register_executor(FieldEncryptionExecutor::<MockDekRegistryClient>::new(
             FakeClock::new(0),
         ));
-        let ser = JsonSerializer::new(
-            &client,
-            None,
-            topic_name_strategy,
-            Some(rule_registry.clone()),
-            ser_conf,
-        )
-        .unwrap();
+        let ser =
+            JsonSerializer::new(&client, None, Some(rule_registry.clone()), ser_conf).unwrap();
         let ser_ctx = SerializationContext {
             topic: "test".to_string(),
             serde_type: SerdeType::Value,
@@ -1225,7 +1238,6 @@ mod tests {
         let bytes = ser.serialize(&ser_ctx, obj.clone()).await.unwrap();
         let deser = JsonDeserializer::new(
             &client,
-            topic_name_strategy,
             Some(rule_registry.clone()),
             DeserializerConfig::default(),
         )

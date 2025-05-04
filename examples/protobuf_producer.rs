@@ -17,12 +17,8 @@ use schema_registry_client::rest::dek_registry_client::DekRegistryClient;
 use schema_registry_client::rest::models::{Kind, Mode, Rule, RuleSet, Schema};
 use schema_registry_client::rest::schema_registry_client::{Client, SchemaRegistryClient};
 use schema_registry_client::serdes::config::SerializerConfig;
-use schema_registry_client::serdes::protobuf::{
-    ProtobufSerializer, default_reference_subject_name_strategy,
-};
-use schema_registry_client::serdes::serde::{
-    SerdeFormat, SerdeType, SerializationContext, topic_name_strategy,
-};
+use schema_registry_client::serdes::protobuf::ProtobufSerializer;
+use schema_registry_client::serdes::serde::{SerdeFormat, SerdeType, SerializationContext};
 
 mod example_utils;
 
@@ -74,14 +70,8 @@ message Pizza {
     "#;
 
     let ser_conf = SerializerConfig::new(true, None, true, false, HashMap::new());
-    let ser = ProtobufSerializer::new(
-        &client,
-        topic_name_strategy,
-        default_reference_subject_name_strategy,
-        None,
-        ser_conf,
-    )
-    .expect("Failed to create serializer");
+    let ser =
+        ProtobufSerializer::new(&client, None, ser_conf).expect("Failed to create serializer");
     let ser_ctx = SerializationContext {
         topic: topic_name.to_string(),
         serde_type: SerdeType::Value,
