@@ -316,7 +316,7 @@ impl SerdeHeaders {
         }
     }
 
-    fn iter(&self) -> SerdeHeadersIter<'_>
+    pub fn iter(&self) -> SerdeHeadersIter<'_>
     where
         Self: Sized,
     {
