@@ -1,6 +1,6 @@
 [package]
 name = "schema-registry-client"
-version = "0.3.0"
+version = "0.3.1"
 authors = ["Robert Yokota <rayokota@gmail.com>"]
 include = ["src/**/*", "Cargo.toml"]
 description = "Serialize/deserialize data to/from Kafka using the Confluent Schema Registry"
