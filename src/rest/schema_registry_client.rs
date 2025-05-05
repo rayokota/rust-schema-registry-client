@@ -141,7 +141,12 @@ impl Client for SchemaRegistryClient {
             let mut store = self.store.lock().unwrap();
             let rs: RegisteredSchema = serde_json::from_str(&content)?;
             // The registered schema may not be fully populated
-            store.set_schema(Some(subject.to_string()), rs.id, rs.guid.clone(), schema);
+            let s = if rs.schema.is_some() {
+                &rs.to_schema()
+            } else {
+                schema
+            };
+            store.set_schema(Some(subject.to_string()), rs.id, rs.guid.clone(), &s);
             Ok(rs)
         } else {
             let entity = serde_json::from_str(&content).ok();
