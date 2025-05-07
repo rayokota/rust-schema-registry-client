@@ -31,7 +31,7 @@ aws-config = { version="1.6.1", features = ["behavior-version-latest"], optional
 aws-credential-types = { version = "1.2.2", features = ["hardcoded-credentials"], optional = true }
 aws-sdk-kms = { version="1.65.0", features = ["behavior-version-latest"], optional = true }
 azure_core = { version = "0.21.0", optional = true }
-azure_identity = { version = "0.21.0", optional = true }
+azure_identity = { version = "0.24.0", optional = true }
 azure_security_keyvault = { version = "0.21.0", optional = true }
 base64 = "0.22.1"
 bumpalo = { version = "3.17.0", optional = true }
