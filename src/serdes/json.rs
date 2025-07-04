@@ -1,5 +1,5 @@
-use crate::rest::models::Schema;
 use crate::rest::models::{Kind, Mode};
+use crate::rest::models::{Phase, Schema};
 use crate::rest::schema_registry_client::Client;
 use crate::serdes::config::{DeserializerConfig, SerializerConfig};
 use crate::serdes::rule_registry::RuleRegistry;
@@ -141,7 +141,31 @@ impl<'a, T: Client + Sync> JsonSerializer<'a, T> {
             validator.validate(&value)?;
         }
 
-        let encoded_bytes = serde_json::to_vec(&value)?;
+        let mut encoded_bytes = serde_json::to_vec(&value)?;
+        if let Some(ref latest_schema) = latest_schema {
+            let schema = latest_schema.to_schema();
+            if let Some(ref rule_set) = schema.rule_set {
+                if rule_set.encoding_rules.is_some() {
+                    encoded_bytes = self
+                        .base
+                        .serde
+                        .execute_rules_with_phase(
+                            ctx,
+                            &subject,
+                            Phase::Encoding,
+                            Mode::Write,
+                            None,
+                            Some(&schema),
+                            None,
+                            &SerdeValue::new_bytes(SerdeFormat::Json, &encoded_bytes),
+                            None,
+                        )
+                        .await?
+                        .as_bytes();
+                }
+            }
+        }
+
         let id_ser = self.base.config.schema_id_serializer;
         id_ser(&encoded_bytes, ctx, &schema_id)
     }
@@ -267,7 +291,7 @@ impl<'a, T: Client + Sync> JsonDeserializer<'a, T> {
         let mut schema_id = SchemaId::new(SerdeFormat::Json, None, None, None)?;
         let id_deser = self.base.config.schema_id_deserializer;
         let bytes_read = id_deser(data, ctx, &mut schema_id)?;
-        let data = &data[bytes_read..];
+        let mut data = &data[bytes_read..];
 
         let writer_schema_raw = self
             .base
@@ -287,6 +311,28 @@ impl<'a, T: Client + Sync> JsonDeserializer<'a, T> {
             }
         }
         let subject = subject.unwrap();
+        let serde_value;
+        if let Some(ref rule_set) = writer_schema_raw.rule_set {
+            if rule_set.encoding_rules.is_some() {
+                serde_value = self
+                    .base
+                    .serde
+                    .execute_rules_with_phase(
+                        ctx,
+                        &subject,
+                        Phase::Encoding,
+                        Mode::Read,
+                        None,
+                        Some(&writer_schema_raw),
+                        None,
+                        &SerdeValue::new_bytes(SerdeFormat::Json, data),
+                        None,
+                    )
+                    .await?
+                    .as_bytes();
+                data = &serde_value;
+            }
+        }
 
         let migrations;
         let reader_schema_raw;
@@ -679,7 +725,9 @@ mod tests {
     use crate::rest::mock_schema_registry_client::MockSchemaRegistryClient;
     use crate::rest::models::{Rule, RuleSet, SchemaReference};
     use crate::rules::cel::cel_field_executor::CelFieldExecutor;
-    use crate::rules::encryption::encrypt_executor::{FakeClock, FieldEncryptionExecutor};
+    use crate::rules::encryption::encrypt_executor::{
+        EncryptionExecutor, FakeClock, FieldEncryptionExecutor,
+    };
     use crate::rules::encryption::localkms::local_driver::LocalKmsDriver;
     use crate::serdes::config::SchemaSelector;
     use crate::serdes::serde::{SerdeFormat, SerdeHeaders, header_schema_id_serializer};
@@ -966,6 +1014,7 @@ mod tests {
         let rule_set = RuleSet {
             migration_rules: None,
             domain_rules: Some(vec![rule]),
+            encoding_rules: None,
         };
         let schema = Schema {
             schema_type: Some("JSON".to_string()),
@@ -1074,6 +1123,7 @@ mod tests {
         let rule_set = RuleSet {
             migration_rules: None,
             domain_rules: Some(vec![rule]),
+            encoding_rules: None,
         };
         let schema = Schema {
             schema_type: Some("JSON".to_string()),
@@ -1098,6 +1148,106 @@ mod tests {
         let obj: Value = serde_json::from_str(obj_str).unwrap();
         let rule_registry = RuleRegistry::new();
         rule_registry.register_executor(FieldEncryptionExecutor::<MockDekRegistryClient>::new(
+            FakeClock::new(0),
+        ));
+        let ser =
+            JsonSerializer::new(&client, None, Some(rule_registry.clone()), ser_conf).unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Json,
+            headers: None,
+        };
+        let bytes = ser.serialize(&ser_ctx, obj.clone()).await.unwrap();
+        let deser = JsonDeserializer::new(
+            &client,
+            Some(rule_registry.clone()),
+            DeserializerConfig::default(),
+        )
+        .unwrap();
+
+        let obj2 = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        assert_eq!(obj2, obj);
+    }
+
+    #[tokio::test]
+    async fn test_payload_encryption() {
+        LocalKmsDriver::register();
+
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let rule_conf = HashMap::from([("secret".to_string(), "mysecret".to_string())]);
+        let ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            false,
+            false,
+            rule_conf,
+        );
+        let schema_str = r#"
+        {
+            "type": "object",
+            "properties": {
+                "intField": {"type": "integer"},
+                "doubleField": {"type": "number"},
+                "stringField": {
+                    "type": "string",
+                    "confluent:tags": ["PII"]
+                },
+                "booleanField": {"type": "boolean"},
+                "bytesField": {
+                    "type": "string",
+                    "contentEncoding": "base64",
+                    "confluent:tags": ["PII"]
+                }
+            }
+        }
+        "#;
+        let rule = Rule {
+            name: "test-encrypt".to_string(),
+            doc: None,
+            kind: Some(Kind::Transform),
+            mode: Some(Mode::WriteRead),
+            r#type: "ENCRYPT_PAYLOAD".to_string(),
+            tags: None,
+            params: Some(BTreeMap::from([
+                ("encrypt.kek.name".to_string(), "kek1".to_string()),
+                ("encrypt.kms.type".to_string(), "local-kms".to_string()),
+                ("encrypt.kms.key.id".to_string(), "mykey".to_string()),
+            ])),
+            expr: None,
+            on_success: None,
+            on_failure: Some("ERROR,NONE".to_string()),
+            disabled: None,
+        };
+        let rule_set = RuleSet {
+            migration_rules: None,
+            domain_rules: None,
+            encoding_rules: Some(vec![rule]),
+        };
+        let schema = Schema {
+            schema_type: Some("JSON".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(rule_set)),
+            schema: schema_str.to_string(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+        let obj_str = r#"
+        {
+            "intField": 123,
+            "doubleField": 45.67,
+            "stringField": "hi",
+            "booleanField": true,
+            "bytesField": "Zm9vYmFy"
+        }
+        "#;
+        let obj: Value = serde_json::from_str(obj_str).unwrap();
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(EncryptionExecutor::<MockDekRegistryClient>::new(
             FakeClock::new(0),
         ));
         let ser =
@@ -1192,6 +1342,7 @@ mod tests {
         let rule_set = RuleSet {
             migration_rules: None,
             domain_rules: Some(vec![rule]),
+            encoding_rules: None,
         };
         let refs = vec![SchemaReference {
             name: Some("ref".to_string()),

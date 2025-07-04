@@ -1,7 +1,7 @@
 use crate::rest::apis::Error as RestError;
 use crate::rest::client_config::ClientConfig;
 use crate::rest::models::Mode::{Downgrade, Upgrade};
-use crate::rest::models::{Kind, Mode, RegisteredSchema, Rule, RuleSet, Schema};
+use crate::rest::models::{Kind, Mode, Phase, RegisteredSchema, Rule, RuleSet, Schema};
 use crate::rest::schema_registry_client::Client;
 use crate::serdes::config::{DeserializerConfig, SchemaSelector, SerializerConfig};
 use crate::serdes::rule_registry::{
@@ -162,7 +162,7 @@ pub enum SerdeValue {
 }
 
 impl SerdeValue {
-    pub fn new_string(format: &SerdeFormat, value: &str) -> SerdeValue {
+    pub fn new_string(format: SerdeFormat, value: &str) -> SerdeValue {
         match format {
             SerdeFormat::Avro => {
                 SerdeValue::Avro(apache_avro::types::Value::String(value.to_string()))
@@ -174,7 +174,7 @@ impl SerdeValue {
         }
     }
 
-    pub fn new_bytes(format: &SerdeFormat, value: &[u8]) -> SerdeValue {
+    pub fn new_bytes(format: SerdeFormat, value: &[u8]) -> SerdeValue {
         match format {
             SerdeFormat::Avro => SerdeValue::Avro(apache_avro::types::Value::Bytes(value.to_vec())),
             SerdeFormat::Json => {
@@ -514,6 +514,32 @@ impl<'a, T: Client> Serde<'a, T> {
         msg: &SerdeValue,
         field_transformer: Option<Arc<FieldTransformer>>,
     ) -> Result<SerdeValue, SerdeError> {
+        self.execute_rules_with_phase(
+            ser_ctx,
+            subject,
+            Phase::Domain,
+            rule_mode,
+            source,
+            target,
+            parsed_target,
+            msg,
+            field_transformer,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_rules_with_phase(
+        &self,
+        ser_ctx: &SerializationContext,
+        subject: &str,
+        rule_phase: Phase,
+        rule_mode: Mode,
+        source: Option<&Schema>,
+        target: Option<&Schema>,
+        parsed_target: Option<&SerdeSchema>,
+        msg: &SerdeValue,
+        field_transformer: Option<Arc<FieldTransformer>>,
+    ) -> Result<SerdeValue, SerdeError> {
         let mut rules: Vec<Rule>;
         match rule_mode {
             Upgrade => rules = self.get_migration_rules(target),
@@ -522,7 +548,11 @@ impl<'a, T: Client> Serde<'a, T> {
                 rules.reverse()
             }
             _ => {
-                rules = self.get_domain_rules(target);
+                rules = if rule_phase == Phase::Encoding {
+                    self.get_encoding_rules(target)
+                } else {
+                    self.get_domain_rules(target)
+                };
                 if rule_mode == Mode::Read {
                     rules.reverse()
                 }
@@ -647,6 +677,13 @@ impl<'a, T: Client> Serde<'a, T> {
             .unwrap_or_default()
     }
 
+    fn get_encoding_rules(&self, schema: Option<&Schema>) -> Vec<Rule> {
+        schema
+            .and_then(|schema| schema.rule_set.clone())
+            .and_then(|rule_set| rule_set.encoding_rules)
+            .unwrap_or_default()
+    }
+
     fn get_on_success(&self, rule: &Rule) -> Option<String> {
         get_override(self.rule_registry.as_ref(), &rule.r#type)
             .and_then(|rule_override| rule_override.on_success.clone())
@@ -717,27 +754,31 @@ impl<'a, T: Client> Serde<'a, T> {
         get_action(self.rule_registry.as_ref(), action_name)
     }
 
-    fn has_rules(&self, rule_set: Option<&RuleSet>, mode: Mode) -> bool {
+    fn has_rules(&self, rule_set: Option<&RuleSet>, phase: Phase, mode: Mode) -> bool {
         if rule_set.is_none() {
             return false;
         }
-        let migration_rules = rule_set.unwrap().migration_rules.as_ref();
-        if migration_rules.is_none() {
+        let rules = match phase {
+            Phase::Migration => rule_set.unwrap().migration_rules.as_ref(),
+            Phase::Domain => rule_set.unwrap().domain_rules.as_ref(),
+            Phase::Encoding => rule_set.unwrap().encoding_rules.as_ref(),
+        };
+        if rules.is_none() {
             return false;
         }
-        let mut migration_rules = migration_rules.unwrap().iter();
+        let mut rules = rules.unwrap().iter();
         match mode {
-            Upgrade | Downgrade => migration_rules.any(|rule| {
+            Upgrade | Downgrade => rules.any(|rule| {
                 rule.mode
                     .map(|m| m == mode || m == Mode::UpDown)
                     .unwrap_or(false)
             }),
-            Mode::Write | Mode::Read => migration_rules.any(|rule| {
+            Mode::Write | Mode::Read => rules.any(|rule| {
                 rule.mode
                     .map(|m| m == mode || m == Mode::WriteRead)
                     .unwrap_or(false)
             }),
-            _ => migration_rules.any(|rule| rule.mode.map(|m| m == mode).unwrap_or(false)),
+            _ => rules.any(|rule| rule.mode.map(|m| m == mode).unwrap_or(false)),
         }
     }
 
@@ -780,7 +821,11 @@ impl<'a, T: Client> Serde<'a, T> {
                 previous = Some(version);
                 continue;
             }
-            if self.has_rules(version.rule_set.as_deref(), migration_mode) {
+            if self.has_rules(
+                version.rule_set.as_deref(),
+                Phase::Migration,
+                migration_mode,
+            ) {
                 let migration: Migration = if migration_mode == Upgrade {
                     Migration {
                         rule_mode: migration_mode,
@@ -837,9 +882,10 @@ impl<'a, T: Client> Serde<'a, T> {
             let source = migration.source.as_ref().map(|s| s.to_schema());
             let target = migration.target.as_ref().map(|s| s.to_schema());
             let result = self
-                .execute_rules(
+                .execute_rules_with_phase(
                     ser_ctx,
                     subject,
+                    Phase::Migration,
                     migration.rule_mode,
                     source.as_ref(),
                     target.as_ref(),

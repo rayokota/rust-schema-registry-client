@@ -7,7 +7,7 @@ use crate::rules::encryption::kms_driver::KmsDriver;
 use crate::rules::encryption::{get_kms_client, get_kms_driver, register_kms_client};
 use crate::serdes::serde::SerdeError::{Rest, Rule};
 use crate::serdes::serde::{
-    FieldContext, FieldRuleExecutor, FieldType, RuleBase, RuleContext, SerdeError, SerdeValue,
+    FieldRuleExecutor, FieldType, RuleBase, RuleContext, RuleExecutor, SerdeError, SerdeValue,
 };
 use async_trait::async_trait;
 use base64::Engine;
@@ -74,13 +74,13 @@ impl Clock for FakeClock {
     }
 }
 
-pub struct FieldEncryptionExecutor<T: Client> {
+pub struct EncryptionExecutor<T: Client> {
     pub(crate) client: OnceLock<T>,
     config: RwLock<HashMap<String, String>>,
     clock: Arc<dyn Clock>,
 }
 
-impl<T: Client + Sync + 'static> RuleBase for FieldEncryptionExecutor<T> {
+impl<T: Client + Sync + 'static> RuleBase for EncryptionExecutor<T> {
     fn configure(
         &self,
         client_config: &ClientConfig,
@@ -109,7 +109,7 @@ impl<T: Client + Sync + 'static> RuleBase for FieldEncryptionExecutor<T> {
     }
 
     fn get_type(&self) -> &'static str {
-        "ENCRYPT"
+        "ENCRYPT_PAYLOAD"
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -117,11 +117,11 @@ impl<T: Client + Sync + 'static> RuleBase for FieldEncryptionExecutor<T> {
     }
 }
 
-impl<T: Client + Clone + Sync + 'static> FieldEncryptionExecutor<T> {
+impl<T: Client + Clone + Sync + 'static> EncryptionExecutor<T> {
     pub fn new<C: Clock + 'static>(clock: C) -> Self {
         tink_aead::init();
         tink_daead::init();
-        FieldEncryptionExecutor {
+        EncryptionExecutor {
             client: OnceLock::new(),
             config: RwLock::new(HashMap::new()),
             clock: Arc::new(clock),
@@ -171,32 +171,38 @@ impl<T: Client + Clone + Sync + 'static> FieldEncryptionExecutor<T> {
         }
     }
 
+    fn new_transform(
+        &self,
+        ctx: &mut RuleContext,
+    ) -> Result<EncryptionExecutorTransform<T>, SerdeError> {
+        let cryptor = self.get_cryptor(ctx)?;
+        let kek_name = self.get_kek_name(ctx)?;
+        let dek_expiry_days = self.get_dek_expiry_days(ctx)?;
+        Ok(EncryptionExecutorTransform {
+            executor: self,
+            cryptor,
+            kek_name,
+            kek: OnceLock::new(),
+            dek_expiry_days,
+        })
+    }
+
     pub fn register() {
-        crate::serdes::rule_registry::register_rule_executor(FieldEncryptionExecutor::<T>::new(
+        crate::serdes::rule_registry::register_rule_executor(EncryptionExecutor::<T>::new(
             SystemClock::new(),
         ));
     }
 }
 
 #[async_trait]
-impl<T: Client + Clone + Sync + 'static> FieldRuleExecutor for FieldEncryptionExecutor<T> {
-    async fn transform_field(
+impl<T: Client + Clone + Sync + 'static> RuleExecutor for EncryptionExecutor<T> {
+    async fn transform(
         &self,
         ctx: &mut RuleContext,
-        field_value: &SerdeValue,
+        msg: &SerdeValue,
     ) -> Result<SerdeValue, SerdeError> {
-        let field_ctx = ctx.current_field().expect("no field context");
-        let cryptor = self.get_cryptor(ctx)?;
-        let kek_name = self.get_kek_name(ctx)?;
-        let dek_expiry_days = self.get_dek_expiry_days(ctx)?;
-        let transform = FieldEncryptionExecutorTransform {
-            executor: self,
-            cryptor,
-            kek_name,
-            kek: OnceLock::new(),
-            dek_expiry_days,
-        };
-        transform.transform(ctx, field_ctx, field_value).await
+        let transform = self.new_transform(ctx)?;
+        transform.transform(ctx, FieldType::Bytes, msg).await
     }
 }
 
@@ -309,15 +315,15 @@ impl Cryptor {
     }
 }
 
-pub(crate) struct FieldEncryptionExecutorTransform<'a, T: Client> {
-    pub executor: &'a FieldEncryptionExecutor<T>,
+pub(crate) struct EncryptionExecutorTransform<'a, T: Client> {
+    pub executor: &'a EncryptionExecutor<T>,
     pub cryptor: Cryptor,
     pub kek_name: String,
     pub kek: OnceLock<Kek>,
     pub dek_expiry_days: i64,
 }
 
-impl<T: Client> FieldEncryptionExecutorTransform<'_, T> {
+impl<T: Client> EncryptionExecutorTransform<'_, T> {
     fn is_dek_rotated(&self) -> bool {
         self.dek_expiry_days > 0
     }
@@ -684,17 +690,14 @@ impl<T: Client> FieldEncryptionExecutorTransform<'_, T> {
     async fn transform(
         &self,
         ctx: &RuleContext,
-        field_ctx: &FieldContext,
+        field_type: FieldType,
         field_value: &SerdeValue,
     ) -> Result<SerdeValue, SerdeError> {
         match ctx.rule_mode {
             Mode::Write => {
-                let plaintext = self.to_bytes(field_ctx.get_field_type(), field_value);
+                let plaintext = self.to_bytes(field_type, field_value);
                 if plaintext.is_none() {
-                    return Err(Rule(format!(
-                        "unsupported field type {}",
-                        field_ctx.get_field_type()
-                    )));
+                    return Err(Rule(format!("unsupported field type {}", field_type)));
                 }
                 let version = if self.is_dek_rotated() {
                     Some(-1)
@@ -714,29 +717,26 @@ impl<T: Client> FieldEncryptionExecutorTransform<'_, T> {
                 if self.is_dek_rotated() {
                     ciphertext = self.prefix_version(dek.version, &ciphertext);
                 }
-                if let FieldType::String = field_ctx.get_field_type() {
+                if let FieldType::String = field_type {
                     let encrypted_value_str = BASE64_STANDARD.encode(&ciphertext);
                     Ok(SerdeValue::new_string(
-                        &ctx.ser_ctx.serde_format,
+                        ctx.ser_ctx.serde_format,
                         &encrypted_value_str,
                     ))
                 } else {
-                    Ok(SerdeValue::new_bytes(
-                        &ctx.ser_ctx.serde_format,
-                        &ciphertext,
-                    ))
+                    Ok(SerdeValue::new_bytes(ctx.ser_ctx.serde_format, &ciphertext))
                 }
             }
             Mode::Read => {
                 let mut ciphertext;
-                if let FieldType::String = field_ctx.get_field_type() {
+                if let FieldType::String = field_type {
                     ciphertext = Some(
                         BASE64_STANDARD
                             .decode(field_value.as_string())
                             .map_err(|e| Rule("could not decode base64 ciphertext".to_string()))?,
                     );
                 } else {
-                    ciphertext = self.to_bytes(field_ctx.get_field_type(), field_value);
+                    ciphertext = self.to_bytes(field_type, field_value);
                 }
                 if ciphertext.is_none() {
                     return Ok(field_value.clone());
@@ -759,7 +759,7 @@ impl<T: Client> FieldEncryptionExecutorTransform<'_, T> {
                     EMPTY_AAD,
                 )?;
                 Ok(self
-                    .to_object(ctx, field_ctx.get_field_type(), &plaintext)
+                    .to_object(ctx, field_type, &plaintext)
                     .unwrap_or(field_value.clone()))
             }
             _ => Err(Rule("unsupported rule mode".to_string())),
@@ -802,10 +802,10 @@ impl<T: Client> FieldEncryptionExecutorTransform<'_, T> {
     ) -> Option<SerdeValue> {
         match field_type {
             FieldType::String => Some(SerdeValue::new_string(
-                &ctx.ser_ctx.serde_format,
+                ctx.ser_ctx.serde_format,
                 &String::from_utf8_lossy(value),
             )),
-            FieldType::Bytes => Some(SerdeValue::new_bytes(&ctx.ser_ctx.serde_format, value)),
+            FieldType::Bytes => Some(SerdeValue::new_bytes(ctx.ser_ctx.serde_format, value)),
             _ => None,
         }
     }
@@ -842,5 +842,58 @@ impl<T: Client> FieldEncryptionExecutorTransform<'_, T> {
         let kms_client = kms_driver.new_kms_client(config, kek_url)?;
         register_kms_client(kms_client);
         Ok(get_kms_client(kek_url)?)
+    }
+}
+
+pub struct FieldEncryptionExecutor<T: Client> {
+    pub(crate) executor: EncryptionExecutor<T>,
+}
+
+impl<T: Client + Sync + 'static> RuleBase for FieldEncryptionExecutor<T> {
+    fn configure(
+        &self,
+        client_config: &ClientConfig,
+        rule_config: &HashMap<String, String>,
+    ) -> Result<(), SerdeError> {
+        self.executor.configure(client_config, rule_config)
+    }
+
+    fn get_type(&self) -> &'static str {
+        "ENCRYPT"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl<T: Client + Clone + Sync + 'static> FieldEncryptionExecutor<T> {
+    pub fn new<C: Clock + 'static>(clock: C) -> Self {
+        tink_aead::init();
+        tink_daead::init();
+        FieldEncryptionExecutor {
+            executor: EncryptionExecutor::new(clock),
+        }
+    }
+
+    pub fn register() {
+        crate::serdes::rule_registry::register_rule_executor(FieldEncryptionExecutor::<T>::new(
+            SystemClock::new(),
+        ));
+    }
+}
+
+#[async_trait]
+impl<T: Client + Clone + Sync + 'static> FieldRuleExecutor for FieldEncryptionExecutor<T> {
+    async fn transform_field(
+        &self,
+        ctx: &mut RuleContext,
+        field_value: &SerdeValue,
+    ) -> Result<SerdeValue, SerdeError> {
+        let transform = self.executor.new_transform(ctx)?;
+        let field_ctx = ctx.current_field().expect("no field context");
+        transform
+            .transform(ctx, field_ctx.get_field_type(), field_value)
+            .await
     }
 }

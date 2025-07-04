@@ -102,6 +102,7 @@ message Pizza {
     let rule_set = RuleSet {
         migration_rules: None,
         domain_rules: Some(vec![rule]),
+        encoding_rules: None,
     };
     let schema = Schema {
         schema_type: Some("PROTOBUF".to_string()),

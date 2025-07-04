@@ -1,5 +1,5 @@
 use crate::DESCRIPTOR_POOL;
-use crate::rest::models::{Kind, Mode};
+use crate::rest::models::{Kind, Mode, Phase};
 use crate::rest::models::{Schema, SchemaReference};
 use crate::rest::schema_registry_client::Client;
 use crate::serdes::config::{DeserializerConfig, SerializerConfig};
@@ -178,7 +178,7 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
                     &subject,
                     Mode::Write,
                     None,
-                    Some(&latest_schema.to_schema()),
+                    Some(&schema),
                     Some(&SerdeSchema::Protobuf(fd.clone())),
                     &SerdeValue::Protobuf(Value::Message(msg)),
                     Some(Arc::new(field_transformer)),
@@ -189,6 +189,26 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
                 _ => return Err(Serialization("unexpected serde value".to_string())),
             };
             msg.encode(&mut encoded_bytes)?;
+            if let Some(ref rule_set) = schema.rule_set {
+                if rule_set.encoding_rules.is_some() {
+                    encoded_bytes = self
+                        .base
+                        .serde
+                        .execute_rules_with_phase(
+                            ctx,
+                            &subject,
+                            Phase::Encoding,
+                            Mode::Write,
+                            None,
+                            Some(&schema),
+                            None,
+                            &SerdeValue::new_bytes(SerdeFormat::Protobuf, &encoded_bytes),
+                            None,
+                        )
+                        .await?
+                        .as_bytes();
+                }
+            }
         } else {
             value.encode(&mut encoded_bytes)?;
         }
@@ -421,7 +441,7 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
         let id_deser = self.base.config.schema_id_deserializer;
         let bytes_read = id_deser(data, ctx, &mut schema_id)?;
         let msg_index = schema_id.message_indexes.clone().unwrap_or_default();
-        let data = &data[bytes_read..];
+        let mut data = &data[bytes_read..];
 
         let writer_schema_raw = self
             .base
@@ -441,6 +461,28 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
             }
         }
         let subject = subject.unwrap();
+        let serde_value;
+        if let Some(ref rule_set) = writer_schema_raw.rule_set {
+            if rule_set.encoding_rules.is_some() {
+                serde_value = self
+                    .base
+                    .serde
+                    .execute_rules_with_phase(
+                        ctx,
+                        &subject,
+                        Phase::Encoding,
+                        Mode::Read,
+                        None,
+                        Some(&writer_schema_raw),
+                        None,
+                        &SerdeValue::new_bytes(SerdeFormat::Protobuf, data),
+                        None,
+                    )
+                    .await?
+                    .as_bytes();
+                data = &serde_value;
+            }
+        }
 
         let migrations;
         let reader_schema_raw;
@@ -808,7 +850,9 @@ mod tests {
     use crate::rest::models::{Rule, RuleSet};
     use crate::rest::schema_registry_client::SchemaRegistryClient;
     use crate::rules::cel::cel_field_executor::CelFieldExecutor;
-    use crate::rules::encryption::encrypt_executor::{FakeClock, FieldEncryptionExecutor};
+    use crate::rules::encryption::encrypt_executor::{
+        EncryptionExecutor, FakeClock, FieldEncryptionExecutor,
+    };
     use crate::rules::encryption::localkms::local_driver::LocalKmsDriver;
     use crate::serdes::config::SchemaSelector;
     use crate::serdes::protobuf::tests::test::Author;
@@ -1027,6 +1071,7 @@ mod tests {
         let rule_set = RuleSet {
             migration_rules: None,
             domain_rules: Some(vec![rule]),
+            encoding_rules: None,
         };
         let schema = Schema {
             schema_type: Some("PROTOBUF".to_string()),
@@ -1113,6 +1158,7 @@ mod tests {
         let rule_set = RuleSet {
             migration_rules: None,
             domain_rules: Some(vec![rule]),
+            encoding_rules: None,
         };
         let schema = Schema {
             schema_type: Some("PROTOBUF".to_string()),
@@ -1127,6 +1173,88 @@ mod tests {
             .unwrap();
         let rule_registry = RuleRegistry::new();
         rule_registry.register_executor(FieldEncryptionExecutor::<MockDekRegistryClient>::new(
+            FakeClock::new(0),
+        ));
+        let ser = ProtobufSerializer::with_reference_subject_name_strategy(
+            &client,
+            default_reference_subject_name_strategy,
+            Some(rule_registry.clone()),
+            ser_conf,
+        )
+        .unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Protobuf,
+            headers: None,
+        };
+        let bytes = ser.serialize(&ser_ctx, &obj).await.unwrap();
+
+        let deser =
+            ProtobufDeserializer::new(&client, Some(rule_registry.clone()), deser_conf).unwrap();
+
+        obj = Author {
+            name: "Kafka".to_string(),
+            id: 123,
+            picture: vec![1u8, 2u8, 3u8],
+            works: vec!["Metamorphosis".to_string(), "The Trial".to_string()],
+            pii_oneof: Some(PiiOneof::OneofString("oneof".to_string())),
+        };
+        let obj2: Author = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        assert_eq!(obj2, obj);
+    }
+
+    #[tokio::test]
+    async fn test_payload_encryption() {
+        LocalKmsDriver::register();
+
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let rule_conf = HashMap::from([("secret".to_string(), "mysecret".to_string())]);
+        let ser_conf = SerializerConfig::new(false, None, true, false, rule_conf.clone());
+        let deser_conf = DeserializerConfig::new(None, false, rule_conf);
+        let mut obj = Author {
+            name: "Kafka".to_string(),
+            id: 123,
+            picture: vec![1u8, 2u8, 3u8],
+            works: vec!["Metamorphosis".to_string(), "The Trial".to_string()],
+            pii_oneof: Some(PiiOneof::OneofString("oneof".to_string())),
+        };
+        let rule = Rule {
+            name: "test-encrypt".to_string(),
+            doc: None,
+            kind: Some(Kind::Transform),
+            mode: Some(Mode::WriteRead),
+            r#type: "ENCRYPT_PAYLOAD".to_string(),
+            tags: None,
+            params: Some(BTreeMap::from([
+                ("encrypt.kek.name".to_string(), "kek1".to_string()),
+                ("encrypt.kms.type".to_string(), "local-kms".to_string()),
+                ("encrypt.kms.key.id".to_string(), "mykey".to_string()),
+            ])),
+            expr: None,
+            on_success: None,
+            on_failure: Some("ERROR,NONE".to_string()),
+            disabled: None,
+        };
+        let rule_set = RuleSet {
+            migration_rules: None,
+            domain_rules: None,
+            encoding_rules: Some(vec![rule]),
+        };
+        let schema = Schema {
+            schema_type: Some("PROTOBUF".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(rule_set)),
+            schema: schema_to_str(&obj.descriptor().parent_file()).unwrap(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(EncryptionExecutor::<MockDekRegistryClient>::new(
             FakeClock::new(0),
         ));
         let ser = ProtobufSerializer::with_reference_subject_name_strategy(

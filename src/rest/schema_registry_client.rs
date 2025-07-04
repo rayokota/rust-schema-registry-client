@@ -146,7 +146,7 @@ impl Client for SchemaRegistryClient {
             } else {
                 schema
             };
-            store.set_schema(Some(subject.to_string()), rs.id, rs.guid.clone(), &s);
+            store.set_schema(Some(subject.to_string()), rs.id, rs.guid.clone(), s);
             Ok(rs)
         } else {
             let entity = serde_json::from_str(&content).ok();
