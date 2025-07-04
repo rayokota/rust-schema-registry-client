@@ -81,4 +81,4 @@ tokio = { version = "1.46", features = ["macros"] }
 
 [build-dependencies]
 prost-build = "0.13.5"
-prost-reflect-build = "0.15.2"
+prost-reflect-build = "0.16.0"
