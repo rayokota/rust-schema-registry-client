@@ -55,7 +55,7 @@ impl AwsAead {
             None => Err(TinkError::new("no ciphertext in response")),
         };
         if result.is_err() {
-            error!("failed to encrypt: {:?}", result);
+            error!("failed to encrypt: {result:?}");
         }
         if sender.send(result).is_err() {
             error!("failed to send result");
@@ -93,7 +93,7 @@ impl AwsAead {
             None => Err(TinkError::new("no plaintext in response")),
         };
         if result.is_err() {
-            error!("failed to decrypt: {:?}", result);
+            error!("failed to decrypt: {result:?}");
         }
         if sender.send(result).is_err() {
             error!("failed to send result");

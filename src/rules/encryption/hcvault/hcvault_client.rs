@@ -42,7 +42,7 @@ impl HcVaultClient {
         let mut vault_url =
             parsed.scheme().to_string() + "://" + parsed.host_str().unwrap_or("localhost");
         if let Some(port) = parsed.port() {
-            vault_url.push_str(&format!(":{}", port));
+            vault_url.push_str(&format!(":{port}"));
         }
 
         let client_settings = VaultClientSettingsBuilder::default()

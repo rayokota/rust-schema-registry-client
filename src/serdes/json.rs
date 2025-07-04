@@ -597,8 +597,7 @@ async fn transform(
                     executor
                         .as_field_rule_executor()
                         .ok_or(SerdeError::Rule(format!(
-                            "executor {} is not a field rule executor",
-                            field_executor_type
+                            "executor {field_executor_type} is not a field rule executor"
                         )))?;
                 let new_value = field_executor.transform_field(ctx, &message_value).await?;
                 if let SerdeValue::Json(v) = new_value {
@@ -643,7 +642,7 @@ async fn transform_field_with_ctx(
     if let Some(Kind::Condition) = ctx.rule.kind {
         if let Value::Bool(b) = new_value {
             if !b {
-                return Err(SerdeError::RuleCondition(ctx.rule.clone()));
+                return Err(SerdeError::RuleCondition(Box::new(ctx.rule.clone())));
             }
         }
     }

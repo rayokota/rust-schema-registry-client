@@ -241,7 +241,7 @@ pub enum SerdeSchema {
 #[derive(thiserror::Error, Debug)]
 pub enum SerdeError {
     #[error("avro error: {0}")]
-    Avro(#[from] apache_avro::Error),
+    Avro(Box<apache_avro::Error>),
     #[error("json referencing error")]
     JsonReferencing(#[from] referencing::Error),
     #[error("json serde error")]
@@ -257,13 +257,19 @@ pub enum SerdeError {
     #[error("rule failed: {0}")]
     Rule(String),
     #[error("rule condition failed: {0}")]
-    RuleCondition(Rule),
+    RuleCondition(Box<Rule>),
     #[error("rest error")]
     Rest(#[from] RestError),
     #[error("serde error: {0}")]
     Serialization(String),
     #[error("tink error")]
     Tink(#[from] TinkError),
+}
+
+impl From<apache_avro::Error> for SerdeError {
+    fn from(e: apache_avro::Error) -> Self {
+        SerdeError::Avro(Box::new(e))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -379,8 +385,8 @@ pub fn topic_name_strategy(
     _schema: Option<&Schema>,
 ) -> Option<String> {
     match serde_type {
-        SerdeType::Key => Some(format!("{}-key", topic)),
-        SerdeType::Value => Some(format!("{}-value", topic)),
+        SerdeType::Key => Some(format!("{topic}-key")),
+        SerdeType::Value => Some(format!("{topic}-value")),
     }
 }
 
@@ -641,7 +647,7 @@ impl<'a, T: Client> Serde<'a, T> {
                         rule,
                         self.get_on_failure(rule).as_deref(),
                         &msg,
-                        Some(SerdeError::RuleCondition(rule.clone())),
+                        Some(SerdeError::RuleCondition(Box::new(rule.clone()))),
                         "ERROR",
                     )
                     .await?;
@@ -716,8 +722,7 @@ impl<'a, T: Client> Serde<'a, T> {
         let action_name = action_name.unwrap_or(default_action.to_string());
         let action = self.get_rule_action(ctx, &action_name);
         let action = action.ok_or(SerdeError::Rule(format!(
-            "rule action {} not found",
-            action_name
+            "rule action {action_name} not found"
         )))?;
         action.run(ctx, msg, ex).await
     }
@@ -1070,7 +1075,7 @@ impl RuleAction for ErrorAction {
     ) -> Result<(), SerdeError> {
         let err_msg = format!("rule {} failed", ctx.rule.name);
         if let Some(e) = ex {
-            Err(Serialization(format!("{}: {}", err_msg, e)))
+            Err(Serialization(format!("{err_msg}: {e}")))
         } else {
             Err(Serialization(err_msg))
         }

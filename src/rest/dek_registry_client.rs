@@ -138,7 +138,7 @@ impl Client for DekRegistryClient {
                 return Ok(kek.clone());
             }
         }
-        let url = format!("/dek-registry/v1/keks/{}", name);
+        let url = format!("/dek-registry/v1/keks/{name}");
         let query = vec![("deleted".to_string(), deleted.to_string())];
         let resp = self
             .rest_service
@@ -186,10 +186,7 @@ impl Client for DekRegistryClient {
                 return Ok(dek.clone());
             }
         }
-        let url = format!(
-            "/dek-registry/v1/keks/{}/deks/{}/versions/{}",
-            kek_name, subject, version
-        );
+        let url = format!("/dek-registry/v1/keks/{kek_name}/deks/{subject}/versions/{version}");
         let query = vec![
             (
                 "algorithm".to_string(),

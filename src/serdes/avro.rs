@@ -537,8 +537,7 @@ async fn transform(
                     executor
                         .as_field_rule_executor()
                         .ok_or(SerdeError::Rule(format!(
-                            "executor {} is not a field rule executor",
-                            field_executor_type
+                            "executor {field_executor_type} is not a field rule executor"
                         )))?;
                 let new_value = field_executor.transform_field(ctx, &message_value).await?;
                 if let SerdeValue::Avro(v) = new_value {
@@ -588,7 +587,7 @@ async fn transform_field_with_ctx(
     if let Some(Kind::Condition) = ctx.rule.kind {
         if let Value::Boolean(b) = new_value {
             if !b {
-                return Err(SerdeError::RuleCondition(ctx.rule.clone()));
+                return Err(SerdeError::RuleCondition(Box::new(ctx.rule.clone())));
             }
         }
     }
@@ -703,7 +702,7 @@ fn to_avro_value(input: &Value, value: &serde_json::Value) -> Result<Value, Serd
                 for (k, _v) in fields {
                     let v = props
                         .get(k)
-                        .ok_or(Serialization(format!("missing field {}", k)))?;
+                        .ok_or(Serialization(format!("missing field {k}")))?;
                     result.push((k.to_string(), to_avro_value(input, v)?));
                 }
                 Value::Record(result)
@@ -722,7 +721,7 @@ fn to_avro_value(input: &Value, value: &serde_json::Value) -> Result<Value, Serd
 
 impl From<uuid::Error> for SerdeError {
     fn from(value: uuid::Error) -> Self {
-        Serialization(format!("UUID error: {}", value))
+        Serialization(format!("UUID error: {value}"))
     }
 }
 

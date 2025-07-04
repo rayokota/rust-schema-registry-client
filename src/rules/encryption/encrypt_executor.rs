@@ -99,7 +99,7 @@ impl<T: Client + Sync + 'static> RuleBase for EncryptionExecutor<T> {
         for (key, value) in rule_config {
             if let Some(existing_value) = config.get(key) {
                 if existing_value != value {
-                    return Err(Rule(format!("rule config key {} already set", key)));
+                    return Err(Rule(format!("rule config key {key} already set")));
                 }
             } else {
                 config.insert(key.clone(), value.clone());
@@ -697,7 +697,7 @@ impl<T: Client> EncryptionExecutorTransform<'_, T> {
             Mode::Write => {
                 let plaintext = self.to_bytes(field_type, field_value);
                 if plaintext.is_none() {
-                    return Err(Rule(format!("unsupported field type {}", field_type)));
+                    return Err(Rule(format!("unsupported field type {field_type}")));
                 }
                 let version = if self.is_dek_rotated() {
                     Some(-1)

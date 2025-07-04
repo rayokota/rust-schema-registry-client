@@ -47,7 +47,7 @@ impl HcVaultAead {
         .map_err(|e| wrap_err("request failed", e));
 
         if result.is_err() {
-            error!("failed to encrypt: {:?}", result);
+            error!("failed to encrypt: {result:?}");
         }
         if sender.send(result).is_err() {
             error!("failed to send result");
@@ -64,7 +64,7 @@ impl HcVaultAead {
         let payload = str::from_utf8(&ciphertext)
             .map_err(|e| wrap_err("failed to convert ciphertext to string", e));
         if payload.is_err() {
-            error!("failed to convert ciphertext to string: {:?}", payload);
+            error!("failed to convert ciphertext to string: {payload:?}");
             if sender.send(Err(payload.unwrap_err())).is_err() {
                 error!("failed to send result");
             }
@@ -87,7 +87,7 @@ impl HcVaultAead {
             None => Err(TinkError::new("no ciphertext in response")),
         };
         if result.is_err() {
-            error!("failed to encrypt: {:?}", result);
+            error!("failed to encrypt: {result:?}");
         }
         if sender.send(result).is_err() {
             error!("failed to send result");

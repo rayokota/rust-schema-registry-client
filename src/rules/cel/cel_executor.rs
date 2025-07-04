@@ -374,12 +374,12 @@ fn to_json_value(input: &serde_json::Value, value: &Value) -> serde_json::Value 
 
 impl From<ExecutionError> for SerdeError {
     fn from(value: ExecutionError) -> Self {
-        SerdeError::Rule(format!("CEL execution error: {}", value))
+        SerdeError::Rule(format!("CEL execution error: {value}"))
     }
 }
 
 impl From<ParseError> for SerdeError {
     fn from(value: ParseError) -> Self {
-        SerdeError::Rule(format!("CEL parse error: {}", value))
+        SerdeError::Rule(format!("CEL parse error: {value}"))
     }
 }

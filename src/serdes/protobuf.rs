@@ -94,8 +94,7 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
         let md = pool
             .get_message_by_name(message_type_name)
             .ok_or(Serialization(format!(
-                "message descriptor {} not found",
-                message_type_name
+                "message descriptor {message_type_name} not found"
             )))?;
         self.serialize_with_message_desc(ctx, value, &md).await
     }
@@ -345,8 +344,7 @@ fn str_to_proto(
 ) -> Result<FileDescriptor, SerdeError> {
     let result = BASE64_STANDARD.decode(s).map_err(|e| {
         Serialization(format!(
-            "failed to decode base64 schema string for {}: {}",
-            name, e
+            "failed to decode base64 schema string for {name}: {e}"
         ))
     });
     decode_file_descriptor_proto_with_name(pool, name, result.unwrap())?;
@@ -578,8 +576,7 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
         let msg = pool
             .get_message_by_name(&qualified_name)
             .ok_or(Serialization(format!(
-                "message descriptor {} not found",
-                qualified_name
+                "message descriptor {qualified_name} not found"
             )))?;
         Ok(msg)
     }
@@ -592,8 +589,7 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
     ) -> Result<(String, DescriptorProto), SerdeError> {
         let index = msg_index[0] as usize;
         let msg = desc.message_type.get(index).ok_or(Serialization(format!(
-            "message descriptor not found at index {}",
-            index
+            "message descriptor not found at index {index}"
         )))?;
         let name = msg.name.clone().unwrap_or(String::new());
         let path = if !path.is_empty() && !name.is_empty() {
@@ -616,8 +612,7 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
     ) -> Result<(String, DescriptorProto), SerdeError> {
         let index = msg_index[0] as usize;
         let msg = desc.nested_type.get(index).ok_or(Serialization(format!(
-            "message descriptor not found at index {}",
-            index
+            "message descriptor not found at index {index}"
         )))?;
         let name = msg.name.clone().unwrap_or(String::new());
         let path = if !path.is_empty() && !name.is_empty() {
@@ -740,8 +735,7 @@ async fn transform(
                             executor
                                 .as_field_rule_executor()
                                 .ok_or(SerdeError::Rule(format!(
-                                    "executor {} is not a field rule executor",
-                                    field_executor_type
+                                    "executor {field_executor_type} is not a field rule executor"
                                 )))?;
                         let new_value = field_executor.transform_field(ctx, &message_value).await?;
                         if let SerdeValue::Protobuf(v) = new_value {
@@ -779,7 +773,7 @@ async fn transform_field_with_ctx(
     if let Some(Kind::Condition) = ctx.rule.kind {
         if let Value::Bool(b) = new_value {
             if !b {
-                return Err(SerdeError::RuleCondition(ctx.rule.clone()));
+                return Err(SerdeError::RuleCondition(Box::new(ctx.rule.clone())));
             }
         }
     }
