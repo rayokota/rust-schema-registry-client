@@ -91,9 +91,9 @@ async fn get_creds_async(
 ) {
     let creds = create_access_token_credentials()
         .await
-        .map_err(|e| TinkError::new(format!("failed to get creds: {}", e).as_str()));
+        .map_err(|e| TinkError::new(format!("failed to get creds: {e}").as_str()));
     if creds.is_err() {
-        error!("failed to get creds: {:?}", creds);
+        error!("failed to get creds: {creds:?}");
     }
     if sender.send(creds).is_err() {
         error!("failed to send result");

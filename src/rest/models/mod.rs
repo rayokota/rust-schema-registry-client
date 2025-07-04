@@ -11,7 +11,7 @@ pub use self::metadata::Metadata;
 pub mod registered_schema;
 pub use self::registered_schema::RegisteredSchema;
 pub mod rule;
-pub use self::rule::{Kind, Mode, Rule};
+pub use self::rule::{Kind, Mode, Phase, Rule};
 pub mod rule_set;
 pub use self::rule_set::RuleSet;
 pub mod schema;

@@ -71,6 +71,6 @@ impl KmsDriver for AzureKmsDriver {
 
 impl From<azure_core::Error> for SerdeError {
     fn from(value: azure_core::Error) -> Self {
-        SerdeError::Rule(format!("Azure error: {}", value))
+        SerdeError::Rule(format!("Azure error: {value}"))
     }
 }

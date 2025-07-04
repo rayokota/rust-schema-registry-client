@@ -38,7 +38,7 @@ impl GcpAead {
             .map(|r| r.ciphertext.to_vec())
             .map_err(|e| wrap_err("failed to encrypt", e));
         if result.is_err() {
-            error!("failed to encrypt: {:?}", result);
+            error!("failed to encrypt: {result:?}");
         }
         if sender.send(result).is_err() {
             error!("failed to send result");
@@ -61,7 +61,7 @@ impl GcpAead {
             .map(|r| r.plaintext.to_vec())
             .map_err(|e| wrap_err("failed to decrypt", e));
         if result.is_err() {
-            error!("failed to decrypt: {:?}", result);
+            error!("failed to decrypt: {result:?}");
         }
         if sender.send(result).is_err() {
             error!("failed to send result");

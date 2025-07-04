@@ -56,6 +56,6 @@ impl RuleExecutor for JsonataExecutor {
 
 impl From<Error> for SerdeError {
     fn from(value: Error) -> Self {
-        SerdeError::Rule(format!("JSONata error: {}", value))
+        SerdeError::Rule(format!("JSONata error: {value}"))
     }
 }

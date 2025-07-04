@@ -146,7 +146,7 @@ impl Client for SchemaRegistryClient {
             } else {
                 schema
             };
-            store.set_schema(Some(subject.to_string()), rs.id, rs.guid.clone(), &s);
+            store.set_schema(Some(subject.to_string()), rs.id, rs.guid.clone(), s);
             Ok(rs)
         } else {
             let entity = serde_json::from_str(&content).ok();
@@ -173,7 +173,7 @@ impl Client for SchemaRegistryClient {
             }
         }
 
-        let url = format!("/schemas/ids/{}", id);
+        let url = format!("/schemas/ids/{id}");
         let mut query = Vec::new();
         if let Some(subject) = subject {
             query.push(("subject".to_string(), subject.to_string()));
@@ -213,7 +213,7 @@ impl Client for SchemaRegistryClient {
             }
         }
 
-        let url = format!("/schemas/guids/{}", guid);
+        let url = format!("/schemas/guids/{guid}");
         let mut query = Vec::new();
         if let Some(format) = format {
             query.push(("format".to_string(), format.to_string()));

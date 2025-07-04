@@ -79,6 +79,17 @@ impl Default for Kind {
         Self::Transform
     }
 }
+/// Rule phase
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum Phase {
+    #[serde(rename = "MIGRATION")]
+    Migration,
+    #[serde(rename = "DOMAIN")]
+    Domain,
+    #[serde(rename = "ENCODING")]
+    Encoding,
+}
+
 /// Rule mode
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum Mode {

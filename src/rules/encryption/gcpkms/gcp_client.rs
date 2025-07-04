@@ -47,7 +47,7 @@ async fn get_client(
         .await
         .map_err(|e| wrap_err("failed to create GCP KMS client", e));
     if result.is_err() {
-        error!("failed to decrypt: {:?}", result);
+        error!("failed to decrypt: {result:?}");
     }
     if sender.send(result).is_err() {
         error!("failed to send result");

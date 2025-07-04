@@ -33,8 +33,7 @@ fn build_protos() -> Result<()> {
                 proto_files.lock().unwrap().push(entry.path());
             }
         })?;
-        let proto_files = proto_files.lock().unwrap().iter().cloned().collect();
-        proto_files
+        proto_files.lock().unwrap().iter().cloned().collect()
     };
 
     prost_reflect_build::Builder::new()
@@ -60,8 +59,7 @@ fn build_protos() -> Result<()> {
                 proto_files.lock().unwrap().push(entry.path());
             }
         })?;
-        let proto_files = proto_files.lock().unwrap().iter().cloned().collect();
-        proto_files
+        proto_files.lock().unwrap().iter().cloned().collect()
     };
 
     prost_reflect_build::Builder::new()

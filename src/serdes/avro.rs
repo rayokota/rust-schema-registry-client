@@ -1,5 +1,5 @@
-use crate::rest::models::Schema;
 use crate::rest::models::{Kind, Mode};
+use crate::rest::models::{Phase, Schema};
 use crate::rest::schema_registry_client::Client;
 use crate::serdes::config::{DeserializerConfig, SerializerConfig};
 use crate::serdes::rule_registry::RuleRegistry;
@@ -120,7 +120,7 @@ impl<'a, T: Client + Sync> AvroSerializer<'a, T> {
                     &subject,
                     Mode::Write,
                     None,
-                    Some(&latest_schema.to_schema()),
+                    Some(&schema),
                     Some(&SerdeSchema::Avro(schema_tuple.clone())),
                     &SerdeValue::Avro(value),
                     Some(Arc::new(field_transformer)),
@@ -137,11 +137,35 @@ impl<'a, T: Client + Sync> AvroSerializer<'a, T> {
             schema_tuple = self.get_parsed_schema(schema).await?;
         }
 
-        let encoded_bytes = apache_avro::to_avro_datum_schemata(
+        let mut encoded_bytes = apache_avro::to_avro_datum_schemata(
             &schema_tuple.0,
             schema_tuple.1.iter().collect(),
             value,
         )?;
+        if let Some(ref latest_schema) = latest_schema {
+            let schema = latest_schema.to_schema();
+            if let Some(ref rule_set) = schema.rule_set {
+                if rule_set.encoding_rules.is_some() {
+                    encoded_bytes = self
+                        .base
+                        .serde
+                        .execute_rules_with_phase(
+                            ctx,
+                            &subject,
+                            Phase::Encoding,
+                            Mode::Write,
+                            None,
+                            Some(&schema),
+                            None,
+                            &SerdeValue::new_bytes(SerdeFormat::Avro, &encoded_bytes),
+                            None,
+                        )
+                        .await?
+                        .as_bytes();
+                }
+            }
+        }
+
         let id_ser = self.base.config.schema_id_serializer;
         id_ser(&encoded_bytes, ctx, &schema_id)
     }
@@ -242,7 +266,7 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
         let mut schema_id = SchemaId::new(SerdeFormat::Avro, None, None, None)?;
         let id_deser = self.base.config.schema_id_deserializer;
         let bytes_read = id_deser(data, ctx, &mut schema_id)?;
-        let data = &data[bytes_read..];
+        let mut data = &data[bytes_read..];
 
         let writer_schema_raw = self
             .base
@@ -261,6 +285,28 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
             }
         }
         let subject = subject.unwrap();
+        let serde_value;
+        if let Some(ref rule_set) = writer_schema_raw.rule_set {
+            if rule_set.encoding_rules.is_some() {
+                serde_value = self
+                    .base
+                    .serde
+                    .execute_rules_with_phase(
+                        ctx,
+                        &subject,
+                        Phase::Encoding,
+                        Mode::Read,
+                        None,
+                        Some(&writer_schema_raw),
+                        None,
+                        &SerdeValue::new_bytes(SerdeFormat::Avro, data),
+                        None,
+                    )
+                    .await?
+                    .as_bytes();
+                data = &serde_value;
+            }
+        }
 
         let migrations;
         let reader_schema_raw;
@@ -491,8 +537,7 @@ async fn transform(
                     executor
                         .as_field_rule_executor()
                         .ok_or(SerdeError::Rule(format!(
-                            "executor {} is not a field rule executor",
-                            field_executor_type
+                            "executor {field_executor_type} is not a field rule executor"
                         )))?;
                 let new_value = field_executor.transform_field(ctx, &message_value).await?;
                 if let SerdeValue::Avro(v) = new_value {
@@ -542,7 +587,7 @@ async fn transform_field_with_ctx(
     if let Some(Kind::Condition) = ctx.rule.kind {
         if let Value::Boolean(b) = new_value {
             if !b {
-                return Err(SerdeError::RuleCondition(ctx.rule.clone()));
+                return Err(SerdeError::RuleCondition(Box::new(ctx.rule.clone())));
             }
         }
     }
@@ -657,7 +702,7 @@ fn to_avro_value(input: &Value, value: &serde_json::Value) -> Result<Value, Serd
                 for (k, _v) in fields {
                     let v = props
                         .get(k)
-                        .ok_or(Serialization(format!("missing field {}", k)))?;
+                        .ok_or(Serialization(format!("missing field {k}")))?;
                     result.push((k.to_string(), to_avro_value(input, v)?));
                 }
                 Value::Record(result)
@@ -676,7 +721,7 @@ fn to_avro_value(input: &Value, value: &serde_json::Value) -> Result<Value, Serd
 
 impl From<uuid::Error> for SerdeError {
     fn from(value: uuid::Error) -> Self {
-        Serialization(format!("UUID error: {}", value))
+        Serialization(format!("UUID error: {value}"))
     }
 }
 
@@ -694,7 +739,9 @@ mod tests {
     };
     use crate::rest::schema_registry_client::Client;
     use crate::rules::cel::cel_field_executor::CelFieldExecutor;
-    use crate::rules::encryption::encrypt_executor::{FakeClock, FieldEncryptionExecutor};
+    use crate::rules::encryption::encrypt_executor::{
+        EncryptionExecutor, FakeClock, FieldEncryptionExecutor,
+    };
     use crate::rules::encryption::localkms::local_driver::LocalKmsDriver;
     use crate::rules::jsonata::jsonata_executor::JsonataExecutor;
     use crate::serdes::config::SchemaSelector;
@@ -988,6 +1035,7 @@ mod tests {
         let rule_set = RuleSet {
             migration_rules: None,
             domain_rules: Some(vec![rule]),
+            encoding_rules: None,
         };
         let schema = Schema {
             schema_type: Some("AVRO".to_string()),
@@ -1131,6 +1179,7 @@ mod tests {
         let rule_set = RuleSet {
             migration_rules: Some(vec![rule1]),
             domain_rules: Some(vec![rule2]),
+            encoding_rules: None,
         };
         let metadata = Metadata {
             tags: None,
@@ -1254,6 +1303,7 @@ mod tests {
         let rule_set = RuleSet {
             migration_rules: None,
             domain_rules: Some(vec![rule]),
+            encoding_rules: None,
         };
         let schema = Schema {
             schema_type: Some("AVRO".to_string()),
@@ -1276,6 +1326,109 @@ mod tests {
         let obj = Record(fields.clone());
         let rule_registry = RuleRegistry::new();
         rule_registry.register_executor(FieldEncryptionExecutor::<MockDekRegistryClient>::new(
+            FakeClock::new(0),
+        ));
+        let ser =
+            AvroSerializer::new(&client, None, Some(rule_registry.clone()), ser_conf).unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Avro,
+            headers: None,
+        };
+        let bytes = ser.serialize(&ser_ctx, obj).await.unwrap();
+        let deser = AvroDeserializer::new(
+            &client,
+            Some(rule_registry.clone()),
+            DeserializerConfig::default(),
+        )
+        .unwrap();
+
+        let fields2 = vec![
+            ("intField".to_string(), Value::Int(123)),
+            ("doubleField".to_string(), Value::Double(45.67)),
+            ("stringField".to_string(), Value::String("hi".to_string())),
+            ("booleanField".to_string(), Value::Boolean(true)),
+            ("bytesField".to_string(), Value::Bytes(vec![1, 2, 3])),
+        ];
+        let obj2 = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        if let Record(v) = obj2.value {
+            assert_eq!(v, fields2);
+        } else {
+            unreachable!();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_payload_encryption() {
+        LocalKmsDriver::register();
+
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let rule_conf = HashMap::from([("secret".to_string(), "mysecret".to_string())]);
+        let ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            false,
+            false,
+            rule_conf,
+        );
+        let schema_str = r#"
+        {
+            "type": "record",
+            "name": "test",
+            "fields": [
+                {"name": "intField", "type": "int"},
+                {"name": "doubleField", "type": "double"},
+                {"name": "stringField", "type": "string", "confluent:tags": ["PII"]},
+                {"name": "booleanField", "type": "boolean"},
+                {"name": "bytesField", "type": "bytes", "confluent:tags": ["PII"]}
+            ]
+        }
+        "#;
+        let rule = Rule {
+            name: "test-encrypt".to_string(),
+            doc: None,
+            kind: Some(Kind::Transform),
+            mode: Some(Mode::WriteRead),
+            r#type: "ENCRYPT_PAYLOAD".to_string(),
+            tags: None,
+            params: Some(BTreeMap::from([
+                ("encrypt.kek.name".to_string(), "kek1".to_string()),
+                ("encrypt.kms.type".to_string(), "local-kms".to_string()),
+                ("encrypt.kms.key.id".to_string(), "mykey".to_string()),
+            ])),
+            expr: None,
+            on_success: None,
+            on_failure: Some("ERROR,NONE".to_string()),
+            disabled: None,
+        };
+        let rule_set = RuleSet {
+            migration_rules: None,
+            domain_rules: None,
+            encoding_rules: Some(vec![rule]),
+        };
+        let schema = Schema {
+            schema_type: Some("AVRO".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(rule_set)),
+            schema: schema_str.to_string(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+        let fields = vec![
+            ("intField".to_string(), Value::Int(123)),
+            ("doubleField".to_string(), Value::Double(45.67)),
+            ("stringField".to_string(), Value::String("hi".to_string())),
+            ("booleanField".to_string(), Value::Boolean(true)),
+            ("bytesField".to_string(), Value::Bytes(vec![1, 2, 3])),
+        ];
+        let obj = Record(fields.clone());
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(EncryptionExecutor::<MockDekRegistryClient>::new(
             FakeClock::new(0),
         ));
         let ser =
@@ -1345,6 +1498,7 @@ mod tests {
         let rule_set = RuleSet {
             migration_rules: None,
             domain_rules: Some(vec![rule]),
+            encoding_rules: None,
         };
         let schema = Schema {
             schema_type: Some("AVRO".to_string()),
@@ -1379,7 +1533,7 @@ mod tests {
             .as_any()
             .downcast_ref::<FieldEncryptionExecutor<MockDekRegistryClient>>()
             .unwrap();
-        let dek_client = field_executor.client().unwrap();
+        let dek_client = field_executor.executor.client().unwrap();
         let kek_req = CreateKekRequest {
             name: "kek1-f1".to_string(),
             kms_type: "local-kms".to_string(),
@@ -1454,6 +1608,7 @@ mod tests {
         let rule_set = RuleSet {
             migration_rules: None,
             domain_rules: Some(vec![rule]),
+            encoding_rules: None,
         };
         let schema = Schema {
             schema_type: Some("AVRO".to_string()),
@@ -1488,7 +1643,7 @@ mod tests {
             .as_any()
             .downcast_ref::<FieldEncryptionExecutor<MockDekRegistryClient>>()
             .unwrap();
-        let dek_client = field_executor.client().unwrap();
+        let dek_client = field_executor.executor.client().unwrap();
         let kek_req = CreateKekRequest {
             name: "kek1-det-f1".to_string(),
             kms_type: "local-kms".to_string(),
@@ -1562,6 +1717,7 @@ mod tests {
         let rule_set = RuleSet {
             migration_rules: None,
             domain_rules: Some(vec![rule]),
+            encoding_rules: None,
         };
         let schema = Schema {
             schema_type: Some("AVRO".to_string()),
@@ -1596,7 +1752,7 @@ mod tests {
             .as_any()
             .downcast_ref::<FieldEncryptionExecutor<MockDekRegistryClient>>()
             .unwrap();
-        let dek_client = field_executor.client().unwrap();
+        let dek_client = field_executor.executor.client().unwrap();
         let kek_req = CreateKekRequest {
             name: "kek1-rot-f1".to_string(),
             kms_type: "local-kms".to_string(),

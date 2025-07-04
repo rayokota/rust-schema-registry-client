@@ -8,6 +8,8 @@ pub struct RuleSet {
     pub migration_rules: Option<Vec<models::Rule>>,
     #[serde(rename = "domainRules", skip_serializing_if = "Option::is_none")]
     pub domain_rules: Option<Vec<models::Rule>>,
+    #[serde(rename = "encodingRules", skip_serializing_if = "Option::is_none")]
+    pub encoding_rules: Option<Vec<models::Rule>>,
 }
 
 impl RuleSet {
@@ -16,6 +18,7 @@ impl RuleSet {
         RuleSet {
             migration_rules: None,
             domain_rules: None,
+            encoding_rules: None,
         }
     }
 }
