@@ -164,9 +164,7 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
             let schema = latest_schema.to_schema();
             (fd, pool) = self.get_parsed_schema(&schema).await?;
             let field_transformer: FieldTransformer =
-                Box::new(|ctx, field_executor_type, value| {
-                    transform_fields(ctx, field_executor_type, value).boxed()
-                });
+                Box::new(|ctx, value| transform_fields(ctx, value).boxed());
             let mut msg = DynamicMessage::new(md.clone());
             msg.transcode_from(value)?;
             let serde_value = self
@@ -370,7 +368,6 @@ fn decode_file_descriptor_proto_with_name(
 
 async fn transform_fields(
     ctx: &mut RuleContext,
-    field_executor_type: &str,
     value: &SerdeValue,
 ) -> Result<SerdeValue, SerdeError> {
     if let Some(SerdeSchema::Protobuf(s)) = ctx.parsed_target.clone() {
@@ -383,7 +380,7 @@ async fn transform_fields(
                         "message descriptor {} not found",
                         message.descriptor().full_name()
                     )))?;
-                let value = transform(ctx, &desc, v, field_executor_type).await?;
+                let value = transform(ctx, &desc, v).await?;
                 return Ok(SerdeValue::Protobuf(value));
             }
         }
@@ -532,9 +529,8 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
             msg = DynamicMessage::decode(reader_desc, &mut reader)?;
         }
 
-        let field_transformer: FieldTransformer = Box::new(|ctx, field_executor_type, value| {
-            transform_fields(ctx, field_executor_type, value).boxed()
-        });
+        let field_transformer: FieldTransformer =
+            Box::new(|ctx, value| transform_fields(ctx, value).boxed());
         let serde_value = self
             .base
             .serde
@@ -689,13 +685,12 @@ async fn transform(
     ctx: &mut RuleContext,
     descriptor: &MessageDescriptor,
     message: &Value,
-    field_executor_type: &str,
 ) -> Result<Value, SerdeError> {
     match message {
         Value::List(items) => {
             let mut result = Vec::with_capacity(items.len());
             for item in items {
-                let item = transform(ctx, descriptor, item, field_executor_type).await?;
+                let item = transform(ctx, descriptor, item).await?;
                 result.push(item);
             }
             return Ok(Value::List(result));
@@ -703,7 +698,7 @@ async fn transform(
         Value::Map(map) => {
             let mut result = HashMap::new();
             for (key, value) in map {
-                let value = transform(ctx, descriptor, value, field_executor_type).await?;
+                let value = transform(ctx, descriptor, value).await?;
                 result.insert(key.clone(), value);
             }
             return Ok(Value::Map(result));
@@ -711,9 +706,7 @@ async fn transform(
         Value::Message(message) => {
             let mut result = message.clone();
             for fd in descriptor.fields() {
-                let field =
-                    transform_field_with_ctx(ctx, &fd, descriptor, message, field_executor_type)
-                        .await?;
+                let field = transform_field_with_ctx(ctx, &fd, descriptor, message).await?;
                 if let Some(field) = field {
                     result.set_field(&fd, field);
                 }
@@ -729,7 +722,8 @@ async fn transform(
                     .map(|v| HashSet::from_iter(v.into_iter()));
                 if rule_tags.is_none_or(|tags| !tags.is_disjoint(&field_ctx.tags)) {
                     let message_value = SerdeValue::Protobuf(message.clone());
-                    let executor = get_executor(ctx.rule_registry.as_ref(), field_executor_type);
+                    let field_executor_type = ctx.rule.r#type.clone();
+                    let executor = get_executor(ctx.rule_registry.as_ref(), &field_executor_type);
                     if let Some(executor) = executor {
                         let field_executor =
                             executor
@@ -754,7 +748,6 @@ async fn transform_field_with_ctx(
     fd: &FieldDescriptor,
     desc: &MessageDescriptor,
     message: &DynamicMessage,
-    field_executor_type: &str,
 ) -> Result<Option<Value>, SerdeError> {
     let message_value = SerdeValue::Protobuf(Value::Message(message.clone()));
     ctx.enter_field(
@@ -769,7 +762,7 @@ async fn transform_field_with_ctx(
         return Ok(None);
     }
     let value = message.get_field(fd);
-    let new_value = transform(ctx, desc, &value, field_executor_type).await?;
+    let new_value = transform(ctx, desc, &value).await?;
     if let Some(Kind::Condition) = ctx.rule.kind {
         if let Value::Bool(b) = new_value {
             if !b {

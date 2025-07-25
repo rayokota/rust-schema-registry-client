@@ -109,9 +109,7 @@ impl<'a, T: Client + Sync> AvroSerializer<'a, T> {
             let schema = latest_schema.to_schema();
             schema_tuple = self.get_parsed_schema(&schema).await?;
             let field_transformer: FieldTransformer =
-                Box::new(|ctx, field_executor_type, value| {
-                    transform_fields(ctx, field_executor_type, value).boxed()
-                });
+                Box::new(|ctx, value| transform_fields(ctx, value).boxed());
             let serde_value = self
                 .base
                 .serde
@@ -201,12 +199,11 @@ impl<'a, T: Client + Sync> AvroSerializer<'a, T> {
 
 async fn transform_fields(
     ctx: &mut RuleContext,
-    field_executor_type: &str,
     value: &SerdeValue,
 ) -> Result<SerdeValue, SerdeError> {
     if let Some(SerdeSchema::Avro((s, named))) = ctx.parsed_target.clone() {
         if let SerdeValue::Avro(v) = value {
-            let value = transform(ctx, &s, &named, v, field_executor_type).await?;
+            let value = transform(ctx, &s, &named, v).await?;
             return Ok(SerdeValue::Avro(value));
         }
     }
@@ -357,9 +354,8 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
             )?;
         }
 
-        let field_transformer: FieldTransformer = Box::new(|ctx, field_executor_type, value| {
-            transform_fields(ctx, field_executor_type, value).boxed()
-        });
+        let field_transformer: FieldTransformer =
+            Box::new(|ctx, value| transform_fields(ctx, value).boxed());
         let serde_value = self
             .base
             .serde
@@ -460,7 +456,6 @@ async fn transform(
     schema: &apache_avro::Schema,
     named_schemas: &[apache_avro::Schema],
     message: &Value,
-    field_executor_type: &str,
 ) -> Result<Value, SerdeError> {
     match schema {
         apache_avro::Schema::Union(union) => {
@@ -468,23 +463,14 @@ async fn transform(
             if subschema.is_none() {
                 return Ok(message.clone());
             }
-            let result = transform(
-                ctx,
-                subschema.unwrap().1,
-                named_schemas,
-                message,
-                field_executor_type,
-            )
-            .await?;
+            let result = transform(ctx, subschema.unwrap().1, named_schemas, message).await?;
             return Ok(result);
         }
         apache_avro::Schema::Array(array) => {
             if let Value::Array(items) = message {
                 let mut result = Vec::with_capacity(items.len());
                 for item in items {
-                    let item =
-                        transform(ctx, &array.items, named_schemas, item, field_executor_type)
-                            .await?;
+                    let item = transform(ctx, &array.items, named_schemas, item).await?;
                     result.push(item);
                 }
                 return Ok(Value::Array(result));
@@ -494,9 +480,7 @@ async fn transform(
             if let Value::Map(values) = message {
                 let mut result: HashMap<String, Value> = HashMap::with_capacity(values.len());
                 for (key, value) in values {
-                    let value =
-                        transform(ctx, &map.types, named_schemas, value, field_executor_type)
-                            .await?;
+                    let value = transform(ctx, &map.types, named_schemas, value).await?;
                     result.insert(key.clone(), value);
                 }
                 return Ok(Value::Map(result));
@@ -506,15 +490,8 @@ async fn transform(
             if let Value::Record(fields) = message {
                 let mut result = Vec::with_capacity(fields.len());
                 for field in fields {
-                    let field = transform_field_with_ctx(
-                        ctx,
-                        record,
-                        named_schemas,
-                        field,
-                        fields,
-                        field_executor_type,
-                    )
-                    .await?;
+                    let field =
+                        transform_field_with_ctx(ctx, record, named_schemas, field, fields).await?;
                     result.push(field);
                 }
                 return Ok(Value::Record(result));
@@ -531,7 +508,8 @@ async fn transform(
             .map(|v| HashSet::from_iter(v.into_iter()));
         if rule_tags.is_none_or(|tags| !tags.is_disjoint(&field_ctx.tags)) {
             let message_value = SerdeValue::Avro(message.clone());
-            let executor = get_executor(ctx.rule_registry.as_ref(), field_executor_type);
+            let field_executor_type = ctx.rule.r#type.clone();
+            let executor = get_executor(ctx.rule_registry.as_ref(), &field_executor_type);
             if let Some(executor) = executor {
                 let field_executor =
                     executor
@@ -555,7 +533,6 @@ async fn transform_field_with_ctx(
     named_schemas: &[apache_avro::Schema],
     field: &(String, Value),
     message: &[(String, Value)],
-    field_executor_type: &str,
 ) -> Result<(String, Value), SerdeError> {
     let field_schema = schema
         .fields
@@ -576,14 +553,7 @@ async fn transform_field_with_ctx(
         field_type,
         get_inline_tags(field_schema),
     );
-    let new_value = transform(
-        ctx,
-        &field_schema.schema,
-        named_schemas,
-        &field.1,
-        field_executor_type,
-    )
-    .await?;
+    let new_value = transform(ctx, &field_schema.schema, named_schemas, &field.1).await?;
     if let Some(Kind::Condition) = ctx.rule.kind {
         if let Value::Boolean(b) = new_value {
             if !b {

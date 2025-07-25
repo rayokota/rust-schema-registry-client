@@ -1021,7 +1021,7 @@ impl<FRE: FieldRuleExecutor> RuleExecutor for FRE {
             }
         }
         if let Some(field_transformer) = ctx.field_transformer.clone() {
-            let result = field_transformer(ctx, self.get_type(), msg).await?;
+            let result = field_transformer(ctx, msg).await?;
             return Ok(result);
         }
         Ok(msg.clone())
@@ -1305,7 +1305,6 @@ pub type FieldTransformer = Box<
         + Sync
         + for<'a> Fn(
             &'a mut RuleContext,
-            &'a str,
             &'a SerdeValue,
         ) -> BoxFuture<'a, Result<SerdeValue, SerdeError>>,
 >;

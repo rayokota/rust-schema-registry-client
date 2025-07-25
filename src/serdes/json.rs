@@ -102,9 +102,7 @@ impl<'a, T: Client + Sync> JsonSerializer<'a, T> {
             schema = latest_schema.to_schema();
             (parsed_schema, ref_registry) = self.get_parsed_schema(&schema).await?;
             let field_transformer: FieldTransformer =
-                Box::new(|ctx, field_executor_type, value| {
-                    transform_fields(ctx, field_executor_type, value).boxed()
-                });
+                Box::new(|ctx, value| transform_fields(ctx, value).boxed());
             let serde_value = self
                 .base
                 .serde
@@ -216,7 +214,6 @@ impl<'a> From<ValidationError<'a>> for SerdeError {
 
 async fn transform_fields(
     ctx: &mut RuleContext,
-    field_executor_type: &str,
     value: &SerdeValue,
 ) -> Result<SerdeValue, SerdeError> {
     if let Some(SerdeSchema::Json((s, ref_registry))) = ctx.parsed_target.clone() {
@@ -227,16 +224,7 @@ async fn transform_fields(
                 .clone()
                 .try_with_resource(base_uri.clone(), root_resource)?;
             let ref_resolver = ref_registry.try_resolver(&base_uri)?;
-            let value = transform(
-                ctx,
-                &s,
-                &ref_registry,
-                &ref_resolver,
-                "$",
-                v,
-                field_executor_type,
-            )
-            .await?;
+            let value = transform(ctx, &s, &ref_registry, &ref_resolver, "$", v).await?;
             return Ok(SerdeValue::Json(value));
         }
     }
@@ -367,9 +355,8 @@ impl<'a, T: Client + Sync> JsonDeserializer<'a, T> {
             }
         }
 
-        let field_transformer: FieldTransformer = Box::new(|ctx, field_executor_type, value| {
-            transform_fields(ctx, field_executor_type, value).boxed()
-        });
+        let field_transformer: FieldTransformer =
+            Box::new(|ctx, value| transform_fields(ctx, value).boxed());
         let serde_value = self
             .base
             .serde
@@ -485,78 +472,32 @@ async fn transform(
     ref_resolver: &Resolver,
     path: &str,
     message: &Value,
-    field_executor_type: &str,
 ) -> Result<Value, SerdeError> {
     if let Value::Object(map) = schema {
         if let Some(Value::Array(subschemas)) = map.get("allOf") {
             if let Some(subschema) = validate_subschemas(subschemas, message, ref_registry) {
-                return transform(
-                    ctx,
-                    subschema,
-                    ref_registry,
-                    ref_resolver,
-                    path,
-                    message,
-                    field_executor_type,
-                )
-                .await;
+                return transform(ctx, subschema, ref_registry, ref_resolver, path, message).await;
             }
         }
         if let Some(Value::Array(subschemas)) = map.get("anyOf") {
             if let Some(subschema) = validate_subschemas(subschemas, message, ref_registry) {
-                return transform(
-                    ctx,
-                    subschema,
-                    ref_registry,
-                    ref_resolver,
-                    path,
-                    message,
-                    field_executor_type,
-                )
-                .await;
+                return transform(ctx, subschema, ref_registry, ref_resolver, path, message).await;
             }
         }
         if let Some(Value::Array(subschemas)) = map.get("oneOf") {
             if let Some(subschema) = validate_subschemas(subschemas, message, ref_registry) {
-                return transform(
-                    ctx,
-                    subschema,
-                    ref_registry,
-                    ref_resolver,
-                    path,
-                    message,
-                    field_executor_type,
-                )
-                .await;
+                return transform(ctx, subschema, ref_registry, ref_resolver, path, message).await;
             }
         }
         if let Some(items) = map.get("items") {
             if let Value::Array(_) = message {
-                return transform(
-                    ctx,
-                    items,
-                    ref_registry,
-                    ref_resolver,
-                    path,
-                    message,
-                    field_executor_type,
-                )
-                .await;
+                return transform(ctx, items, ref_registry, ref_resolver, path, message).await;
             }
         }
         if let Some(reference) = map.get("$ref") {
             let ref_schema = ref_resolver.lookup(reference.as_str().unwrap())?;
             let ref_schema = ref_schema.contents();
-            return transform(
-                ctx,
-                ref_schema,
-                ref_registry,
-                ref_resolver,
-                path,
-                message,
-                field_executor_type,
-            )
-            .await;
+            return transform(ctx, ref_schema, ref_registry, ref_resolver, path, message).await;
         }
         let field_type = get_type(schema);
         if field_type == FieldType::Record {
@@ -572,7 +513,6 @@ async fn transform(
                             prop_schema,
                             ref_registry,
                             ref_resolver,
-                            field_executor_type,
                         )
                         .await?;
                         new_message.insert(prop_name.clone(), new_value);
@@ -591,7 +531,8 @@ async fn transform(
             .map(|v| HashSet::from_iter(v.into_iter()));
         if rule_tags.is_none_or(|tags| !tags.is_disjoint(&field_ctx.tags)) {
             let message_value = SerdeValue::Json(message.clone());
-            let executor = get_executor(ctx.rule_registry.as_ref(), field_executor_type);
+            let field_executor_type = ctx.rule.r#type.clone();
+            let executor = get_executor(ctx.rule_registry.as_ref(), &field_executor_type);
             if let Some(executor) = executor {
                 let field_executor =
                     executor
@@ -617,7 +558,6 @@ async fn transform_field_with_ctx(
     prop_schema: &Value,
     ref_registry: &Registry,
     ref_resolver: &Resolver<'_>,
-    field_executor_type: &str,
 ) -> Result<Value, SerdeError> {
     let full_name = path.to_string() + "." + prop_name;
     let message_value = SerdeValue::Json(Value::Object(message.clone()));
@@ -636,7 +576,6 @@ async fn transform_field_with_ctx(
         ref_resolver,
         &full_name,
         value,
-        field_executor_type,
     )
     .await?;
     if let Some(Kind::Condition) = ctx.rule.kind {
