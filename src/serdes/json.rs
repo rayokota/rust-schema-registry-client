@@ -814,7 +814,7 @@ mod tests {
             false,
             Some(SchemaSelector::LatestVersion),
             true,
-            false,
+            true,
             HashMap::new(),
         );
         let ref_schema_str = r#"
@@ -914,7 +914,7 @@ mod tests {
             false,
             Some(SchemaSelector::LatestVersion),
             true,
-            false,
+            true,
             HashMap::new(),
         );
         let schema_str = r#"
@@ -1019,7 +1019,7 @@ mod tests {
             false,
             Some(SchemaSelector::LatestVersion),
             false,
-            false,
+            true,
             rule_conf,
         );
         let schema_str = r#"
@@ -1119,7 +1119,7 @@ mod tests {
             false,
             Some(SchemaSelector::LatestVersion),
             false,
-            false,
+            true,
             rule_conf,
         );
         let schema_str = r#"
@@ -1219,7 +1219,7 @@ mod tests {
             false,
             Some(SchemaSelector::LatestVersion),
             false,
-            false,
+            true,
             rule_conf,
         );
         let ref_schema_str = r#"
