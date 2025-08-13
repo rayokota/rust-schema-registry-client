@@ -139,7 +139,10 @@ impl Client for SchemaRegistryClient {
         let content = resp.text().await?;
         if !status.is_client_error() && !status.is_server_error() {
             let mut store = self.store.lock().unwrap();
-            let rs: RegisteredSchema = serde_json::from_str(&content)?;
+            let mut rs: RegisteredSchema = serde_json::from_str(&content)?;
+            if rs.subject.is_none() {
+                rs.subject = Some(subject.to_string());
+            }
             // The registered schema may not be fully populated
             let s = if rs.schema.is_some() {
                 &rs.to_schema()
