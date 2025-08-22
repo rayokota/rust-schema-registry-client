@@ -992,6 +992,108 @@ mod tests {
             Some(rule_registry.clone()),
             DeserializerConfig::default(),
         )
+            .unwrap();
+
+        obj_str = r#"
+        {
+            "intField": 123,
+            "doubleField": 45.67,
+            "stringField": "hi-suffix",
+            "booleanField": true,
+            "bytesField": "Zm9vYmFy"
+        }
+        "#;
+        obj = serde_json::from_str(obj_str).unwrap();
+        let obj2 = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        assert_eq!(obj2, obj);
+    }
+
+    #[tokio::test]
+    async fn test_cel_field_with_nullable() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            true,
+            true,
+            HashMap::new(),
+        );
+        let schema_str = r#"
+        {
+            "type": "object",
+            "properties": {
+                "intField": {"type": "integer"},
+                "doubleField": {"type": "number"},
+                "stringField": {
+                    "type": ["string", "null"],
+                    "confluent:tags": ["PII"]
+                },
+                "booleanField": {"type": "boolean"},
+                "bytesField": {
+                    "type": "string",
+                    "contentEncoding": "base64",
+                    "confluent:tags": ["PII"]
+                }
+            }
+        }
+        "#;
+        let rule = Rule {
+            name: "test-cel".to_string(),
+            doc: None,
+            kind: Some(Kind::Transform),
+            mode: Some(Mode::Write),
+            r#type: "CEL_FIELD".to_string(),
+            tags: None,
+            params: None,
+            expr: Some("name == 'stringField' ; value + '-suffix'".to_string()),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let rule_set = RuleSet {
+            migration_rules: None,
+            domain_rules: Some(vec![rule]),
+            encoding_rules: None,
+        };
+        let schema = Schema {
+            schema_type: Some("JSON".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(rule_set)),
+            schema: schema_str.to_string(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+        let mut obj_str = r#"
+        {
+            "intField": 123,
+            "doubleField": 45.67,
+            "stringField": "hi",
+            "booleanField": true,
+            "bytesField": "Zm9vYmFy"
+        }
+        "#;
+        let mut obj: Value = serde_json::from_str(obj_str).unwrap();
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(CelFieldExecutor::new());
+        let ser =
+            JsonSerializer::new(&client, None, Some(rule_registry.clone()), ser_conf).unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Json,
+            headers: None,
+        };
+        let bytes = ser.serialize(&ser_ctx, obj).await.unwrap();
+
+        let deser = JsonDeserializer::new(
+            &client,
+            Some(rule_registry.clone()),
+            DeserializerConfig::default(),
+        )
         .unwrap();
 
         obj_str = r#"
