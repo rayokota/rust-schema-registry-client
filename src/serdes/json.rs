@@ -992,7 +992,7 @@ mod tests {
             Some(rule_registry.clone()),
             DeserializerConfig::default(),
         )
-            .unwrap();
+        .unwrap();
 
         obj_str = r#"
         {
