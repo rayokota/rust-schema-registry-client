@@ -94,7 +94,7 @@ impl RuleExecutor for CelExecutor {
         msg: &SerdeValue,
     ) -> Result<SerdeValue, SerdeError> {
         let mut args = HashMap::new();
-        args.insert("msg".to_string(), from_serde_value(msg));
+        args.insert("message".to_string(), from_serde_value(msg));
         self.execute(ctx, msg, &args)
     }
 }
