@@ -28,7 +28,7 @@
 //!
 //!```toml
 //![dependencies]
-//!schema-registry-client = { version = "0.4.0" }
+//!schema-registry-client = { version = "0.4.1" }
 //!```
 //!
 //!The following features are available:
