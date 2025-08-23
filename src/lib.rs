@@ -46,7 +46,7 @@
 //!```toml
 //!
 //![dependencies]
-//!schema-registry-client = { version = "0.4.0", features = ["rules-encryption-awskms"] }
+//!schema-registry-client = { version = "0.4.1", features = ["rules-encryption-awskms"] }
 //!```
 //!
 //!# Examples
