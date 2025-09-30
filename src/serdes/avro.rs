@@ -186,7 +186,7 @@ impl<'a, T: Client + Sync> AvroSerializer<'a, T> {
         .await?;
         let parsed_schema = apache_avro::Schema::parse_str_with_list(
             &schema.schema,
-            &schemas.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
+            schemas.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
         )?;
         self.serde
             .parsed_schemas
@@ -409,7 +409,7 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
         .await?;
         let parsed_schema = apache_avro::Schema::parse_str_with_list(
             &schema.schema,
-            &schemas.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
+            schemas.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
         )?;
         self.serde
             .parsed_schemas
