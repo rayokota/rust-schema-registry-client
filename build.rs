@@ -44,7 +44,7 @@ fn build_protos() -> Result<()> {
     let path = PathBuf::from("src/codegen/test/file_descriptor_set.bin");
     fs::create_dir_all(path.parent().unwrap())?;
 
-    let mut prost_test_config = {
+    let prost_test_config = {
         let mut config = prost_build::Config::new();
         config
             .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")

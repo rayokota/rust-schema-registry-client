@@ -336,10 +336,10 @@ impl SchemaStore {
 
     fn has_metadata(&self, metadata: &HashMap<String, String>, rs: &RegisteredSchema) -> bool {
         let mut props = &BTreeMap::new();
-        if let Some(rs_metadata) = &rs.metadata {
-            if let Some(rs_props) = &rs_metadata.properties {
-                props = rs_props;
-            }
+        if let Some(rs_metadata) = &rs.metadata
+            && let Some(rs_props) = &rs_metadata.properties
+        {
+            props = rs_props;
         }
         !metadata.iter().any(|(k, v)| props.get(k) != Some(v))
     }

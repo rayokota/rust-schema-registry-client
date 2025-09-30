@@ -85,10 +85,10 @@ impl RestService {
         } else if let Some(token) = &self.config.bearer_access_token {
             request = request.bearer_auth(token);
         }
-        if let Some(query) = query {
-            if !query.is_empty() {
-                request = request.query(query);
-            }
+        if let Some(query) = query
+            && !query.is_empty()
+        {
+            request = request.query(query);
         }
         if let Some(body) = body {
             request = request.body(body.to_string());

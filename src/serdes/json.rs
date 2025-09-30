@@ -142,25 +142,25 @@ impl<'a, T: Client + Sync> JsonSerializer<'a, T> {
         let mut encoded_bytes = serde_json::to_vec(&value)?;
         if let Some(ref latest_schema) = latest_schema {
             let schema = latest_schema.to_schema();
-            if let Some(ref rule_set) = schema.rule_set {
-                if rule_set.encoding_rules.is_some() {
-                    encoded_bytes = self
-                        .base
-                        .serde
-                        .execute_rules_with_phase(
-                            ctx,
-                            &subject,
-                            Phase::Encoding,
-                            Mode::Write,
-                            None,
-                            Some(&schema),
-                            None,
-                            &SerdeValue::new_bytes(SerdeFormat::Json, &encoded_bytes),
-                            None,
-                        )
-                        .await?
-                        .as_bytes();
-                }
+            if let Some(ref rule_set) = schema.rule_set
+                && rule_set.encoding_rules.is_some()
+            {
+                encoded_bytes = self
+                    .base
+                    .serde
+                    .execute_rules_with_phase(
+                        ctx,
+                        &subject,
+                        Phase::Encoding,
+                        Mode::Write,
+                        None,
+                        Some(&schema),
+                        None,
+                        &SerdeValue::new_bytes(SerdeFormat::Json, &encoded_bytes),
+                        None,
+                    )
+                    .await?
+                    .as_bytes();
             }
         }
 
@@ -216,17 +216,17 @@ async fn transform_fields(
     ctx: &mut RuleContext,
     value: &SerdeValue,
 ) -> Result<SerdeValue, SerdeError> {
-    if let Some(SerdeSchema::Json((s, ref_registry))) = ctx.parsed_target.clone() {
-        if let SerdeValue::Json(v) = value {
-            let root_resource = Resource::from_contents(s.clone())?;
-            let base_uri = root_resource.id().unwrap_or("").to_string();
-            let ref_registry = ref_registry
-                .clone()
-                .try_with_resource(base_uri.clone(), root_resource)?;
-            let ref_resolver = ref_registry.try_resolver(&base_uri)?;
-            let value = transform(ctx, &s, &ref_registry, &ref_resolver, "$", v).await?;
-            return Ok(SerdeValue::Json(value));
-        }
+    if let Some(SerdeSchema::Json((s, ref_registry))) = ctx.parsed_target.clone()
+        && let SerdeValue::Json(v) = value
+    {
+        let root_resource = Resource::from_contents(s.clone())?;
+        let base_uri = root_resource.id().unwrap_or("").to_string();
+        let ref_registry = ref_registry
+            .clone()
+            .try_with_resource(base_uri.clone(), root_resource)?;
+        let ref_resolver = ref_registry.try_resolver(&base_uri)?;
+        let value = transform(ctx, &s, &ref_registry, &ref_resolver, "$", v).await?;
+        return Ok(SerdeValue::Json(value));
     }
     Ok(value.clone())
 }
@@ -300,26 +300,26 @@ impl<'a, T: Client + Sync> JsonDeserializer<'a, T> {
         }
         let subject = subject.unwrap();
         let serde_value;
-        if let Some(ref rule_set) = writer_schema_raw.rule_set {
-            if rule_set.encoding_rules.is_some() {
-                serde_value = self
-                    .base
-                    .serde
-                    .execute_rules_with_phase(
-                        ctx,
-                        &subject,
-                        Phase::Encoding,
-                        Mode::Read,
-                        None,
-                        Some(&writer_schema_raw),
-                        None,
-                        &SerdeValue::new_bytes(SerdeFormat::Json, data),
-                        None,
-                    )
-                    .await?
-                    .as_bytes();
-                data = &serde_value;
-            }
+        if let Some(ref rule_set) = writer_schema_raw.rule_set
+            && rule_set.encoding_rules.is_some()
+        {
+            serde_value = self
+                .base
+                .serde
+                .execute_rules_with_phase(
+                    ctx,
+                    &subject,
+                    Phase::Encoding,
+                    Mode::Read,
+                    None,
+                    Some(&writer_schema_raw),
+                    None,
+                    &SerdeValue::new_bytes(SerdeFormat::Json, data),
+                    None,
+                )
+                .await?
+                .as_bytes();
+            data = &serde_value;
         }
 
         let migrations;
@@ -474,25 +474,25 @@ async fn transform(
     message: &Value,
 ) -> Result<Value, SerdeError> {
     if let Value::Object(map) = schema {
-        if let Some(Value::Array(subschemas)) = map.get("allOf") {
-            if let Some(subschema) = validate_subschemas(subschemas, message, ref_registry) {
-                return transform(ctx, subschema, ref_registry, ref_resolver, path, message).await;
-            }
+        if let Some(Value::Array(subschemas)) = map.get("allOf")
+            && let Some(subschema) = validate_subschemas(subschemas, message, ref_registry)
+        {
+            return transform(ctx, subschema, ref_registry, ref_resolver, path, message).await;
         }
-        if let Some(Value::Array(subschemas)) = map.get("anyOf") {
-            if let Some(subschema) = validate_subschemas(subschemas, message, ref_registry) {
-                return transform(ctx, subschema, ref_registry, ref_resolver, path, message).await;
-            }
+        if let Some(Value::Array(subschemas)) = map.get("anyOf")
+            && let Some(subschema) = validate_subschemas(subschemas, message, ref_registry)
+        {
+            return transform(ctx, subschema, ref_registry, ref_resolver, path, message).await;
         }
-        if let Some(Value::Array(subschemas)) = map.get("oneOf") {
-            if let Some(subschema) = validate_subschemas(subschemas, message, ref_registry) {
-                return transform(ctx, subschema, ref_registry, ref_resolver, path, message).await;
-            }
+        if let Some(Value::Array(subschemas)) = map.get("oneOf")
+            && let Some(subschema) = validate_subschemas(subschemas, message, ref_registry)
+        {
+            return transform(ctx, subschema, ref_registry, ref_resolver, path, message).await;
         }
-        if let Some(items) = map.get("items") {
-            if let Value::Array(_) = message {
-                return transform(ctx, items, ref_registry, ref_resolver, path, message).await;
-            }
+        if let Some(items) = map.get("items")
+            && let Value::Array(_) = message
+        {
+            return transform(ctx, items, ref_registry, ref_resolver, path, message).await;
         }
         if let Some(reference) = map.get("$ref") {
             let ref_schema = ref_resolver.lookup(reference.as_str().unwrap())?;
@@ -500,28 +500,27 @@ async fn transform(
             return transform(ctx, ref_schema, ref_registry, ref_resolver, path, message).await;
         }
         let field_type = get_type(schema);
-        if field_type == FieldType::Record {
-            if let Some(Value::Object(props)) = map.get("properties") {
-                if let Value::Object(message) = message {
-                    let mut new_message = serde_json::Map::new();
-                    for (prop_name, prop_schema) in props {
-                        let new_value = transform_field_with_ctx(
-                            ctx,
-                            path,
-                            prop_name,
-                            message,
-                            prop_schema,
-                            ref_registry,
-                            ref_resolver,
-                        )
-                        .await?;
-                        if let Some(new_value) = new_value {
-                            new_message.insert(prop_name.clone(), new_value);
-                        }
-                    }
-                    return Ok(Value::Object(new_message));
+        if field_type == FieldType::Record
+            && let Some(Value::Object(props)) = map.get("properties")
+            && let Value::Object(message) = message
+        {
+            let mut new_message = serde_json::Map::new();
+            for (prop_name, prop_schema) in props {
+                let new_value = transform_field_with_ctx(
+                    ctx,
+                    path,
+                    prop_name,
+                    message,
+                    prop_schema,
+                    ref_registry,
+                    ref_resolver,
+                )
+                .await?;
+                if let Some(new_value) = new_value {
+                    new_message.insert(prop_name.clone(), new_value);
                 }
             }
+            return Ok(Value::Object(new_message));
         }
     }
     if let Some(field_ctx) = ctx.current_field() {
@@ -580,12 +579,11 @@ async fn transform_field_with_ctx(
             value,
         )
         .await?;
-        if let Some(Kind::Condition) = ctx.rule.kind {
-            if let Value::Bool(b) = new_value {
-                if !b {
-                    return Err(SerdeError::RuleCondition(Box::new(ctx.rule.clone())));
-                }
-            }
+        if let Some(Kind::Condition) = ctx.rule.kind
+            && let Value::Bool(b) = new_value
+            && !b
+        {
+            return Err(SerdeError::RuleCondition(Box::new(ctx.rule.clone())));
         }
         ctx.exit_field();
         return Ok(Some(new_value));
@@ -649,12 +647,12 @@ fn get_type(schema: &Value) -> FieldType {
 
 fn get_inline_tags(schema: &Value) -> HashSet<String> {
     let mut tag_set = HashSet::new();
-    if let Value::Object(schema) = schema {
-        if let Some(Value::Array(tags)) = schema.get("confluent:tags") {
-            for tag in tags {
-                if let Value::String(tag) = tag {
-                    tag_set.insert(tag.clone());
-                }
+    if let Value::Object(schema) = schema
+        && let Some(Value::Array(tags)) = schema.get("confluent:tags")
+    {
+        for tag in tags {
+            if let Value::String(tag) = tag {
+                tag_set.insert(tag.clone());
             }
         }
     }

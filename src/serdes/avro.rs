@@ -142,25 +142,25 @@ impl<'a, T: Client + Sync> AvroSerializer<'a, T> {
         )?;
         if let Some(ref latest_schema) = latest_schema {
             let schema = latest_schema.to_schema();
-            if let Some(ref rule_set) = schema.rule_set {
-                if rule_set.encoding_rules.is_some() {
-                    encoded_bytes = self
-                        .base
-                        .serde
-                        .execute_rules_with_phase(
-                            ctx,
-                            &subject,
-                            Phase::Encoding,
-                            Mode::Write,
-                            None,
-                            Some(&schema),
-                            None,
-                            &SerdeValue::new_bytes(SerdeFormat::Avro, &encoded_bytes),
-                            None,
-                        )
-                        .await?
-                        .as_bytes();
-                }
+            if let Some(ref rule_set) = schema.rule_set
+                && rule_set.encoding_rules.is_some()
+            {
+                encoded_bytes = self
+                    .base
+                    .serde
+                    .execute_rules_with_phase(
+                        ctx,
+                        &subject,
+                        Phase::Encoding,
+                        Mode::Write,
+                        None,
+                        Some(&schema),
+                        None,
+                        &SerdeValue::new_bytes(SerdeFormat::Avro, &encoded_bytes),
+                        None,
+                    )
+                    .await?
+                    .as_bytes();
             }
         }
 
@@ -201,11 +201,11 @@ async fn transform_fields(
     ctx: &mut RuleContext,
     value: &SerdeValue,
 ) -> Result<SerdeValue, SerdeError> {
-    if let Some(SerdeSchema::Avro((s, named))) = ctx.parsed_target.clone() {
-        if let SerdeValue::Avro(v) = value {
-            let value = transform(ctx, &s, &named, v).await?;
-            return Ok(SerdeValue::Avro(value));
-        }
+    if let Some(SerdeSchema::Avro((s, named))) = ctx.parsed_target.clone()
+        && let SerdeValue::Avro(v) = value
+    {
+        let value = transform(ctx, &s, &named, v).await?;
+        return Ok(SerdeValue::Avro(value));
     }
     Ok(value.clone())
 }
@@ -283,26 +283,26 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
         }
         let subject = subject.unwrap();
         let serde_value;
-        if let Some(ref rule_set) = writer_schema_raw.rule_set {
-            if rule_set.encoding_rules.is_some() {
-                serde_value = self
-                    .base
-                    .serde
-                    .execute_rules_with_phase(
-                        ctx,
-                        &subject,
-                        Phase::Encoding,
-                        Mode::Read,
-                        None,
-                        Some(&writer_schema_raw),
-                        None,
-                        &SerdeValue::new_bytes(SerdeFormat::Avro, data),
-                        None,
-                    )
-                    .await?
-                    .as_bytes();
-                data = &serde_value;
-            }
+        if let Some(ref rule_set) = writer_schema_raw.rule_set
+            && rule_set.encoding_rules.is_some()
+        {
+            serde_value = self
+                .base
+                .serde
+                .execute_rules_with_phase(
+                    ctx,
+                    &subject,
+                    Phase::Encoding,
+                    Mode::Read,
+                    None,
+                    Some(&writer_schema_raw),
+                    None,
+                    &SerdeValue::new_bytes(SerdeFormat::Avro, data),
+                    None,
+                )
+                .await?
+                .as_bytes();
+            data = &serde_value;
         }
 
         let migrations;
@@ -554,12 +554,11 @@ async fn transform_field_with_ctx(
         get_inline_tags(field_schema),
     );
     let new_value = transform(ctx, &field_schema.schema, named_schemas, &field.1).await?;
-    if let Some(Kind::Condition) = ctx.rule.kind {
-        if let Value::Boolean(b) = new_value {
-            if !b {
-                return Err(SerdeError::RuleCondition(Box::new(ctx.rule.clone())));
-            }
-        }
+    if let Some(Kind::Condition) = ctx.rule.kind
+        && let Value::Boolean(b) = new_value
+        && !b
+    {
+        return Err(SerdeError::RuleCondition(Box::new(ctx.rule.clone())));
     }
     ctx.exit_field();
     Ok((field.0.clone(), new_value))

@@ -444,11 +444,11 @@ pub fn dual_schema_id_deserializer(
             SerdeType::Key => KEY_SCHEMA_ID_HEADER,
             SerdeType::Value => VALUE_SCHEMA_ID_HEADER,
         };
-        if let Some(header) = headers.last_header(header_key) {
-            if let Some(header_value) = header.value {
-                schema_id.read_from_bytes(&header_value)?;
-                return Ok(0);
-            }
+        if let Some(header) = headers.last_header(header_key)
+            && let Some(header_value) = header.value
+        {
+            schema_id.read_from_bytes(&header_value)?;
+            return Ok(0);
         }
     }
     schema_id.read_from_bytes(payload)

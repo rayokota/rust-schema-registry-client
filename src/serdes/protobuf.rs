@@ -186,25 +186,25 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
                 _ => return Err(Serialization("unexpected serde value".to_string())),
             };
             msg.encode(&mut encoded_bytes)?;
-            if let Some(ref rule_set) = schema.rule_set {
-                if rule_set.encoding_rules.is_some() {
-                    encoded_bytes = self
-                        .base
-                        .serde
-                        .execute_rules_with_phase(
-                            ctx,
-                            &subject,
-                            Phase::Encoding,
-                            Mode::Write,
-                            None,
-                            Some(&schema),
-                            None,
-                            &SerdeValue::new_bytes(SerdeFormat::Protobuf, &encoded_bytes),
-                            None,
-                        )
-                        .await?
-                        .as_bytes();
-                }
+            if let Some(ref rule_set) = schema.rule_set
+                && rule_set.encoding_rules.is_some()
+            {
+                encoded_bytes = self
+                    .base
+                    .serde
+                    .execute_rules_with_phase(
+                        ctx,
+                        &subject,
+                        Phase::Encoding,
+                        Mode::Write,
+                        None,
+                        Some(&schema),
+                        None,
+                        &SerdeValue::new_bytes(SerdeFormat::Protobuf, &encoded_bytes),
+                        None,
+                    )
+                    .await?
+                    .as_bytes();
             }
         } else {
             value.encode(&mut encoded_bytes)?;
@@ -370,20 +370,19 @@ async fn transform_fields(
     ctx: &mut RuleContext,
     value: &SerdeValue,
 ) -> Result<SerdeValue, SerdeError> {
-    if let Some(SerdeSchema::Protobuf(s)) = ctx.parsed_target.clone() {
-        if let SerdeValue::Protobuf(v) = value {
-            if let Value::Message(message) = v {
-                let pool = s.parent_pool();
-                let desc = pool
-                    .get_message_by_name(message.descriptor().full_name())
-                    .ok_or(Serialization(format!(
-                        "message descriptor {} not found",
-                        message.descriptor().full_name()
-                    )))?;
-                let value = transform(ctx, &desc, v).await?;
-                return Ok(SerdeValue::Protobuf(value));
-            }
-        }
+    if let Some(SerdeSchema::Protobuf(s)) = ctx.parsed_target.clone()
+        && let SerdeValue::Protobuf(v) = value
+        && let Value::Message(message) = v
+    {
+        let pool = s.parent_pool();
+        let desc = pool
+            .get_message_by_name(message.descriptor().full_name())
+            .ok_or(Serialization(format!(
+                "message descriptor {} not found",
+                message.descriptor().full_name()
+            )))?;
+        let value = transform(ctx, &desc, v).await?;
+        return Ok(SerdeValue::Protobuf(value));
     }
     Ok(value.clone())
 }
@@ -442,7 +441,7 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
             .base
             .get_writer_schema(&schema_id, subject.as_deref(), Some("serialized"))
             .await?;
-        let (mut writer_schema, mut pool) = self.get_parsed_schema(&writer_schema_raw).await?;
+        let (writer_schema, mut pool) = self.get_parsed_schema(&writer_schema_raw).await?;
         let writer_desc = self.get_message_desc(&pool, &writer_schema, &msg_index)?;
 
         if !has_subject {
@@ -457,26 +456,26 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
         }
         let subject = subject.unwrap();
         let serde_value;
-        if let Some(ref rule_set) = writer_schema_raw.rule_set {
-            if rule_set.encoding_rules.is_some() {
-                serde_value = self
-                    .base
-                    .serde
-                    .execute_rules_with_phase(
-                        ctx,
-                        &subject,
-                        Phase::Encoding,
-                        Mode::Read,
-                        None,
-                        Some(&writer_schema_raw),
-                        None,
-                        &SerdeValue::new_bytes(SerdeFormat::Protobuf, data),
-                        None,
-                    )
-                    .await?
-                    .as_bytes();
-                data = &serde_value;
-            }
+        if let Some(ref rule_set) = writer_schema_raw.rule_set
+            && rule_set.encoding_rules.is_some()
+        {
+            serde_value = self
+                .base
+                .serde
+                .execute_rules_with_phase(
+                    ctx,
+                    &subject,
+                    Phase::Encoding,
+                    Mode::Read,
+                    None,
+                    Some(&writer_schema_raw),
+                    None,
+                    &SerdeValue::new_bytes(SerdeFormat::Protobuf, data),
+                    None,
+                )
+                .await?
+                .as_bytes();
+            data = &serde_value;
         }
 
         let migrations;
@@ -763,12 +762,11 @@ async fn transform_field_with_ctx(
     }
     let value = message.get_field(fd);
     let new_value = transform(ctx, desc, &value).await?;
-    if let Some(Kind::Condition) = ctx.rule.kind {
-        if let Value::Bool(b) = new_value {
-            if !b {
-                return Err(SerdeError::RuleCondition(Box::new(ctx.rule.clone())));
-            }
-        }
+    if let Some(Kind::Condition) = ctx.rule.kind
+        && let Value::Bool(b) = new_value
+        && !b
+    {
+        return Err(SerdeError::RuleCondition(Box::new(ctx.rule.clone())));
     }
     ctx.exit_field();
     Ok(Some(new_value))
@@ -804,16 +802,14 @@ fn get_inline_tags(fd: &FieldDescriptor) -> HashSet<String> {
     let field_ext = DESCRIPTOR_POOL
         .get_extension_by_name("confluent.field_meta")
         .unwrap();
-    if fd.options().has_extension(&field_ext) {
-        if let Some(v) = fd.options().get_extension(&field_ext).as_message() {
-            if let Some(tags) = v.get_field_by_name("tags") {
-                if let Some(tags) = tags.as_list() {
-                    for tag in tags {
-                        if let Some(tag) = tag.as_str() {
-                            tag_set.insert(tag.to_string());
-                        }
-                    }
-                }
+    if fd.options().has_extension(&field_ext)
+        && let Some(v) = fd.options().get_extension(&field_ext).as_message()
+        && let Some(tags) = v.get_field_by_name("tags")
+        && let Some(tags) = tags.as_list()
+    {
+        for tag in tags {
+            if let Some(tag) = tag.as_str() {
+                tag_set.insert(tag.to_string());
             }
         }
     }
