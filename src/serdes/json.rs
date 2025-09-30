@@ -579,7 +579,7 @@ async fn transform_field_with_ctx(
             &full_name,
             value,
         )
-            .await?;
+        .await?;
         if let Some(Kind::Condition) = ctx.rule.kind {
             if let Value::Bool(b) = new_value {
                 if !b {
@@ -1101,7 +1101,7 @@ mod tests {
             Some(rule_registry.clone()),
             DeserializerConfig::default(),
         )
-            .unwrap();
+        .unwrap();
 
         obj_str = r#"
         {
@@ -1116,7 +1116,6 @@ mod tests {
         let obj2 = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
         assert_eq!(obj2, obj);
     }
-
 
     #[tokio::test]
     async fn test_cel_field_with_union_of_refs() {
