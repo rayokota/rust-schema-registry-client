@@ -515,7 +515,9 @@ async fn transform(
                             ref_resolver,
                         )
                         .await?;
-                        new_message.insert(prop_name.clone(), new_value);
+                        if let Some(new_value) = new_value {
+                            new_message.insert(prop_name.clone(), new_value);
+                        }
                     }
                     return Ok(Value::Object(new_message));
                 }
@@ -558,7 +560,7 @@ async fn transform_field_with_ctx(
     prop_schema: &Value,
     ref_registry: &Registry,
     ref_resolver: &Resolver<'_>,
-) -> Result<Value, SerdeError> {
+) -> Result<Option<Value>, SerdeError> {
     let full_name = path.to_string() + "." + prop_name;
     let message_value = SerdeValue::Json(Value::Object(message.clone()));
     ctx.enter_field(
@@ -568,25 +570,28 @@ async fn transform_field_with_ctx(
         get_type(prop_schema),
         get_inline_tags(prop_schema),
     );
-    let value = message.get(prop_name).unwrap_or(&Value::Null);
-    let new_value = transform(
-        ctx,
-        prop_schema,
-        ref_registry,
-        ref_resolver,
-        &full_name,
-        value,
-    )
-    .await?;
-    if let Some(Kind::Condition) = ctx.rule.kind {
-        if let Value::Bool(b) = new_value {
-            if !b {
-                return Err(SerdeError::RuleCondition(Box::new(ctx.rule.clone())));
+    if let Some(value) = message.get(prop_name) {
+        let new_value = transform(
+            ctx,
+            prop_schema,
+            ref_registry,
+            ref_resolver,
+            &full_name,
+            value,
+        )
+            .await?;
+        if let Some(Kind::Condition) = ctx.rule.kind {
+            if let Value::Bool(b) = new_value {
+                if !b {
+                    return Err(SerdeError::RuleCondition(Box::new(ctx.rule.clone())));
+                }
             }
         }
+        ctx.exit_field();
+        return Ok(Some(new_value));
     }
     ctx.exit_field();
-    Ok(new_value)
+    Ok(None)
 }
 
 fn validate_subschemas<'a>(
@@ -618,6 +623,8 @@ fn get_type(schema: &Value) -> FieldType {
             return FieldType::Enum;
         } else if let Some(Value::String(s)) = schema.get("type") {
             schema_type = s;
+        } else if schema.get("properties").is_some() {
+            schema_type = "object";
         }
     } else if let Value::String(schema) = schema {
         schema_type = schema
@@ -1094,7 +1101,7 @@ mod tests {
             Some(rule_registry.clone()),
             DeserializerConfig::default(),
         )
-        .unwrap();
+            .unwrap();
 
         obj_str = r#"
         {
@@ -1103,6 +1110,159 @@ mod tests {
             "stringField": "hi-suffix",
             "booleanField": true,
             "bytesField": "Zm9vYmFy"
+        }
+        "#;
+        obj = serde_json::from_str(obj_str).unwrap();
+        let obj2 = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        assert_eq!(obj2, obj);
+    }
+
+
+    #[tokio::test]
+    async fn test_cel_field_with_union_of_refs() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            true,
+            true,
+            HashMap::new(),
+        );
+        let schema_str = r##"{
+            "type": "object",
+            "properties": {
+                "messageType": {
+                    "type": "string"
+                },
+                "version": {
+                    "type": "string"
+                },
+                "payload": {
+                    "type": "object",
+                    "oneOf": [
+                    {
+                        "$ref": "#/$defs/authentication_request"
+                    },
+                    {
+                        "$ref": "#/$defs/authentication_status"
+                    }
+                    ]
+                }
+            },
+            "required": [
+            "payload",
+            "messageType",
+            "version"
+            ],
+            "$defs": {
+                "authentication_request": {
+                    "properties": {
+                        "messageId": {
+                            "type": "string",
+                            "confluent:tags": ["PII"]
+                        },
+                        "timestamp": {
+                            "type": "integer",
+                            "minimum": 0
+                        },
+                        "requestId": {
+                            "type": "string"
+                        }
+                    },
+                    "required": [
+                    "messageId",
+                    "timestamp"
+                    ]
+                },
+                "authentication_status": {
+                    "properties": {
+                        "messageId": {
+                            "type": "string",
+                            "confluent:tags": ["PII"]
+                        },
+                        "authType": {
+                            "type": [
+                            "string",
+                            "null"
+                            ]
+                        }
+                    },
+                    "required": [
+                    "messageId",
+                    "authType"
+                    ]
+                }
+            }
+        }
+        "##;
+        let rule = Rule {
+            name: "test-cel".to_string(),
+            doc: None,
+            kind: Some(Kind::Transform),
+            mode: Some(Mode::Write),
+            r#type: "CEL_FIELD".to_string(),
+            tags: None,
+            params: None,
+            expr: Some("name == 'messageId' ; value + '-suffix'".to_string()),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let rule_set = RuleSet {
+            migration_rules: None,
+            domain_rules: Some(vec![rule]),
+            encoding_rules: None,
+        };
+        let schema = Schema {
+            schema_type: Some("JSON".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(rule_set)),
+            schema: schema_str.to_string(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+        let mut obj_str = r#"
+        {
+            "messageType": "authentication_request",
+            "version": "1.0",
+            "payload": {
+                "messageId": "12345",
+                "timestamp": 1757410647
+            }
+        }
+        "#;
+        let mut obj: Value = serde_json::from_str(obj_str).unwrap();
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(CelFieldExecutor::new());
+        let ser =
+            JsonSerializer::new(&client, None, Some(rule_registry.clone()), ser_conf).unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Json,
+            headers: None,
+        };
+        let bytes = ser.serialize(&ser_ctx, obj).await.unwrap();
+
+        let deser = JsonDeserializer::new(
+            &client,
+            Some(rule_registry.clone()),
+            DeserializerConfig::default(),
+        )
+        .unwrap();
+
+        obj_str = r#"
+        {
+            "messageType": "authentication_request",
+            "version": "1.0",
+            "payload": {
+                "messageId": "12345-suffix",
+                "timestamp": 1757410647
+            }
         }
         "#;
         obj = serde_json::from_str(obj_str).unwrap();
