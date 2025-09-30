@@ -174,7 +174,7 @@ impl<T: Client + Clone + Sync + 'static> EncryptionExecutor<T> {
     fn new_transform(
         &self,
         ctx: &mut RuleContext,
-    ) -> Result<EncryptionExecutorTransform<T>, SerdeError> {
+    ) -> Result<EncryptionExecutorTransform<'_, T>, SerdeError> {
         let cryptor = self.get_cryptor(ctx)?;
         let kek_name = self.get_kek_name(ctx)?;
         let dek_expiry_days = self.get_dek_expiry_days(ctx)?;
@@ -351,21 +351,21 @@ impl<T: Client> EncryptionExecutorTransform<'_, T> {
         };
         let mut kek = self.retrieve_kek_from_registry(&kek_id).await?;
         if let Some(kek) = kek {
-            if let Some(kms_type) = kms_type {
-                if kek.kms_type != *kms_type {
-                    return Err(Rule(format!(
-                        "found {} with kms type {} which differs from rule kms type {}",
-                        self.kek_name, kek.kms_type, kms_type
-                    )));
-                }
+            if let Some(kms_type) = kms_type
+                && kek.kms_type != *kms_type
+            {
+                return Err(Rule(format!(
+                    "found {} with kms type {} which differs from rule kms type {}",
+                    self.kek_name, kek.kms_type, kms_type
+                )));
             }
-            if let Some(kms_key_id) = kms_key_id {
-                if kek.kms_key_id != *kms_key_id {
-                    return Err(Rule(format!(
-                        "found {} with kms key id {} which differs from rule kms key id {}",
-                        self.kek_name, kek.kms_key_id, kms_key_id
-                    )));
-                }
+            if let Some(kms_key_id) = kms_key_id
+                && kek.kms_key_id != *kms_key_id
+            {
+                return Err(Rule(format!(
+                    "found {} with kms key id {} which differs from rule kms key id {}",
+                    self.kek_name, kek.kms_key_id, kms_key_id
+                )));
             }
             Ok(kek)
         } else {

@@ -45,22 +45,24 @@ impl KmsDriver for AzureKmsDriver {
         let client = conf.get(CLIENT_ID).cloned();
         let secret = conf.get(CLIENT_SECRET).cloned();
 
-        let creds: Arc<dyn TokenCredential> =
-            if tenant.is_some() && client.is_some() && secret.is_some() {
-                let http_client = azure_core::new_http_client();
-                let token_url = "https://login.microsoftonline.com/";
-                Arc::new(ClientSecretCredential::new(
-                    http_client,
-                    Url::parse(token_url).unwrap(),
-                    tenant.unwrap(),
-                    client.unwrap(),
-                    secret.unwrap(),
-                ))
-            } else {
-                Arc::new(DefaultAzureCredential::create(
-                    TokenCredentialOptions::default(),
-                )?)
-            };
+        let creds: Arc<dyn TokenCredential> = if let Some(tenant) = tenant
+            && let Some(client) = client
+            && let Some(secret) = secret
+        {
+            let http_client = azure_core::new_http_client();
+            let token_url = "https://login.microsoftonline.com/";
+            Arc::new(ClientSecretCredential::new(
+                http_client,
+                Url::parse(token_url).unwrap(),
+                tenant,
+                client,
+                secret,
+            ))
+        } else {
+            Arc::new(DefaultAzureCredential::create(
+                TokenCredentialOptions::default(),
+            )?)
+        };
         Ok(Arc::new(AzureClient::new(
             key_url,
             creds,

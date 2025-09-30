@@ -104,12 +104,14 @@ async fn build_creds(
     let key_arn = key_uri_to_key_arn(key_url.as_str())?;
     let region = Region::new(get_region_from_key_arn(&key_arn)?);
     let mut creds: Arc<dyn ProvideCredentials>;
-    if key.is_some() && secret.is_some() {
-        creds = Arc::new(Credentials::from_keys(key.unwrap(), secret.unwrap(), None));
-    } else if profile.is_some() {
+    if let Some(key) = key
+        && let Some(secret) = secret
+    {
+        creds = Arc::new(Credentials::from_keys(key, secret, None));
+    } else if let Some(profile) = profile {
         creds = Arc::new(
             ProfileFileCredentialsProvider::builder()
-                .profile_name(profile.unwrap())
+                .profile_name(profile)
                 .build(),
         );
     } else {
@@ -117,13 +119,13 @@ async fn build_creds(
         let c = builder.build().await;
         creds = Arc::new(c);
     }
-    if role_arn.is_some() {
-        let mut builder = AssumeRoleProvider::builder(role_arn.unwrap()).region(region.clone());
-        if role_session_name.is_some() {
-            builder = builder.session_name(role_session_name.unwrap());
+    if let Some(role_arn) = role_arn {
+        let mut builder = AssumeRoleProvider::builder(role_arn).region(region.clone());
+        if let Some(role_session_name) = role_session_name {
+            builder = builder.session_name(role_session_name);
         }
-        if role_external_id.is_some() {
-            builder = builder.external_id(role_external_id.unwrap());
+        if let Some(role_external_id) = role_external_id {
+            builder = builder.external_id(role_external_id);
         }
         let c = builder.build_from_provider(creds).await;
         creds = Arc::new(c);

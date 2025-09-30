@@ -63,9 +63,9 @@ impl HcVaultAead {
         // TODO additional data?
         let payload = str::from_utf8(&ciphertext)
             .map_err(|e| wrap_err("failed to convert ciphertext to string", e));
-        if payload.is_err() {
+        if let Err(payload) = payload {
             error!("failed to convert ciphertext to string: {payload:?}");
-            if sender.send(Err(payload.unwrap_err())).is_err() {
+            if sender.send(Err(payload)).is_err() {
                 error!("failed to send result");
             }
             return;
