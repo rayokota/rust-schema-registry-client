@@ -97,6 +97,7 @@ async fn build_creds(
     if role_external_id.is_none() {
         role_external_id = env::var("AWS_ROLE_EXTERNAL_ID").ok();
     }
+    let roleWebIdentityTokenFile = env::var("AWS_WEB_IDENTITY_TOKEN_FILE").ok();
     let key = conf.get(ACCESS_KEY_ID).cloned();
     let secret = conf.get(SECRET_ACCESS_KEY).cloned();
     let profile = conf.get(PROFILE).cloned();
@@ -119,7 +120,8 @@ async fn build_creds(
         let c = builder.build().await;
         creds = Arc::new(c);
     }
-    if let Some(role_arn) = role_arn {
+    // If roleWebIdentityTokenFile is set, use the DefaultCredentialsProvider
+    if let Some(role_arn) = role_arn && roleWebIdentityTokenFile.is_none() {
         let mut builder = AssumeRoleProvider::builder(role_arn).region(region.clone());
         if let Some(role_session_name) = role_session_name {
             builder = builder.session_name(role_session_name);
