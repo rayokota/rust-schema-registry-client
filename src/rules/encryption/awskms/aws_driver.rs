@@ -121,7 +121,9 @@ async fn build_creds(
         creds = Arc::new(c);
     }
     // If roleWebIdentityTokenFile is set, use the DefaultCredentialsProvider
-    if let Some(role_arn) = role_arn && roleWebIdentityTokenFile.is_none() {
+    if let Some(role_arn) = role_arn
+        && roleWebIdentityTokenFile.is_none()
+    {
         let mut builder = AssumeRoleProvider::builder(role_arn).region(region.clone());
         if let Some(role_session_name) = role_session_name {
             builder = builder.session_name(role_session_name);

@@ -103,10 +103,10 @@ impl Client for DekRegistryClient {
                 return Ok(dek.clone());
             }
         }
-        
+
         // Try newer API with subject in path first
         let url = format!(
-            "/dek-registry/v1/keks/{}/deks/{}", 
+            "/dek-registry/v1/keks/{}/deks/{}",
             urlencode(kek_name),
             urlencode(&request.subject)
         );
@@ -117,7 +117,7 @@ impl Client for DekRegistryClient {
             .await?;
         let status = resp.status();
         let content = resp.text().await?;
-        
+
         // If we get a 405 (Method Not Allowed), fall back to older API
         if status == reqwest::StatusCode::METHOD_NOT_ALLOWED {
             let url = format!("/dek-registry/v1/keks/{}/deks", urlencode(kek_name));
@@ -127,7 +127,7 @@ impl Client for DekRegistryClient {
                 .await?;
             let status = resp.status();
             let content = resp.text().await?;
-            
+
             if !status.is_client_error() && !status.is_server_error() {
                 let mut store = self.store.lock().unwrap();
                 let dek: Dek = serde_json::from_str(&content)?;
