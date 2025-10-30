@@ -135,11 +135,23 @@ impl<'a, T: Client + Sync> AvroSerializer<'a, T> {
             schema_tuple = self.get_parsed_schema(schema).await?;
         }
 
-        let mut encoded_bytes = apache_avro::to_avro_datum_schemata(
-            &schema_tuple.0,
-            schema_tuple.1.iter().collect(),
-            value,
-        )?;
+        let mut encoded_bytes = if matches!(schema_tuple.0, apache_avro::Schema::Bytes) {
+            // If the writer schema is bytes, just pass the bytes along
+            match value {
+                Value::Bytes(bytes) => bytes.clone(),
+                _ => {
+                    return Err(Serialization(
+                        "expected bytes value for bytes schema".to_string(),
+                    ));
+                }
+            }
+        } else {
+            apache_avro::to_avro_datum_schemata(
+                &schema_tuple.0,
+                schema_tuple.1.iter().collect(),
+                value,
+            )?
+        };
         if let Some(ref latest_schema) = latest_schema {
             let schema = latest_schema.to_schema();
             if let Some(ref rule_set) = schema.rule_set
@@ -327,12 +339,17 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
         let mut reader = Cursor::new(data);
         let mut value;
         if let Some(ref latest_schema) = latest_schema {
-            value = apache_avro::from_avro_datum_schemata(
-                &writer_schema,
-                writer_named.iter().collect(),
-                &mut reader,
-                None,
-            )?;
+            value = if matches!(writer_schema, apache_avro::Schema::Bytes) {
+                // If the writer schema is bytes, just pass the bytes along
+                Value::Bytes(data.to_vec())
+            } else {
+                apache_avro::from_avro_datum_schemata(
+                    &writer_schema,
+                    writer_named.iter().collect(),
+                    &mut reader,
+                    None,
+                )?
+            };
             let json = from_avro_value(value.clone())?;
             let mut serde_value = SerdeValue::Json(json);
             serde_value = self
@@ -345,13 +362,17 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
                 _ => return Err(Serialization("unexpected serde value".to_string())),
             }
         } else {
-            value = apache_avro::from_avro_datum_reader_schemata(
-                &writer_schema,
-                writer_named.iter().collect(),
-                &mut reader,
-                Some(&reader_schema),
-                reader_named.iter().collect(),
-            )?;
+            value = if matches!(writer_schema, apache_avro::Schema::Bytes) {
+                Value::Bytes(data.to_vec())
+            } else {
+                apache_avro::from_avro_datum_reader_schemata(
+                    &writer_schema,
+                    writer_named.iter().collect(),
+                    &mut reader,
+                    Some(&reader_schema),
+                    reader_named.iter().collect(),
+                )?
+            };
         }
 
         let field_transformer: FieldTransformer =
@@ -777,6 +798,51 @@ mod tests {
         let obj2 = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
         if let Record(v) = obj2.value {
             assert_eq!(v, fields);
+        } else {
+            unreachable!();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bytes_serialization() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let ser_conf = SerializerConfig::default();
+        let schema_str = "\"bytes\"";
+        let schema = Schema {
+            schema_type: Some("AVRO".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: None,
+            schema: schema_str.to_string(),
+        };
+        let obj = Value::Bytes(vec![2, 3, 4]);
+        let rule_registry = RuleRegistry::new();
+        let ser = AvroSerializer::new(
+            &client,
+            Some(&schema),
+            Some(rule_registry.clone()),
+            ser_conf,
+        )
+        .unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Avro,
+            headers: None,
+        };
+        let bytes = ser.serialize(&ser_ctx, obj).await.unwrap();
+        assert_eq!(bytes, vec![0, 0, 0, 0, 1, 2, 3, 4]);
+
+        let deser = AvroDeserializer::new(
+            &client,
+            Some(rule_registry.clone()),
+            DeserializerConfig::default(),
+        )
+        .unwrap();
+        let obj2 = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        if let Value::Bytes(v) = obj2.value {
+            assert_eq!(v, vec![2, 3, 4]);
         } else {
             unreachable!();
         }
