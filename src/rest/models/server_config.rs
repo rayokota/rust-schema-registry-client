@@ -47,9 +47,12 @@ impl ServerConfig {
     }
 }
 /// Compatibility Level
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize, Default,
+)]
 pub enum CompatibilityLevel {
     #[serde(rename = "BACKWARD")]
+    #[default]
     Backward,
     #[serde(rename = "BACKWARD_TRANSITIVE")]
     BackwardTransitive,
@@ -63,10 +66,4 @@ pub enum CompatibilityLevel {
     FullTransitive,
     #[serde(rename = "NONE")]
     None,
-}
-
-impl Default for CompatibilityLevel {
-    fn default() -> CompatibilityLevel {
-        Self::Backward
-    }
 }

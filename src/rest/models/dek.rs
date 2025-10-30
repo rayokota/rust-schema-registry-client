@@ -101,18 +101,15 @@ impl Dek {
     }
 }
 /// Algorithm of the dek
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize, Default,
+)]
 pub enum Algorithm {
     #[serde(rename = "AES128_GCM")]
     Aes128Gcm,
     #[serde(rename = "AES256_GCM")]
+    #[default]
     Aes256Gcm,
     #[serde(rename = "AES256_SIV")]
     Aes256Siv,
-}
-
-impl Default for Algorithm {
-    fn default() -> Algorithm {
-        Self::Aes256Gcm
-    }
 }

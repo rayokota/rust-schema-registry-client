@@ -66,19 +66,17 @@ impl Display for Rule {
 }
 
 /// Rule kind
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize, Default,
+)]
 pub enum Kind {
     #[serde(rename = "TRANSFORM")]
+    #[default]
     Transform,
     #[serde(rename = "CONDITION")]
     Condition,
 }
 
-impl Default for Kind {
-    fn default() -> Kind {
-        Self::Transform
-    }
-}
 /// Rule phase
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum Phase {
@@ -91,7 +89,9 @@ pub enum Phase {
 }
 
 /// Rule mode
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize, Default,
+)]
 pub enum Mode {
     #[serde(rename = "UPGRADE")]
     Upgrade,
@@ -104,11 +104,6 @@ pub enum Mode {
     #[serde(rename = "READ")]
     Read,
     #[serde(rename = "WRITEREAD")]
+    #[default]
     WriteRead,
-}
-
-impl Default for Mode {
-    fn default() -> Mode {
-        Self::WriteRead
-    }
 }
