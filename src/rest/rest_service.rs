@@ -80,7 +80,7 @@ impl RestService {
             reqwest::header::CONTENT_TYPE,
             "application/vnd.schemaregistry.v1+json",
         );
-        request = request.header("Accept-Version", "8.0");
+        request = request.header("Confluent-Accept-Unknown-Properties", "true");
         if let Some((username, password)) = &self.config.basic_auth {
             request = request.basic_auth(username, password.as_deref());
         } else if let Some(token) = &self.config.bearer_access_token {
