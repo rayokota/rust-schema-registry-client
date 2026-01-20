@@ -17,7 +17,7 @@ use url::Url;
 pub struct AzureAead {
     kms: KeyClient,
     key_name: String,
-    key_version: String,
+    key_version: Option<String>,
     algorithm: CryptographParamtersEncryption,
 }
 
@@ -33,8 +33,8 @@ impl AzureAead {
             .map_err(|e| wrap_err("failed to create KeyClient", e))?;
         Ok(AzureAead {
             kms,
-            key_name: key_name.to_string(),
-            key_version: key_version.to_string(),
+            key_name,
+            key_version,
             algorithm,
         })
     }
@@ -49,10 +49,10 @@ impl AzureAead {
             encrypt_parameters_encryption: self.algorithm.clone(),
             plaintext,
         };
-        let req = self
-            .kms
-            .encrypt(self.key_name.clone(), params)
-            .version(self.key_version.clone());
+        let mut req = self.kms.encrypt(self.key_name.clone(), params);
+        if let Some(version) = self.key_version.clone() {
+            req = req.version(version);
+        }
         // TODO additional data
         /*
         if !additional_data.is_empty() {
@@ -83,10 +83,10 @@ impl AzureAead {
             decrypt_parameters_encryption: self.algorithm.clone(),
             ciphertext,
         };
-        let req = self
-            .kms
-            .decrypt(self.key_name.clone(), params)
-            .version(self.key_version.clone());
+        let mut req = self.kms.decrypt(self.key_name.clone(), params);
+        if let Some(version) = self.key_version.clone() {
+            req = req.version(version);
+        }
         // TODO additional data
         /*
         if !additional_data.is_empty() {
@@ -136,14 +136,23 @@ impl tink_core::Aead for AzureAead {
     }
 }
 
-fn get_key_info(key_uri: &str) -> Result<(String, String, String), TinkError> {
+fn get_key_info(key_uri: &str) -> Result<(String, String, Option<String>), TinkError> {
     let parsed = Url::parse(key_uri).map_err(|e| wrap_err("failed to parse URI", e))?;
     let path = parsed.path();
     let parts: Vec<&str> = path.split('/').collect();
     let len = parts.len();
-    if len != 4 || !parts[0].is_empty() || parts[1] != "keys" {
+    // Valid paths:
+    // - /keys/{key_name} (3 parts: ["", "keys", "{key_name}"])
+    // - /keys/{key_name}/{version} (4 parts: ["", "keys", "{key_name}", "{version}"])
+    if (len != 3 && len != 4) || !parts[0].is_empty() || parts[1] != "keys" {
         return Err("invalid key uri".into());
     }
     let vault_url = parsed.scheme().to_string() + "://" + parsed.host_str().unwrap_or("localhost");
-    Ok((vault_url, parts[2].to_string(), parts[3].to_string()))
+    let key_name = parts[2].to_string();
+    let key_version = if len == 4 && !parts[3].is_empty() {
+        Some(parts[3].to_string())
+    } else {
+        None
+    };
+    Ok((vault_url, key_name, key_version))
 }
