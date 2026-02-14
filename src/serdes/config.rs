@@ -1,6 +1,6 @@
 use crate::serdes::serde::{
-    SchemaIdDeserializer, SchemaIdSerializer, SubjectNameStrategy, dual_schema_id_deserializer,
-    prefix_schema_id_serializer, topic_name_strategy,
+    SchemaIdDeserializer, SchemaIdSerializer, SubjectNameStrategyType,
+    dual_schema_id_deserializer, prefix_schema_id_serializer,
 };
 use std::collections::HashMap;
 
@@ -18,7 +18,7 @@ pub struct SerializerConfig {
     pub normalize_schemas: bool,
     pub validate: bool,
     pub rule_config: HashMap<String, String>,
-    pub subject_name_strategy: SubjectNameStrategy,
+    pub subject_name_strategy_type: SubjectNameStrategyType,
     pub schema_id_serializer: SchemaIdSerializer,
 }
 
@@ -36,7 +36,7 @@ impl SerializerConfig {
             normalize_schemas,
             validate,
             rule_config,
-            subject_name_strategy: topic_name_strategy,
+            subject_name_strategy_type: SubjectNameStrategyType::Topic,
             schema_id_serializer: prefix_schema_id_serializer,
         }
     }
@@ -50,7 +50,7 @@ impl Default for SerializerConfig {
             normalize_schemas: false,
             validate: false,
             rule_config: HashMap::new(),
-            subject_name_strategy: topic_name_strategy,
+            subject_name_strategy_type: SubjectNameStrategyType::Topic,
             schema_id_serializer: prefix_schema_id_serializer,
         }
     }
@@ -61,7 +61,7 @@ pub struct DeserializerConfig {
     pub use_schema: Option<SchemaSelector>,
     pub validate: bool,
     pub rule_config: HashMap<String, String>,
-    pub subject_name_strategy: SubjectNameStrategy,
+    pub subject_name_strategy_type: SubjectNameStrategyType,
     pub schema_id_deserializer: SchemaIdDeserializer,
 }
 
@@ -75,7 +75,7 @@ impl DeserializerConfig {
             use_schema,
             validate,
             rule_config,
-            subject_name_strategy: topic_name_strategy,
+            subject_name_strategy_type: SubjectNameStrategyType::Topic,
             schema_id_deserializer: dual_schema_id_deserializer,
         }
     }
@@ -87,7 +87,7 @@ impl Default for DeserializerConfig {
             use_schema: None,
             validate: false,
             rule_config: HashMap::new(),
-            subject_name_strategy: topic_name_strategy,
+            subject_name_strategy_type: SubjectNameStrategyType::Topic,
             schema_id_deserializer: dual_schema_id_deserializer,
         }
     }

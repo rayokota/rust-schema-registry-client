@@ -2,7 +2,10 @@ use crate::rest::apis::Error::ResponseError;
 use crate::rest::apis::error_message::ErrorMessage;
 use crate::rest::apis::{Error, ResponseContent};
 use crate::rest::client_config;
-use crate::rest::models::{RegisteredSchema, Schema, ServerConfig};
+use crate::rest::models::{
+    Association, AssociationCreateOrUpdateRequest, AssociationInfo, AssociationResponse,
+    RegisteredSchema, Schema, ServerConfig,
+};
 use crate::rest::schema_registry_client::Client;
 use reqwest::StatusCode;
 use std::collections::{BTreeMap, HashMap};
@@ -12,6 +15,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct MockSchemaRegistryClient {
     store: Arc<Mutex<SchemaStore>>,
+    association_store: Arc<Mutex<AssociationStore>>,
     config: client_config::ClientConfig,
 }
 
@@ -19,6 +23,7 @@ impl Client for MockSchemaRegistryClient {
     fn new(config: client_config::ClientConfig) -> Self {
         MockSchemaRegistryClient {
             store: Arc::new(Mutex::new(SchemaStore::new())),
+            association_store: Arc::new(Mutex::new(AssociationStore::new())),
             config,
         }
     }
@@ -237,10 +242,61 @@ impl Client for MockSchemaRegistryClient {
         Ok(ServerConfig::new())
     }
 
+    async fn get_associations_by_resource_name(
+        &self,
+        resource_name: &str,
+        resource_namespace: &str,
+        resource_type: &str,
+        association_types: &[&str],
+        _lifecycle: &str,
+        offset: i32,
+        limit: i32,
+    ) -> Result<Vec<Association>, Error> {
+        let store = self.association_store.lock().unwrap();
+        let associations = store.get_associations_by_resource_name(
+            resource_name,
+            resource_namespace,
+            resource_type,
+            association_types,
+        );
+        // Apply pagination
+        let start = offset as usize;
+        let end = if limit >= 1 {
+            std::cmp::min(start + limit as usize, associations.len())
+        } else {
+            associations.len()
+        };
+        if start >= associations.len() {
+            return Ok(Vec::new());
+        }
+        Ok(associations[start..end].to_vec())
+    }
+
+    async fn create_association(
+        &self,
+        request: &AssociationCreateOrUpdateRequest,
+    ) -> Result<AssociationResponse, Error> {
+        let mut store = self.association_store.lock().unwrap();
+        Ok(store.create_association(request))
+    }
+
+    async fn delete_associations(
+        &self,
+        resource_id: &str,
+        resource_type: Option<&str>,
+        association_types: Option<&[&str]>,
+        _cascade_lifecycle: bool,
+    ) -> Result<(), Error> {
+        let mut store = self.association_store.lock().unwrap();
+        store.delete_associations(resource_id, resource_type, association_types);
+        Ok(())
+    }
+
     fn clear_latest_caches(&self) {}
 
     fn clear_caches(&self) {
         self.store.lock().unwrap().clear();
+        self.association_store.lock().unwrap().clear();
     }
 
     fn close(&mut self) {}
@@ -383,6 +439,170 @@ impl SchemaStore {
         self.schema_id_index.clear();
         self.schema_guid_index.clear();
         self.schema_index.clear();
+    }
+}
+
+/// AssociationCacheEntry stores associations for a resource.
+struct AssociationCacheEntry {
+    resource_name: String,
+    resource_namespace: String,
+    resource_type: String,
+    associations: Vec<Association>,
+}
+
+/// AssociationStore stores associations keyed by resource_id.
+struct AssociationStore {
+    associations_by_resource_id: HashMap<String, AssociationCacheEntry>,
+}
+
+impl AssociationStore {
+    pub fn new() -> Self {
+        AssociationStore {
+            associations_by_resource_id: HashMap::new(),
+        }
+    }
+
+    pub fn create_association(
+        &mut self,
+        request: &AssociationCreateOrUpdateRequest,
+    ) -> AssociationResponse {
+        let resource_id = request
+            .resource_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let resource_name = request.resource_name.clone().unwrap_or_default();
+        let resource_namespace = request
+            .resource_namespace
+            .clone()
+            .unwrap_or_else(|| "-".to_string());
+        let resource_type = request
+            .resource_type
+            .clone()
+            .unwrap_or_else(|| "topic".to_string());
+
+        let entry = self
+            .associations_by_resource_id
+            .entry(resource_id.clone())
+            .or_insert_with(|| AssociationCacheEntry {
+                resource_name: resource_name.clone(),
+                resource_namespace: resource_namespace.clone(),
+                resource_type: resource_type.clone(),
+                associations: Vec::new(),
+            });
+
+        let mut response_associations = Vec::new();
+
+        if let Some(assoc_infos) = &request.associations {
+            for assoc_info in assoc_infos {
+                let association = Association {
+                    subject: assoc_info.subject.clone(),
+                    guid: None,
+                    resource_name: Some(resource_name.clone()),
+                    resource_namespace: Some(resource_namespace.clone()),
+                    resource_id: Some(resource_id.clone()),
+                    resource_type: Some(resource_type.clone()),
+                    association_type: assoc_info.association_type.clone(),
+                    lifecycle: assoc_info.lifecycle.clone(),
+                    frozen: assoc_info.frozen,
+                };
+
+                // Check if association already exists
+                let existing_idx = entry.associations.iter().position(|a| {
+                    a.subject == association.subject
+                        && a.association_type == association.association_type
+                });
+
+                if let Some(idx) = existing_idx {
+                    entry.associations[idx] = association.clone();
+                } else {
+                    entry.associations.push(association.clone());
+                }
+
+                response_associations.push(AssociationInfo {
+                    subject: association.subject,
+                    association_type: association.association_type,
+                    lifecycle: association.lifecycle,
+                    frozen: association.frozen,
+                    schema: None,
+                });
+            }
+        }
+
+        AssociationResponse {
+            resource_name: Some(resource_name),
+            resource_namespace: Some(resource_namespace),
+            resource_id: Some(resource_id),
+            resource_type: Some(resource_type),
+            associations: Some(response_associations),
+        }
+    }
+
+    pub fn get_associations_by_resource_name(
+        &self,
+        resource_name: &str,
+        resource_namespace: &str,
+        resource_type: &str,
+        association_types: &[&str],
+    ) -> Vec<Association> {
+        let mut results = Vec::new();
+
+        for entry in self.associations_by_resource_id.values() {
+            if entry.resource_name == resource_name && entry.resource_namespace == resource_namespace
+            {
+                if !resource_type.is_empty() && entry.resource_type != resource_type {
+                    continue;
+                }
+                for assoc in &entry.associations {
+                    if association_types.is_empty()
+                        || assoc
+                            .association_type
+                            .as_ref()
+                            .map_or(false, |at| association_types.contains(&at.as_str()))
+                    {
+                        results.push(assoc.clone());
+                    }
+                }
+            }
+        }
+
+        results
+    }
+
+    pub fn delete_associations(
+        &mut self,
+        resource_id: &str,
+        resource_type: Option<&str>,
+        association_types: Option<&[&str]>,
+    ) {
+        if let Some(entry) = self.associations_by_resource_id.get_mut(resource_id) {
+            if let Some(rt) = resource_type {
+                if entry.resource_type != rt {
+                    return;
+                }
+            }
+
+            if let Some(types) = association_types {
+                if types.is_empty() {
+                    self.associations_by_resource_id.remove(resource_id);
+                } else {
+                    entry.associations.retain(|a| {
+                        !a.association_type
+                            .as_ref()
+                            .map_or(false, |at| types.contains(&at.as_str()))
+                    });
+
+                    if entry.associations.is_empty() {
+                        self.associations_by_resource_id.remove(resource_id);
+                    }
+                }
+            } else {
+                self.associations_by_resource_id.remove(resource_id);
+            }
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.associations_by_resource_id.clear();
     }
 }
 

@@ -8,7 +8,7 @@ use crate::serdes::serde::SerdeError::Serialization;
 use crate::serdes::serde::{
     BaseDeserializer, BaseSerializer, FieldTransformer, FieldType, RuleContext, SchemaId, Serde,
     SerdeError, SerdeFormat, SerdeSchema, SerdeType, SerdeValue, SerializationContext,
-    get_executor, get_executors,
+    SubjectNameStrategyFunc, get_executor, get_executors, strategy_func,
 };
 use async_recursion::async_recursion;
 use base64::Engine;
@@ -33,16 +33,48 @@ pub mod confluent {
     }
 }
 
+/// Helper function to extract record name from Protobuf Schema model.
+/// For protobuf, we extract the message name from the schema definition.
+fn get_protobuf_record_name(schema: Option<&Schema>) -> Result<String, SerdeError> {
+    let schema = schema.ok_or_else(|| Serialization("Schema is required for record name strategy".to_string()))?;
+    let schema_str = &schema.schema;
+    if schema_str.is_empty() {
+        return Err(Serialization("Schema string is empty".to_string()));
+    }
+    // Look for "message MessageName {" pattern
+    for line in schema_str.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("message ") {
+            let rest = &trimmed[8..]; // Skip "message "
+            if let Some(end) = rest.find(|c: char| c == '{' || c.is_whitespace()) {
+                return Ok(rest[..end].trim().to_string());
+            }
+        }
+    }
+    Err(Serialization("Could not find message name in protobuf schema".to_string()))
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ProtobufSerde {
     parsed_schemas: DashMap<Schema, (FileDescriptor, DescriptorPool)>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ProtobufSerializer<'a, T: Client> {
     reference_subject_name_strategy: ReferenceSubjectNameStrategy,
     base: BaseSerializer<'a, T>,
     serde: ProtobufSerde,
+    subject_name_strategy: Arc<SubjectNameStrategyFunc>,
+}
+
+impl<'a, T: Client> std::fmt::Debug for ProtobufSerializer<'a, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProtobufSerializer")
+            .field("reference_subject_name_strategy", &"<function>")
+            .field("serde", &self.serde)
+            .field("subject_name_strategy", &"<function>")
+            .finish_non_exhaustive()
+    }
 }
 
 pub type ReferenceSubjectNameStrategy = fn(ref_name: &str, serde_type: &SerdeType) -> String;
@@ -74,12 +106,25 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
         for executor in get_executors(rule_registry.as_ref()) {
             executor.configure(client.config(), &serializer_config.rule_config)?;
         }
+        let subject_name_strategy = strategy_func(
+            serializer_config.subject_name_strategy_type.clone(),
+            Box::new(get_protobuf_record_name),
+        )?
+        .unwrap_or_else(|| {
+            Box::new(|topic, serde_type, _schema| {
+                Ok(match serde_type {
+                    SerdeType::Key => format!("{topic}-key"),
+                    SerdeType::Value => format!("{topic}-value"),
+                })
+            })
+        });
         Ok(ProtobufSerializer {
             reference_subject_name_strategy,
             base: BaseSerializer::new(Serde::new(client, rule_registry), serializer_config),
             serde: ProtobufSerde {
                 parsed_schemas: DashMap::new(),
             },
+            subject_name_strategy: Arc::new(subject_name_strategy),
         })
     }
 
@@ -114,12 +159,8 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
         value: &M,
         md: &MessageDescriptor,
     ) -> Result<Vec<u8>, SerdeError> {
-        let strategy = self.base.config.subject_name_strategy;
-        // TODO pass schema (instead of None) to strategy later?
-        let subject = strategy(&ctx.topic, &ctx.serde_type, None);
-        let subject = subject.ok_or(Serialization(
-            "subject name strategy returned None".to_string(),
-        ))?;
+        // TODO pass schema (instead of None) to strategy later for Record/TopicRecord strategies
+        let subject = (self.subject_name_strategy)(&ctx.topic, &ctx.serde_type, None)?;
         let latest_schema = self
             .base
             .serde
@@ -387,10 +428,20 @@ async fn transform_fields(
     Ok(value.clone())
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ProtobufDeserializer<'a, T: Client> {
     base: BaseDeserializer<'a, T>,
     serde: ProtobufSerde,
+    subject_name_strategy: Arc<SubjectNameStrategyFunc>,
+}
+
+impl<'a, T: Client> std::fmt::Debug for ProtobufDeserializer<'a, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProtobufDeserializer")
+            .field("serde", &self.serde)
+            .field("subject_name_strategy", &"<function>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
@@ -402,11 +453,24 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
         for executor in get_executors(rule_registry.as_ref()) {
             executor.configure(client.config(), &deserializer_config.rule_config)?;
         }
+        let subject_name_strategy = strategy_func(
+            deserializer_config.subject_name_strategy_type.clone(),
+            Box::new(get_protobuf_record_name),
+        )?
+        .unwrap_or_else(|| {
+            Box::new(|topic, serde_type, _schema| {
+                Ok(match serde_type {
+                    SerdeType::Key => format!("{topic}-key"),
+                    SerdeType::Value => format!("{topic}-value"),
+                })
+            })
+        });
         Ok(ProtobufDeserializer {
             base: BaseDeserializer::new(Serde::new(client, rule_registry), deserializer_config),
             serde: ProtobufSerde {
                 parsed_schemas: DashMap::new(),
             },
+            subject_name_strategy: Arc::new(subject_name_strategy),
         })
     }
 
@@ -415,20 +479,20 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
         ctx: &SerializationContext,
         data: &[u8],
     ) -> Result<M, SerdeError> {
-        let strategy = self.base.config.subject_name_strategy;
-        let mut subject = strategy(&ctx.topic, &ctx.serde_type, None);
+        // Get initial subject using configured subject name strategy (without schema)
+        let initial_subject = (self.subject_name_strategy)(&ctx.topic, &ctx.serde_type, None)
+            .unwrap_or_default();
         let mut latest_schema = None;
-        let has_subject = subject.is_some();
-        if has_subject {
+
+        // Try to get reader schema with initial subject
+        if !initial_subject.is_empty() {
             latest_schema = self
                 .base
                 .serde
-                .get_reader_schema(
-                    subject.as_ref().unwrap(),
-                    Some("serialized"),
-                    &self.base.config.use_schema,
-                )
-                .await?;
+                .get_reader_schema(&initial_subject, Some("serialized"), &self.base.config.use_schema)
+                .await
+                .ok()
+                .flatten();
         }
 
         let mut schema_id = SchemaId::new(SerdeFormat::Protobuf, None, None, None)?;
@@ -439,22 +503,35 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
 
         let writer_schema_raw = self
             .base
-            .get_writer_schema(&schema_id, subject.as_deref(), Some("serialized"))
+            .get_writer_schema(&schema_id, Some(&initial_subject), Some("serialized"))
             .await?;
         let (writer_schema, mut pool) = self.get_parsed_schema(&writer_schema_raw).await?;
         let writer_desc = self.get_message_desc(&pool, &writer_schema, &msg_index)?;
 
-        if !has_subject {
-            subject = strategy(&ctx.topic, &ctx.serde_type, Some(&writer_schema_raw));
-            if let Some(subject) = subject.as_ref() {
-                latest_schema = self
-                    .base
-                    .serde
-                    .get_reader_schema(subject, Some("serialized"), &self.base.config.use_schema)
-                    .await?;
+        // Recompute subject with writer schema (needed for Record/TopicRecord strategies)
+        let subject = (self.subject_name_strategy)(
+            &ctx.topic,
+            &ctx.serde_type,
+            Some(&writer_schema_raw),
+        )?;
+
+        // If subject changed, try to get reader schema again
+        if subject != initial_subject && !subject.is_empty() {
+            if let Ok(Some(schema)) = self
+                .base
+                .serde
+                .get_reader_schema(&subject, Some("serialized"), &self.base.config.use_schema)
+                .await
+            {
+                latest_schema = Some(schema);
             }
         }
-        let subject = subject.unwrap();
+
+        if subject.is_empty() {
+            return Err(Serialization(
+                "Could not determine subject for deserialization".to_string(),
+            ));
+        }
         let serde_value;
         if let Some(ref rule_set) = writer_schema_raw.rule_set
             && rule_set.encoding_rules.is_some()

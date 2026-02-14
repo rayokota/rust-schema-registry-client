@@ -1,5 +1,8 @@
 use crate::rest::apis::{Error, ResponseContent, urlencode};
-use crate::rest::models::{RegisteredSchema, Schema, ServerConfig};
+use crate::rest::models::{
+    Association, AssociationCreateOrUpdateRequest, AssociationResponse, RegisteredSchema, Schema,
+    ServerConfig,
+};
 use crate::rest::{client_config, rest_service};
 use mini_moka::sync::Cache;
 use std::collections::{BTreeMap, HashMap};
@@ -76,6 +79,27 @@ pub trait Client {
     ) -> Result<ServerConfig, Error>;
     async fn get_default_config(&self) -> Result<ServerConfig, Error>;
     async fn update_default_config(&self, config: &ServerConfig) -> Result<ServerConfig, Error>;
+    async fn get_associations_by_resource_name(
+        &self,
+        resource_name: &str,
+        resource_namespace: &str,
+        resource_type: &str,
+        association_types: &[&str],
+        lifecycle: &str,
+        offset: i32,
+        limit: i32,
+    ) -> Result<Vec<Association>, Error>;
+    async fn create_association(
+        &self,
+        request: &AssociationCreateOrUpdateRequest,
+    ) -> Result<AssociationResponse, Error>;
+    async fn delete_associations(
+        &self,
+        resource_id: &str,
+        resource_type: Option<&str>,
+        association_types: Option<&[&str]>,
+        cascade_lifecycle: bool,
+    ) -> Result<(), Error>;
     fn clear_latest_caches(&self);
     fn clear_caches(&self);
     fn close(&mut self);
@@ -654,6 +678,123 @@ impl Client for SchemaRegistryClient {
             Err(Error::ResponseError(error))
         }
     }
+
+    async fn get_associations_by_resource_name(
+        &self,
+        resource_name: &str,
+        resource_namespace: &str,
+        resource_type: &str,
+        association_types: &[&str],
+        lifecycle: &str,
+        offset: i32,
+        limit: i32,
+    ) -> Result<Vec<Association>, Error> {
+        let url = "/associations";
+        let mut query = vec![
+            ("resourceName".to_string(), resource_name.to_string()),
+        ];
+        if !resource_namespace.is_empty() {
+            query.push(("resourceNamespace".to_string(), resource_namespace.to_string()));
+        }
+        if !resource_type.is_empty() {
+            query.push(("resourceType".to_string(), resource_type.to_string()));
+        }
+        for assoc_type in association_types {
+            query.push(("associationType".to_string(), assoc_type.to_string()));
+        }
+        if !lifecycle.is_empty() {
+            query.push(("lifecycle".to_string(), lifecycle.to_string()));
+        }
+        if offset > 0 {
+            query.push(("offset".to_string(), offset.to_string()));
+        }
+        if limit >= 0 {
+            query.push(("limit".to_string(), limit.to_string()));
+        }
+        let resp = self
+            .rest_service
+            .send_request_urls(url, reqwest::Method::GET, Some(&query), None)
+            .await?;
+        let status = resp.status();
+        let content = resp.text().await?;
+        if !status.is_client_error() && !status.is_server_error() {
+            let associations: Vec<Association> = serde_json::from_str(&content)?;
+            Ok(associations)
+        } else {
+            let entity = serde_json::from_str(&content).ok();
+            let error = ResponseContent {
+                status,
+                content,
+                entity,
+            };
+            Err(Error::ResponseError(error))
+        }
+    }
+
+    async fn create_association(
+        &self,
+        request: &AssociationCreateOrUpdateRequest,
+    ) -> Result<AssociationResponse, Error> {
+        let url = "/associations";
+        let body = serde_json::to_string(request)?;
+        let resp = self
+            .rest_service
+            .send_request_urls(url, reqwest::Method::POST, None, Some(&body))
+            .await?;
+        let status = resp.status();
+        let content = resp.text().await?;
+        if !status.is_client_error() && !status.is_server_error() {
+            let response: AssociationResponse = serde_json::from_str(&content)?;
+            Ok(response)
+        } else {
+            let entity = serde_json::from_str(&content).ok();
+            let error = ResponseContent {
+                status,
+                content,
+                entity,
+            };
+            Err(Error::ResponseError(error))
+        }
+    }
+
+    async fn delete_associations(
+        &self,
+        resource_id: &str,
+        resource_type: Option<&str>,
+        association_types: Option<&[&str]>,
+        cascade_lifecycle: bool,
+    ) -> Result<(), Error> {
+        let url = format!("/associations/resources/{}", urlencode(resource_id));
+        let mut query = vec![
+            ("cascadeLifecycle".to_string(), cascade_lifecycle.to_string()),
+        ];
+        if let Some(rt) = resource_type {
+            query.push(("resourceType".to_string(), rt.to_string()));
+        }
+        if let Some(types) = association_types {
+            for assoc_type in types {
+                query.push(("associationType".to_string(), assoc_type.to_string()));
+            }
+        }
+        let resp = self
+            .rest_service
+            .send_request_urls(&url, reqwest::Method::DELETE, Some(&query), None)
+            .await?;
+        let status = resp.status();
+        let content = resp.text().await?;
+        if !status.is_client_error() && !status.is_server_error() {
+            Ok(())
+        } else {
+            let entity = serde_json::from_str(&content).ok();
+            let error = ResponseContent {
+                status,
+                content,
+                entity,
+            };
+            Err(Error::ResponseError(error))
+        }
+    }
+
     fn clear_latest_caches(&self) {
         self.latest_version_cache.invalidate_all();
         self.latest_with_metadata_cache.invalidate_all();

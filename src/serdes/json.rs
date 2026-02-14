@@ -7,7 +7,7 @@ use crate::serdes::serde::SerdeError::Serialization;
 use crate::serdes::serde::{
     BaseDeserializer, BaseSerializer, FieldTransformer, FieldType, RuleContext, SchemaId, Serde,
     SerdeError, SerdeFormat, SerdeSchema, SerdeType, SerdeValue, SerializationContext,
-    get_executor, get_executors,
+    SubjectNameStrategyFunc, get_executor, get_executors, strategy_func,
 };
 use async_recursion::async_recursion;
 use base64::Engine;
@@ -19,17 +19,53 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// Helper function to extract record name from JSON Schema model.
+fn get_json_schema_record_name(schema: Option<&Schema>) -> Result<String, SerdeError> {
+    let schema = schema.ok_or_else(|| Serialization("Schema is required for record name strategy".to_string()))?;
+    let schema_str = &schema.schema;
+    if schema_str.is_empty() {
+        return Err(Serialization("Schema string is empty".to_string()));
+    }
+    let json: Value = serde_json::from_str(schema_str)
+        .map_err(|e| Serialization(format!("Failed to parse schema JSON: {}", e)))?;
+    // Try "title" first, then "$id"
+    if let Some(title) = json.get("title").and_then(|t| t.as_str()) {
+        return Ok(title.to_string());
+    }
+    if let Some(id) = json.get("$id").and_then(|i| i.as_str()) {
+        // Extract name from URI (last path component)
+        if let Some(pos) = id.rfind('/') {
+            if pos < id.len() - 1 {
+                return Ok(id[pos + 1..].to_string());
+            }
+        }
+        return Ok(id.to_string());
+    }
+    Err(Serialization("Schema does not have a 'title' or '$id' field".to_string()))
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct JsonSerde {
     parsed_schemas: DashMap<Schema, (Value, Registry)>,
     validators: DashMap<Schema, Arc<Validator>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct JsonSerializer<'a, T: Client> {
     schema: Option<&'a Schema>,
     base: BaseSerializer<'a, T>,
     serde: JsonSerde,
+    subject_name_strategy: Arc<SubjectNameStrategyFunc>,
+}
+
+impl<'a, T: Client> std::fmt::Debug for JsonSerializer<'a, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsonSerializer")
+            .field("schema", &self.schema)
+            .field("serde", &self.serde)
+            .field("subject_name_strategy", &"<function>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a, T: Client + Sync> JsonSerializer<'a, T> {
@@ -42,6 +78,18 @@ impl<'a, T: Client + Sync> JsonSerializer<'a, T> {
         for executor in get_executors(rule_registry.as_ref()) {
             executor.configure(client.config(), &serializer_config.rule_config)?;
         }
+        let subject_name_strategy = strategy_func(
+            serializer_config.subject_name_strategy_type.clone(),
+            Box::new(get_json_schema_record_name),
+        )?
+        .unwrap_or_else(|| {
+            Box::new(|topic, serde_type, _schema| {
+                Ok(match serde_type {
+                    SerdeType::Key => format!("{topic}-key"),
+                    SerdeType::Value => format!("{topic}-value"),
+                })
+            })
+        });
         Ok(JsonSerializer {
             schema,
             base: BaseSerializer::new(Serde::new(client, rule_registry), serializer_config),
@@ -49,6 +97,7 @@ impl<'a, T: Client + Sync> JsonSerializer<'a, T> {
                 parsed_schemas: DashMap::new(),
                 validators: DashMap::new(),
             },
+            subject_name_strategy: Arc::new(subject_name_strategy),
         })
     }
 
@@ -58,11 +107,7 @@ impl<'a, T: Client + Sync> JsonSerializer<'a, T> {
         value: Value,
     ) -> Result<Vec<u8>, SerdeError> {
         let mut value = value;
-        let strategy = self.base.config.subject_name_strategy;
-        let subject = strategy(&ctx.topic, &ctx.serde_type, self.schema);
-        let subject = subject.ok_or(Serialization(
-            "subject name strategy returned None".to_string(),
-        ))?;
+        let subject = (self.subject_name_strategy)(&ctx.topic, &ctx.serde_type, self.schema)?;
         let latest_schema = self
             .base
             .serde
@@ -231,10 +276,20 @@ async fn transform_fields(
     Ok(value.clone())
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct JsonDeserializer<'a, T: Client> {
     base: BaseDeserializer<'a, T>,
     serde: JsonSerde,
+    subject_name_strategy: Arc<SubjectNameStrategyFunc>,
+}
+
+impl<'a, T: Client> std::fmt::Debug for JsonDeserializer<'a, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsonDeserializer")
+            .field("serde", &self.serde)
+            .field("subject_name_strategy", &"<function>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a, T: Client + Sync> JsonDeserializer<'a, T> {
@@ -246,12 +301,25 @@ impl<'a, T: Client + Sync> JsonDeserializer<'a, T> {
         for executor in get_executors(rule_registry.as_ref()) {
             executor.configure(client.config(), &deserializer_config.rule_config)?;
         }
+        let subject_name_strategy = strategy_func(
+            deserializer_config.subject_name_strategy_type.clone(),
+            Box::new(get_json_schema_record_name),
+        )?
+        .unwrap_or_else(|| {
+            Box::new(|topic, serde_type, _schema| {
+                Ok(match serde_type {
+                    SerdeType::Key => format!("{topic}-key"),
+                    SerdeType::Value => format!("{topic}-value"),
+                })
+            })
+        });
         Ok(JsonDeserializer {
             base: BaseDeserializer::new(Serde::new(client, rule_registry), deserializer_config),
             serde: JsonSerde {
                 parsed_schemas: DashMap::new(),
                 validators: DashMap::new(),
             },
+            subject_name_strategy: Arc::new(subject_name_strategy),
         })
     }
 
@@ -260,20 +328,20 @@ impl<'a, T: Client + Sync> JsonDeserializer<'a, T> {
         ctx: &SerializationContext,
         data: &[u8],
     ) -> Result<Value, SerdeError> {
-        let strategy = self.base.config.subject_name_strategy;
-        let mut subject = strategy(&ctx.topic, &ctx.serde_type, None);
+        // Get initial subject using configured subject name strategy (without schema)
+        let initial_subject = (self.subject_name_strategy)(&ctx.topic, &ctx.serde_type, None)
+            .unwrap_or_default();
         let mut latest_schema = None;
-        let has_subject = subject.is_some();
-        if has_subject {
+
+        // Try to get reader schema with initial subject
+        if !initial_subject.is_empty() {
             latest_schema = self
                 .base
                 .serde
-                .get_reader_schema(
-                    subject.as_ref().unwrap(),
-                    None,
-                    &self.base.config.use_schema,
-                )
-                .await?;
+                .get_reader_schema(&initial_subject, None, &self.base.config.use_schema)
+                .await
+                .ok()
+                .flatten();
         }
 
         let mut schema_id = SchemaId::new(SerdeFormat::Json, None, None, None)?;
@@ -283,22 +351,35 @@ impl<'a, T: Client + Sync> JsonDeserializer<'a, T> {
 
         let writer_schema_raw = self
             .base
-            .get_writer_schema(&schema_id, subject.as_deref(), None)
+            .get_writer_schema(&schema_id, Some(&initial_subject), None)
             .await?;
         let (writer_schema, writer_ref_registry) =
             self.get_parsed_schema(&writer_schema_raw).await?;
 
-        if !has_subject {
-            subject = strategy(&ctx.topic, &ctx.serde_type, Some(&writer_schema_raw));
-            if let Some(subject) = subject.as_ref() {
-                latest_schema = self
-                    .base
-                    .serde
-                    .get_reader_schema(subject, None, &self.base.config.use_schema)
-                    .await?;
+        // Recompute subject with writer schema (needed for Record/TopicRecord strategies)
+        let subject = (self.subject_name_strategy)(
+            &ctx.topic,
+            &ctx.serde_type,
+            Some(&writer_schema_raw),
+        )?;
+
+        // If subject changed, try to get reader schema again
+        if subject != initial_subject && !subject.is_empty() {
+            if let Ok(Some(schema)) = self
+                .base
+                .serde
+                .get_reader_schema(&subject, None, &self.base.config.use_schema)
+                .await
+            {
+                latest_schema = Some(schema);
             }
         }
-        let subject = subject.unwrap();
+
+        if subject.is_empty() {
+            return Err(Serialization(
+                "Could not determine subject for deserialization".to_string(),
+            ));
+        }
         let serde_value;
         if let Some(ref rule_set) = writer_schema_raw.rule_set
             && rule_set.encoding_rules.is_some()
