@@ -1,6 +1,6 @@
 use crate::serdes::serde::{
-    SchemaIdDeserializer, SchemaIdSerializer, SubjectNameStrategyType,
-    dual_schema_id_deserializer, prefix_schema_id_serializer,
+    SchemaIdDeserializer, SchemaIdSerializer, SubjectNameStrategyType, dual_schema_id_deserializer,
+    prefix_schema_id_serializer,
 };
 use std::collections::HashMap;
 

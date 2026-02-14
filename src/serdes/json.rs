@@ -21,7 +21,8 @@ use std::sync::Arc;
 
 /// Helper function to extract record name from JSON Schema model.
 fn get_json_schema_record_name(schema: Option<&Schema>) -> Result<String, SerdeError> {
-    let schema = schema.ok_or_else(|| Serialization("Schema is required for record name strategy".to_string()))?;
+    let schema = schema
+        .ok_or_else(|| Serialization("Schema is required for record name strategy".to_string()))?;
     let schema_str = &schema.schema;
     if schema_str.is_empty() {
         return Err(Serialization("Schema string is empty".to_string()));
@@ -41,7 +42,9 @@ fn get_json_schema_record_name(schema: Option<&Schema>) -> Result<String, SerdeE
         }
         return Ok(id.to_string());
     }
-    Err(Serialization("Schema does not have a 'title' or '$id' field".to_string()))
+    Err(Serialization(
+        "Schema does not have a 'title' or '$id' field".to_string(),
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -329,8 +332,8 @@ impl<'a, T: Client + Sync> JsonDeserializer<'a, T> {
         data: &[u8],
     ) -> Result<Value, SerdeError> {
         // Get initial subject using configured subject name strategy (without schema)
-        let initial_subject = (self.subject_name_strategy)(&ctx.topic, &ctx.serde_type, None)
-            .unwrap_or_default();
+        let initial_subject =
+            (self.subject_name_strategy)(&ctx.topic, &ctx.serde_type, None).unwrap_or_default();
         let mut latest_schema = None;
 
         // Try to get reader schema with initial subject
@@ -357,11 +360,8 @@ impl<'a, T: Client + Sync> JsonDeserializer<'a, T> {
             self.get_parsed_schema(&writer_schema_raw).await?;
 
         // Recompute subject with writer schema (needed for Record/TopicRecord strategies)
-        let subject = (self.subject_name_strategy)(
-            &ctx.topic,
-            &ctx.serde_type,
-            Some(&writer_schema_raw),
-        )?;
+        let subject =
+            (self.subject_name_strategy)(&ctx.topic, &ctx.serde_type, Some(&writer_schema_raw))?;
 
         // If subject changed, try to get reader schema again
         if subject != initial_subject && !subject.is_empty() {

@@ -23,7 +23,8 @@ use uuid::Uuid;
 
 /// Helper function to extract record name from Avro Schema model.
 fn get_avro_record_name(schema: Option<&Schema>) -> Result<String, SerdeError> {
-    let schema = schema.ok_or_else(|| Serialization("Schema is required for record name strategy".to_string()))?;
+    let schema = schema
+        .ok_or_else(|| Serialization("Schema is required for record name strategy".to_string()))?;
     let schema_str = &schema.schema;
     if schema_str.is_empty() {
         return Err(Serialization("Schema string is empty".to_string()));
@@ -33,7 +34,9 @@ fn get_avro_record_name(schema: Option<&Schema>) -> Result<String, SerdeError> {
     if let Some(name) = json.get("name").and_then(|n| n.as_str()) {
         Ok(name.to_string())
     } else {
-        Err(Serialization("Schema does not have a 'name' field".to_string()))
+        Err(Serialization(
+            "Schema does not have a 'name' field".to_string(),
+        ))
     }
 }
 
@@ -316,8 +319,8 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
         data: &[u8],
     ) -> Result<NamedValue, SerdeError> {
         // Get initial subject using configured subject name strategy (without schema)
-        let initial_subject = (self.subject_name_strategy)(&ctx.topic, &ctx.serde_type, None)
-            .unwrap_or_default();
+        let initial_subject =
+            (self.subject_name_strategy)(&ctx.topic, &ctx.serde_type, None).unwrap_or_default();
         let mut latest_schema = None;
 
         // Try to get reader schema with initial subject
@@ -343,11 +346,8 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
         let (writer_schema, writer_named) = self.get_parsed_schema(&writer_schema_raw).await?;
 
         // Recompute subject with writer schema (needed for Record/TopicRecord strategies)
-        let subject = (self.subject_name_strategy)(
-            &ctx.topic,
-            &ctx.serde_type,
-            Some(&writer_schema_raw),
-        )?;
+        let subject =
+            (self.subject_name_strategy)(&ctx.topic, &ctx.serde_type, Some(&writer_schema_raw))?;
 
         // If subject changed, try to get reader schema again
         if subject != initial_subject && !subject.is_empty() {
@@ -808,7 +808,9 @@ mod tests {
     use crate::rules::encryption::localkms::local_driver::LocalKmsDriver;
     use crate::rules::jsonata::jsonata_executor::JsonataExecutor;
     use crate::serdes::config::SchemaSelector;
-    use crate::serdes::serde::{RecordNameFunc, SerdeFormat, SerdeHeaders, header_schema_id_serializer};
+    use crate::serdes::serde::{
+        RecordNameFunc, SerdeFormat, SerdeHeaders, header_schema_id_serializer,
+    };
     use apache_avro::types::Value::{Record, Union};
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -2048,8 +2050,13 @@ mod tests {
         let obj = Record(fields.clone());
         let rule_registry = RuleRegistry::new();
         // Pass schema to serializer for record name strategy to extract the record name
-        let ser =
-            AvroSerializer::new(&client, Some(&schema), Some(rule_registry.clone()), ser_conf).unwrap();
+        let ser = AvroSerializer::new(
+            &client,
+            Some(&schema),
+            Some(rule_registry.clone()),
+            ser_conf,
+        )
+        .unwrap();
         let ser_ctx = SerializationContext {
             topic: "topic1".to_string(),
             serde_type: SerdeType::Value,
@@ -2122,8 +2129,13 @@ mod tests {
         let obj = Record(fields.clone());
         let rule_registry = RuleRegistry::new();
         // Pass schema to serializer for topic record name strategy to extract the record name
-        let ser =
-            AvroSerializer::new(&client, Some(&schema), Some(rule_registry.clone()), ser_conf).unwrap();
+        let ser = AvroSerializer::new(
+            &client,
+            Some(&schema),
+            Some(rule_registry.clone()),
+            ser_conf,
+        )
+        .unwrap();
         let ser_ctx = SerializationContext {
             topic: "topic1".to_string(),
             serde_type: SerdeType::Value,
@@ -2146,7 +2158,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_associated_name_strategy_returns_subject_when_single_association_exists() {
-        use crate::rest::models::{AssociationCreateOrUpdateInfo, AssociationCreateOrUpdateRequest};
+        use crate::rest::models::{
+            AssociationCreateOrUpdateInfo, AssociationCreateOrUpdateRequest,
+        };
         use crate::serdes::serde::AssociatedNameStrategy;
 
         let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
@@ -2172,16 +2186,20 @@ mod tests {
         let client_arc = Arc::new(client);
         let config = HashMap::new();
         let get_record_name: RecordNameFunc = Box::new(|_| Ok("test".to_string()));
-        let strategy =
-            AssociatedNameStrategy::new(client_arc, &config, get_record_name).unwrap();
+        let strategy = AssociatedNameStrategy::new(client_arc, &config, get_record_name).unwrap();
 
-        let result = strategy.get_subject("test-topic", &SerdeType::Value, None).await.unwrap();
+        let result = strategy
+            .get_subject("test-topic", &SerdeType::Value, None)
+            .await
+            .unwrap();
         assert_eq!(result, "my-custom-subject-value");
     }
 
     #[tokio::test]
     async fn test_associated_name_strategy_returns_subject_for_key() {
-        use crate::rest::models::{AssociationCreateOrUpdateInfo, AssociationCreateOrUpdateRequest};
+        use crate::rest::models::{
+            AssociationCreateOrUpdateInfo, AssociationCreateOrUpdateRequest,
+        };
         use crate::serdes::serde::AssociatedNameStrategy;
 
         let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
@@ -2207,16 +2225,20 @@ mod tests {
         let client_arc = Arc::new(client);
         let config = HashMap::new();
         let get_record_name: RecordNameFunc = Box::new(|_| Ok("test".to_string()));
-        let strategy =
-            AssociatedNameStrategy::new(client_arc, &config, get_record_name).unwrap();
+        let strategy = AssociatedNameStrategy::new(client_arc, &config, get_record_name).unwrap();
 
-        let result = strategy.get_subject("test-topic", &SerdeType::Key, None).await.unwrap();
+        let result = strategy
+            .get_subject("test-topic", &SerdeType::Key, None)
+            .await
+            .unwrap();
         assert_eq!(result, "my-key-subject");
     }
 
     #[tokio::test]
     async fn test_associated_name_strategy_caches_subject_name_lookups() {
-        use crate::rest::models::{AssociationCreateOrUpdateInfo, AssociationCreateOrUpdateRequest};
+        use crate::rest::models::{
+            AssociationCreateOrUpdateInfo, AssociationCreateOrUpdateRequest,
+        };
         use crate::serdes::serde::AssociatedNameStrategy;
 
         let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
@@ -2242,13 +2264,21 @@ mod tests {
         let client_arc = Arc::new(client);
         let config = HashMap::new();
         let get_record_name: RecordNameFunc = Box::new(|_| Ok("test".to_string()));
-        let strategy =
-            AssociatedNameStrategy::new(client_arc, &config, get_record_name).unwrap();
+        let strategy = AssociatedNameStrategy::new(client_arc, &config, get_record_name).unwrap();
 
         // Call multiple times
-        let result1 = strategy.get_subject("test-topic", &SerdeType::Value, None).await.unwrap();
-        let result2 = strategy.get_subject("test-topic", &SerdeType::Value, None).await.unwrap();
-        let result3 = strategy.get_subject("test-topic", &SerdeType::Value, None).await.unwrap();
+        let result1 = strategy
+            .get_subject("test-topic", &SerdeType::Value, None)
+            .await
+            .unwrap();
+        let result2 = strategy
+            .get_subject("test-topic", &SerdeType::Value, None)
+            .await
+            .unwrap();
+        let result3 = strategy
+            .get_subject("test-topic", &SerdeType::Value, None)
+            .await
+            .unwrap();
 
         assert_eq!(result1, "cached-subject-value");
         assert_eq!(result2, "cached-subject-value");
@@ -2266,19 +2296,26 @@ mod tests {
         let client_arc = Arc::new(client);
         let config = HashMap::new(); // Default fallback is TopicNameStrategy
         let get_record_name: RecordNameFunc = Box::new(|_| Ok("test".to_string()));
-        let strategy =
-            AssociatedNameStrategy::new(client_arc, &config, get_record_name).unwrap();
+        let strategy = AssociatedNameStrategy::new(client_arc, &config, get_record_name).unwrap();
 
-        let result = strategy.get_subject("test-topic", &SerdeType::Value, None).await.unwrap();
+        let result = strategy
+            .get_subject("test-topic", &SerdeType::Value, None)
+            .await
+            .unwrap();
         assert_eq!(result, "test-topic-value");
 
-        let result_key = strategy.get_subject("test-topic", &SerdeType::Key, None).await.unwrap();
+        let result_key = strategy
+            .get_subject("test-topic", &SerdeType::Key, None)
+            .await
+            .unwrap();
         assert_eq!(result_key, "test-topic-key");
     }
 
     #[tokio::test]
     async fn test_associated_name_strategy_throws_error_when_multiple_associations_found() {
-        use crate::rest::models::{AssociationCreateOrUpdateInfo, AssociationCreateOrUpdateRequest};
+        use crate::rest::models::{
+            AssociationCreateOrUpdateInfo, AssociationCreateOrUpdateRequest,
+        };
         use crate::serdes::serde::AssociatedNameStrategy;
 
         let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
@@ -2314,18 +2351,24 @@ mod tests {
         let client_arc = Arc::new(client);
         let config = HashMap::new();
         let get_record_name: RecordNameFunc = Box::new(|_| Ok("test".to_string()));
-        let strategy =
-            AssociatedNameStrategy::new(client_arc, &config, get_record_name).unwrap();
+        let strategy = AssociatedNameStrategy::new(client_arc, &config, get_record_name).unwrap();
 
-        let result = strategy.get_subject("test-topic", &SerdeType::Value, None).await;
+        let result = strategy
+            .get_subject("test-topic", &SerdeType::Value, None)
+            .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("multiple associated subjects found"));
+        assert!(
+            err.to_string()
+                .contains("multiple associated subjects found")
+        );
     }
 
     #[tokio::test]
     async fn test_associated_name_strategy_throws_error_when_fallback_is_none_and_no_association() {
-        use crate::serdes::serde::{AssociatedNameStrategy, FALLBACK_SUBJECT_NAME_STRATEGY_TYPE_CONFIG};
+        use crate::serdes::serde::{
+            AssociatedNameStrategy, FALLBACK_SUBJECT_NAME_STRATEGY_TYPE_CONFIG,
+        };
 
         let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
         let client = MockSchemaRegistryClient::new(client_conf);
@@ -2336,10 +2379,11 @@ mod tests {
             "NONE".to_string(),
         )]);
         let get_record_name: RecordNameFunc = Box::new(|_| Ok("test".to_string()));
-        let strategy =
-            AssociatedNameStrategy::new(client_arc, &config, get_record_name).unwrap();
+        let strategy = AssociatedNameStrategy::new(client_arc, &config, get_record_name).unwrap();
 
-        let result = strategy.get_subject("test-topic", &SerdeType::Value, None).await;
+        let result = strategy
+            .get_subject("test-topic", &SerdeType::Value, None)
+            .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("no associated subject found"));
@@ -2347,7 +2391,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_associated_name_strategy_uses_kafka_cluster_id_as_namespace() {
-        use crate::rest::models::{AssociationCreateOrUpdateInfo, AssociationCreateOrUpdateRequest};
+        use crate::rest::models::{
+            AssociationCreateOrUpdateInfo, AssociationCreateOrUpdateRequest,
+        };
         use crate::serdes::serde::{AssociatedNameStrategy, KAFKA_CLUSTER_ID_CONFIG};
 
         let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
@@ -2376,16 +2422,20 @@ mod tests {
             "my-cluster-id".to_string(),
         )]);
         let get_record_name: RecordNameFunc = Box::new(|_| Ok("test".to_string()));
-        let strategy =
-            AssociatedNameStrategy::new(client_arc, &config, get_record_name).unwrap();
+        let strategy = AssociatedNameStrategy::new(client_arc, &config, get_record_name).unwrap();
 
-        let result = strategy.get_subject("test-topic", &SerdeType::Value, None).await.unwrap();
+        let result = strategy
+            .get_subject("test-topic", &SerdeType::Value, None)
+            .await
+            .unwrap();
         assert_eq!(result, "cluster-specific-subject");
     }
 
     #[tokio::test]
     async fn test_associated_name_strategy_delete_associations() {
-        use crate::rest::models::{AssociationCreateOrUpdateInfo, AssociationCreateOrUpdateRequest};
+        use crate::rest::models::{
+            AssociationCreateOrUpdateInfo, AssociationCreateOrUpdateRequest,
+        };
         use crate::serdes::serde::AssociatedNameStrategy;
 
         let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
@@ -2432,10 +2482,12 @@ mod tests {
         let client_arc = Arc::new(client);
         let config = HashMap::new();
         let get_record_name: RecordNameFunc = Box::new(|_| Ok("test".to_string()));
-        let strategy =
-            AssociatedNameStrategy::new(client_arc, &config, get_record_name).unwrap();
+        let strategy = AssociatedNameStrategy::new(client_arc, &config, get_record_name).unwrap();
 
-        let result = strategy.get_subject("test-topic", &SerdeType::Value, None).await.unwrap();
+        let result = strategy
+            .get_subject("test-topic", &SerdeType::Value, None)
+            .await
+            .unwrap();
         assert_eq!(result, "test-topic-value");
     }
 }

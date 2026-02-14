@@ -547,7 +547,8 @@ impl AssociationStore {
         let mut results = Vec::new();
 
         for entry in self.associations_by_resource_id.values() {
-            if entry.resource_name == resource_name && entry.resource_namespace == resource_namespace
+            if entry.resource_name == resource_name
+                && entry.resource_namespace == resource_namespace
             {
                 if !resource_type.is_empty() && entry.resource_type != resource_type {
                     continue;

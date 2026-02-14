@@ -420,8 +420,7 @@ pub type SubjectNameStrategyFunc =
     Box<dyn Fn(&str, &SerdeType, Option<&Schema>) -> Result<String, SerdeError> + Send + Sync>;
 
 /// RecordNameFunc extracts the record name from a schema.
-pub type RecordNameFunc =
-    Box<dyn Fn(Option<&Schema>) -> Result<String, SerdeError> + Send + Sync>;
+pub type RecordNameFunc = Box<dyn Fn(Option<&Schema>) -> Result<String, SerdeError> + Send + Sync>;
 
 /// StrategyFunc returns the SubjectNameStrategyFunc for the given strategy type.
 /// Note: This does not handle AssociatedNameStrategy as it requires additional parameters.
@@ -554,9 +553,7 @@ impl<T: Client> AssociatedNameStrategy<T> {
         }
 
         let is_key = *serde_type == SerdeType::Key;
-        let schema_str = schema
-            .map(|s| s.schema.clone())
-            .unwrap_or_default();
+        let schema_str = schema.map(|s| s.schema.clone()).unwrap_or_default();
 
         let cache_key = AssociationCacheKey {
             topic: topic.to_string(),
@@ -604,7 +601,10 @@ impl<T: Client> AssociatedNameStrategy<T> {
         {
             Ok(assocs) => assocs,
             Err(RestError::ResponseError(resp))
-                if resp.status == reqwest::StatusCode::NOT_FOUND => Vec::new(),
+                if resp.status == reqwest::StatusCode::NOT_FOUND =>
+            {
+                Vec::new()
+            }
             Err(e) => return Err(e.into()),
         };
 

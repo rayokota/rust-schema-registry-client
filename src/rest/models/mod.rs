@@ -1,7 +1,7 @@
 pub mod association;
 pub use self::association::{
-    Association, AssociationCreateOrUpdateInfo, AssociationCreateOrUpdateRequest,
-    AssociationInfo, AssociationResponse, LifecyclePolicy,
+    Association, AssociationCreateOrUpdateInfo, AssociationCreateOrUpdateRequest, AssociationInfo,
+    AssociationResponse, LifecyclePolicy,
 };
 pub mod create_dek_request;
 pub use self::create_dek_request::CreateDekRequest;

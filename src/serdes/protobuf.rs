@@ -36,7 +36,8 @@ pub mod confluent {
 /// Helper function to extract record name from Protobuf Schema model.
 /// For protobuf, we extract the message name from the schema definition.
 fn get_protobuf_record_name(schema: Option<&Schema>) -> Result<String, SerdeError> {
-    let schema = schema.ok_or_else(|| Serialization("Schema is required for record name strategy".to_string()))?;
+    let schema = schema
+        .ok_or_else(|| Serialization("Schema is required for record name strategy".to_string()))?;
     let schema_str = &schema.schema;
     if schema_str.is_empty() {
         return Err(Serialization("Schema string is empty".to_string()));
@@ -51,7 +52,9 @@ fn get_protobuf_record_name(schema: Option<&Schema>) -> Result<String, SerdeErro
             }
         }
     }
-    Err(Serialization("Could not find message name in protobuf schema".to_string()))
+    Err(Serialization(
+        "Could not find message name in protobuf schema".to_string(),
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -480,8 +483,8 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
         data: &[u8],
     ) -> Result<M, SerdeError> {
         // Get initial subject using configured subject name strategy (without schema)
-        let initial_subject = (self.subject_name_strategy)(&ctx.topic, &ctx.serde_type, None)
-            .unwrap_or_default();
+        let initial_subject =
+            (self.subject_name_strategy)(&ctx.topic, &ctx.serde_type, None).unwrap_or_default();
         let mut latest_schema = None;
 
         // Try to get reader schema with initial subject
@@ -489,7 +492,11 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
             latest_schema = self
                 .base
                 .serde
-                .get_reader_schema(&initial_subject, Some("serialized"), &self.base.config.use_schema)
+                .get_reader_schema(
+                    &initial_subject,
+                    Some("serialized"),
+                    &self.base.config.use_schema,
+                )
                 .await
                 .ok()
                 .flatten();
@@ -509,11 +516,8 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
         let writer_desc = self.get_message_desc(&pool, &writer_schema, &msg_index)?;
 
         // Recompute subject with writer schema (needed for Record/TopicRecord strategies)
-        let subject = (self.subject_name_strategy)(
-            &ctx.topic,
-            &ctx.serde_type,
-            Some(&writer_schema_raw),
-        )?;
+        let subject =
+            (self.subject_name_strategy)(&ctx.topic, &ctx.serde_type, Some(&writer_schema_raw))?;
 
         // If subject changed, try to get reader schema again
         if subject != initial_subject && !subject.is_empty() {

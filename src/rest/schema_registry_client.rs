@@ -690,11 +690,12 @@ impl Client for SchemaRegistryClient {
         limit: i32,
     ) -> Result<Vec<Association>, Error> {
         let url = "/associations";
-        let mut query = vec![
-            ("resourceName".to_string(), resource_name.to_string()),
-        ];
+        let mut query = vec![("resourceName".to_string(), resource_name.to_string())];
         if !resource_namespace.is_empty() {
-            query.push(("resourceNamespace".to_string(), resource_namespace.to_string()));
+            query.push((
+                "resourceNamespace".to_string(),
+                resource_namespace.to_string(),
+            ));
         }
         if !resource_type.is_empty() {
             query.push(("resourceType".to_string(), resource_type.to_string()));
@@ -765,9 +766,10 @@ impl Client for SchemaRegistryClient {
         cascade_lifecycle: bool,
     ) -> Result<(), Error> {
         let url = format!("/associations/resources/{}", urlencode(resource_id));
-        let mut query = vec![
-            ("cascadeLifecycle".to_string(), cascade_lifecycle.to_string()),
-        ];
+        let mut query = vec![(
+            "cascadeLifecycle".to_string(),
+            cascade_lifecycle.to_string(),
+        )];
         if let Some(rt) = resource_type {
             query.push(("resourceType".to_string(), rt.to_string()));
         }
