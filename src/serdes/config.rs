@@ -19,6 +19,7 @@ pub struct SerializerConfig {
     pub validate: bool,
     pub rule_config: HashMap<String, String>,
     pub subject_name_strategy_type: SubjectNameStrategyType,
+    pub strategy_config: HashMap<String, String>,
     pub schema_id_serializer: SchemaIdSerializer,
 }
 
@@ -37,6 +38,7 @@ impl SerializerConfig {
             validate,
             rule_config,
             subject_name_strategy_type: SubjectNameStrategyType::Topic,
+            strategy_config: HashMap::new(),
             schema_id_serializer: prefix_schema_id_serializer,
         }
     }
@@ -51,6 +53,7 @@ impl Default for SerializerConfig {
             validate: false,
             rule_config: HashMap::new(),
             subject_name_strategy_type: SubjectNameStrategyType::Topic,
+            strategy_config: HashMap::new(),
             schema_id_serializer: prefix_schema_id_serializer,
         }
     }
@@ -62,6 +65,7 @@ pub struct DeserializerConfig {
     pub validate: bool,
     pub rule_config: HashMap<String, String>,
     pub subject_name_strategy_type: SubjectNameStrategyType,
+    pub strategy_config: HashMap<String, String>,
     pub schema_id_deserializer: SchemaIdDeserializer,
 }
 
@@ -76,6 +80,7 @@ impl DeserializerConfig {
             validate,
             rule_config,
             subject_name_strategy_type: SubjectNameStrategyType::Topic,
+            strategy_config: HashMap::new(),
             schema_id_deserializer: dual_schema_id_deserializer,
         }
     }
@@ -88,6 +93,7 @@ impl Default for DeserializerConfig {
             validate: false,
             rule_config: HashMap::new(),
             subject_name_strategy_type: SubjectNameStrategyType::Topic,
+            strategy_config: HashMap::new(),
             schema_id_deserializer: dual_schema_id_deserializer,
         }
     }
