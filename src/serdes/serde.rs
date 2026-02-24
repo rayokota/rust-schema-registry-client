@@ -399,14 +399,16 @@ pub const FALLBACK_SUBJECT_NAME_STRATEGY_TYPE_CONFIG: &str = "fallback.subject.n
 pub const DEFAULT_CACHE_CAPACITY: u64 = 1000;
 
 /// Parse a string to SubjectNameStrategyType.
-pub fn parse_subject_name_strategy_type(s: &str) -> SubjectNameStrategyType {
+pub fn parse_subject_name_strategy_type(s: &str) -> Result<SubjectNameStrategyType, SerdeError> {
     match s.to_uppercase().as_str() {
-        "TOPIC" => SubjectNameStrategyType::Topic,
-        "RECORD" => SubjectNameStrategyType::Record,
-        "TOPIC_RECORD" => SubjectNameStrategyType::TopicRecord,
-        "ASSOCIATED" => SubjectNameStrategyType::Associated,
-        "NONE" => SubjectNameStrategyType::None,
-        _ => SubjectNameStrategyType::Topic,
+        "TOPIC" => Ok(SubjectNameStrategyType::Topic),
+        "RECORD" => Ok(SubjectNameStrategyType::Record),
+        "TOPIC_RECORD" => Ok(SubjectNameStrategyType::TopicRecord),
+        "ASSOCIATED" => Ok(SubjectNameStrategyType::Associated),
+        "NONE" => Ok(SubjectNameStrategyType::None),
+        _ => Err(Serialization(format!(
+            "unrecognized subject name strategy type: {s}"
+        ))),
     }
 }
 
@@ -517,6 +519,7 @@ impl<T: Client> AssociatedNameStrategy<T> {
         let fallback_type = config
             .get(FALLBACK_SUBJECT_NAME_STRATEGY_TYPE_CONFIG)
             .map(|s| parse_subject_name_strategy_type(s))
+            .transpose()?
             .unwrap_or(SubjectNameStrategyType::Topic);
 
         let fallback_strategy = strategy_func(fallback_type, get_record_name)?;

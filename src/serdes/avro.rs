@@ -584,6 +584,7 @@ async fn load_associated_subject<T: Client + Sync>(
     let fallback_type = strategy_config
         .get(FALLBACK_SUBJECT_NAME_STRATEGY_TYPE_CONFIG)
         .map(|s| parse_subject_name_strategy_type(s))
+        .transpose()?
         .unwrap_or(SubjectNameStrategyType::Topic);
     let is_key = *serde_type == SerdeType::Key;
     let cache_key = (topic.to_string(), is_key);
