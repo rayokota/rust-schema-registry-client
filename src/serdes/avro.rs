@@ -7,7 +7,7 @@ use crate::serdes::serde::SerdeError::Serialization;
 use crate::serdes::serde::{
     BaseDeserializer, BaseSerializer, FieldTransformer, FieldType, RuleContext, SchemaId, Serde,
     SerdeError, SerdeFormat, SerdeSchema, SerdeType, SerdeValue, SerializationContext,
-    SubjectNameStrategyFunc, get_executor, get_executors, strategy_func,
+    SubjectNameStrategyType, get_executor, get_executors, topic_name_strategy,
 };
 use apache_avro::schema::{Name, RecordField, RecordSchema, UnionSchema};
 use apache_avro::types::Value;
@@ -21,24 +21,6 @@ use std::io::Cursor;
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// Helper function to extract record name from Avro Schema model.
-fn get_avro_record_name(schema: Option<&Schema>) -> Result<String, SerdeError> {
-    let schema = schema
-        .ok_or_else(|| Serialization("Schema is required for record name strategy".to_string()))?;
-    let schema_str = &schema.schema;
-    if schema_str.is_empty() {
-        return Err(Serialization("Schema string is empty".to_string()));
-    }
-    let json: serde_json::Value = serde_json::from_str(schema_str)
-        .map_err(|e| Serialization(format!("Failed to parse schema JSON: {}", e)))?;
-    if let Some(name) = json.get("name").and_then(|n| n.as_str()) {
-        Ok(name.to_string())
-    } else {
-        Err(Serialization(
-            "Schema does not have a 'name' field".to_string(),
-        ))
-    }
-}
 
 #[derive(Clone, Debug)]
 pub(crate) struct AvroSerde {
@@ -50,7 +32,7 @@ pub struct AvroSerializer<'a, T: Client> {
     schema: Option<&'a Schema>,
     base: BaseSerializer<'a, T>,
     serde: AvroSerde,
-    subject_name_strategy: Arc<SubjectNameStrategyFunc>,
+    subject_name_strategy_type: SubjectNameStrategyType,
 }
 
 impl<'a, T: Client> std::fmt::Debug for AvroSerializer<'a, T> {
@@ -58,7 +40,7 @@ impl<'a, T: Client> std::fmt::Debug for AvroSerializer<'a, T> {
         f.debug_struct("AvroSerializer")
             .field("schema", &self.schema)
             .field("serde", &self.serde)
-            .field("subject_name_strategy", &"<function>")
+            .field("subject_name_strategy_type", &self.subject_name_strategy_type)
             .finish_non_exhaustive()
     }
 }
@@ -73,25 +55,13 @@ impl<'a, T: Client + Sync> AvroSerializer<'a, T> {
         for executor in get_executors(rule_registry.as_ref()) {
             executor.configure(client.config(), &serializer_config.rule_config)?;
         }
-        let subject_name_strategy = strategy_func(
-            serializer_config.subject_name_strategy_type.clone(),
-            Box::new(get_avro_record_name),
-        )?
-        .unwrap_or_else(|| {
-            Box::new(|topic, serde_type, _schema| {
-                Ok(match serde_type {
-                    SerdeType::Key => format!("{topic}-key"),
-                    SerdeType::Value => format!("{topic}-value"),
-                })
-            })
-        });
         Ok(AvroSerializer {
             schema,
-            base: BaseSerializer::new(Serde::new(client, rule_registry), serializer_config),
+            base: BaseSerializer::new(Serde::new(client, rule_registry), serializer_config.clone()),
             serde: AvroSerde {
                 parsed_schemas: DashMap::new(),
             },
-            subject_name_strategy: Arc::new(subject_name_strategy),
+            subject_name_strategy_type: serializer_config.subject_name_strategy_type,
         })
     }
 
@@ -110,7 +80,7 @@ impl<'a, T: Client + Sync> AvroSerializer<'a, T> {
         value: Value,
     ) -> Result<Vec<u8>, SerdeError> {
         let mut value = value;
-        let subject = (self.subject_name_strategy)(&ctx.topic, &ctx.serde_type, self.schema)?;
+        let subject = self.get_subject(&ctx.topic, &ctx.serde_type, self.schema).await?;
         let latest_schema = self
             .base
             .serde
@@ -245,6 +215,40 @@ impl<'a, T: Client + Sync> AvroSerializer<'a, T> {
         Ok(parsed_schema)
     }
 
+    pub async fn get_record_name(&self, schema: &Schema) -> Result<String, SerdeError> {
+        let (parsed_schema, _) = self.get_parsed_schema(schema).await?;
+        match parsed_schema {
+            apache_avro::Schema::Record(r) => Ok(r.name.name.clone()),
+            _ => Err(Serialization(
+                "Schema is not an Avro record type".to_string(),
+            )),
+        }
+    }
+
+    async fn get_subject(
+        &self,
+        topic: &str,
+        serde_type: &SerdeType,
+        schema: Option<&Schema>,
+    ) -> Result<String, SerdeError> {
+        match self.subject_name_strategy_type {
+            SubjectNameStrategyType::Record => {
+                let schema = schema.ok_or_else(|| {
+                    Serialization("Schema is required for record name strategy".to_string())
+                })?;
+                self.get_record_name(schema).await
+            }
+            SubjectNameStrategyType::TopicRecord => {
+                let schema = schema.ok_or_else(|| {
+                    Serialization("Schema is required for record name strategy".to_string())
+                })?;
+                let name = self.get_record_name(schema).await?;
+                Ok(format!("{topic}-{name}"))
+            }
+            _ => Ok(topic_name_strategy(topic, serde_type, schema).unwrap()),
+        }
+    }
+
     fn close(&mut self) {}
 }
 
@@ -271,14 +275,14 @@ pub struct NamedValue {
 pub struct AvroDeserializer<'a, T: Client> {
     base: BaseDeserializer<'a, T>,
     serde: AvroSerde,
-    subject_name_strategy: Arc<SubjectNameStrategyFunc>,
+    subject_name_strategy_type: SubjectNameStrategyType,
 }
 
 impl<'a, T: Client> std::fmt::Debug for AvroDeserializer<'a, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AvroDeserializer")
             .field("serde", &self.serde)
-            .field("subject_name_strategy", &"<function>")
+            .field("subject_name_strategy_type", &self.subject_name_strategy_type)
             .finish_non_exhaustive()
     }
 }
@@ -292,24 +296,12 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
         for executor in get_executors(rule_registry.as_ref()) {
             executor.configure(client.config(), &deserializer_config.rule_config)?;
         }
-        let subject_name_strategy = strategy_func(
-            deserializer_config.subject_name_strategy_type.clone(),
-            Box::new(get_avro_record_name),
-        )?
-        .unwrap_or_else(|| {
-            Box::new(|topic, serde_type, _schema| {
-                Ok(match serde_type {
-                    SerdeType::Key => format!("{topic}-key"),
-                    SerdeType::Value => format!("{topic}-value"),
-                })
-            })
-        });
         Ok(AvroDeserializer {
-            base: BaseDeserializer::new(Serde::new(client, rule_registry), deserializer_config),
+            base: BaseDeserializer::new(Serde::new(client, rule_registry), deserializer_config.clone()),
             serde: AvroSerde {
                 parsed_schemas: DashMap::new(),
             },
-            subject_name_strategy: Arc::new(subject_name_strategy),
+            subject_name_strategy_type: deserializer_config.subject_name_strategy_type,
         })
     }
 
@@ -319,8 +311,10 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
         data: &[u8],
     ) -> Result<NamedValue, SerdeError> {
         // Get initial subject using configured subject name strategy (without schema)
-        let initial_subject =
-            (self.subject_name_strategy)(&ctx.topic, &ctx.serde_type, None).unwrap_or_default();
+        let initial_subject = self
+            .get_subject(&ctx.topic, &ctx.serde_type, None)
+            .await
+            .unwrap_or_default();
         let mut latest_schema = None;
 
         // Try to get reader schema with initial subject
@@ -346,8 +340,9 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
         let (writer_schema, writer_named) = self.get_parsed_schema(&writer_schema_raw).await?;
 
         // Recompute subject with writer schema (needed for Record/TopicRecord strategies)
-        let subject =
-            (self.subject_name_strategy)(&ctx.topic, &ctx.serde_type, Some(&writer_schema_raw))?;
+        let subject = self
+            .get_subject(&ctx.topic, &ctx.serde_type, Some(&writer_schema_raw))
+            .await?;
 
         // If subject changed, try to get reader schema again
         if subject != initial_subject && !subject.is_empty() {
@@ -508,6 +503,40 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
             .parsed_schemas
             .insert(schema.clone(), parsed_schema.clone());
         Ok(parsed_schema)
+    }
+
+    pub async fn get_record_name(&self, schema: &Schema) -> Result<String, SerdeError> {
+        let (parsed_schema, _) = self.get_parsed_schema(schema).await?;
+        match parsed_schema {
+            apache_avro::Schema::Record(r) => Ok(r.name.name.clone()),
+            _ => Err(Serialization(
+                "Schema is not an Avro record type".to_string(),
+            )),
+        }
+    }
+
+    async fn get_subject(
+        &self,
+        topic: &str,
+        serde_type: &SerdeType,
+        schema: Option<&Schema>,
+    ) -> Result<String, SerdeError> {
+        match self.subject_name_strategy_type {
+            SubjectNameStrategyType::Record => {
+                let schema = schema.ok_or_else(|| {
+                    Serialization("Schema is required for record name strategy".to_string())
+                })?;
+                self.get_record_name(schema).await
+            }
+            SubjectNameStrategyType::TopicRecord => {
+                let schema = schema.ok_or_else(|| {
+                    Serialization("Schema is required for record name strategy".to_string())
+                })?;
+                let name = self.get_record_name(schema).await?;
+                Ok(format!("{topic}-{name}"))
+            }
+            _ => Ok(topic_name_strategy(topic, serde_type, schema).unwrap()),
+        }
     }
 }
 
@@ -1999,7 +2028,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_avro_serde_with_record_name_strategy() {
+    async fn test_avro_serde_with_uecord_name_strategy() {
         use crate::serdes::serde::SubjectNameStrategyType;
 
         let client_conf = ClientConfig::new(vec!["mock://".to_string()]);

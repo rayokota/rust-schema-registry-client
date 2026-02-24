@@ -448,11 +448,7 @@ pub fn strategy_func(
 pub fn record_name_strategy(get_record_name: RecordNameFunc) -> SubjectNameStrategyFunc {
     Box::new(move |_topic, serde_type, schema| {
         let record_name = get_record_name(schema)?;
-        let suffix = match serde_type {
-            SerdeType::Key => "-key",
-            SerdeType::Value => "-value",
-        };
-        Ok(format!("{record_name}{suffix}"))
+        Ok(record_name)
     })
 }
 
@@ -460,11 +456,7 @@ pub fn record_name_strategy(get_record_name: RecordNameFunc) -> SubjectNameStrat
 pub fn topic_record_name_strategy(get_record_name: RecordNameFunc) -> SubjectNameStrategyFunc {
     Box::new(move |topic, serde_type, schema| {
         let record_name = get_record_name(schema)?;
-        let suffix = match serde_type {
-            SerdeType::Key => "-key",
-            SerdeType::Value => "-value",
-        };
-        Ok(format!("{topic}-{record_name}{suffix}"))
+        Ok(format!("{topic}-{record_name}"))
     })
 }
 
