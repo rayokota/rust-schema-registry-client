@@ -2028,7 +2028,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_avro_serde_with_uecord_name_strategy() {
+    async fn test_avro_serde_with_record_name_strategy() {
         use crate::serdes::serde::SubjectNameStrategyType;
 
         let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
@@ -2054,9 +2054,9 @@ mod tests {
             rule_set: None,
             schema: schema_str.to_string(),
         };
-        // RecordNameStrategy uses "{recordName}-value" as subject
+        // RecordNameStrategy uses "{recordName}" as subject
         client
-            .register_schema("DemoSchema-value", &schema, false)
+            .register_schema("DemoSchema", &schema, false)
             .await
             .unwrap();
 
@@ -2133,9 +2133,9 @@ mod tests {
             rule_set: None,
             schema: schema_str.to_string(),
         };
-        // TopicRecordNameStrategy uses "{topic}-{recordName}-value" as subject
+        // TopicRecordNameStrategy uses "{topic}-{recordName}" as subject
         client
-            .register_schema("topic1-DemoSchema-value", &schema, false)
+            .register_schema("topic1-DemoSchema", &schema, false)
             .await
             .unwrap();
 
