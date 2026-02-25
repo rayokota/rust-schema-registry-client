@@ -76,11 +76,17 @@ impl<'a, T: Client + Sync> JsonSerializer<'a, T> {
     ) -> Result<Vec<u8>, SerdeError> {
         let mut value = value;
         let subject = self.get_subject(&ctx.topic, &ctx.serde_type, self.schema).await?;
-        let latest_schema = self
-            .base
-            .serde
-            .get_reader_schema(&subject, None, &self.base.config.use_schema)
-            .await?;
+        let latest_schema = if let Some(ref subj) = subject {
+            self.base
+                .serde
+                .get_reader_schema(subj, None, &self.base.config.use_schema)
+                .await?
+        } else {
+            None
+        };
+        let subject = subject.ok_or_else(|| {
+            Serialization("Could not determine subject for serialization".to_string())
+        })?;
 
         let schema_id;
         if let Some(ref schema) = latest_schema {
@@ -209,22 +215,24 @@ impl<'a, T: Client + Sync> JsonSerializer<'a, T> {
         topic: &str,
         serde_type: &SerdeType,
         schema: Option<&Schema>,
-    ) -> Result<String, SerdeError> {
+    ) -> Result<Option<String>, SerdeError> {
         match self.subject_name_strategy_type {
             SubjectNameStrategyType::Record => {
-                let schema = schema.ok_or_else(|| {
-                    Serialization("Schema is required for record name strategy".to_string())
-                })?;
-                self.get_record_name(schema).await
+                if let Some(schema) = schema {
+                    Ok(Some(self.get_record_name(schema).await?))
+                } else {
+                    Ok(None)
+                }
             }
             SubjectNameStrategyType::TopicRecord => {
-                let schema = schema.ok_or_else(|| {
-                    Serialization("Schema is required for record name strategy".to_string())
-                })?;
-                let name = self.get_record_name(schema).await?;
-                Ok(format!("{topic}-{name}"))
+                if let Some(schema) = schema {
+                    let name = self.get_record_name(schema).await?;
+                    Ok(Some(format!("{topic}-{name}")))
+                } else {
+                    Ok(None)
+                }
             }
-            SubjectNameStrategyType::Associated => {
+            SubjectNameStrategyType::Associated => Ok(Some(
                 load_associated_subject(
                     self.base.serde.client,
                     &self.serde.subject_cache,
@@ -233,9 +241,9 @@ impl<'a, T: Client + Sync> JsonSerializer<'a, T> {
                     serde_type,
                     schema,
                 )
-                .await
-            }
-            _ => Ok(topic_name_strategy(topic, serde_type, schema).unwrap()),
+                .await?,
+            )),
+            _ => Ok(Some(topic_name_strategy(topic, serde_type, schema).unwrap())),
         }
     }
 
@@ -333,15 +341,16 @@ impl<'a, T: Client + Sync> JsonDeserializer<'a, T> {
         let initial_subject = self
             .get_subject(&ctx.topic, &ctx.serde_type, None)
             .await
-            .unwrap_or_default();
+            .ok()
+            .flatten();
         let mut latest_schema = None;
 
         // Try to get reader schema with initial subject
-        if !initial_subject.is_empty() {
+        if let Some(ref init_subj) = initial_subject {
             latest_schema = self
                 .base
                 .serde
-                .get_reader_schema(&initial_subject, None, &self.base.config.use_schema)
+                .get_reader_schema(init_subj, None, &self.base.config.use_schema)
                 .await
                 .ok()
                 .flatten();
@@ -354,7 +363,7 @@ impl<'a, T: Client + Sync> JsonDeserializer<'a, T> {
 
         let writer_schema_raw = self
             .base
-            .get_writer_schema(&schema_id, Some(&initial_subject), None)
+            .get_writer_schema(&schema_id, initial_subject.as_deref(), None)
             .await?;
         let (writer_schema, writer_ref_registry) =
             self.get_parsed_schema(&writer_schema_raw).await?;
@@ -365,22 +374,22 @@ impl<'a, T: Client + Sync> JsonDeserializer<'a, T> {
             .await?;
 
         // If subject changed, try to get reader schema again
-        if subject != initial_subject && !subject.is_empty() {
-            if let Ok(Some(schema)) = self
-                .base
-                .serde
-                .get_reader_schema(&subject, None, &self.base.config.use_schema)
-                .await
-            {
-                latest_schema = Some(schema);
+        if subject != initial_subject {
+            if let Some(ref subj) = subject {
+                if let Ok(Some(schema)) = self
+                    .base
+                    .serde
+                    .get_reader_schema(subj, None, &self.base.config.use_schema)
+                    .await
+                {
+                    latest_schema = Some(schema);
+                }
             }
         }
 
-        if subject.is_empty() {
-            return Err(Serialization(
-                "Could not determine subject for deserialization".to_string(),
-            ));
-        }
+        let subject = subject.ok_or_else(|| {
+            Serialization("Could not determine subject for deserialization".to_string())
+        })?;
         let serde_value;
         if let Some(ref rule_set) = writer_schema_raw.rule_set
             && rule_set.encoding_rules.is_some()
@@ -520,22 +529,24 @@ impl<'a, T: Client + Sync> JsonDeserializer<'a, T> {
         topic: &str,
         serde_type: &SerdeType,
         schema: Option<&Schema>,
-    ) -> Result<String, SerdeError> {
+    ) -> Result<Option<String>, SerdeError> {
         match self.subject_name_strategy_type {
             SubjectNameStrategyType::Record => {
-                let schema = schema.ok_or_else(|| {
-                    Serialization("Schema is required for record name strategy".to_string())
-                })?;
-                self.get_record_name(schema).await
+                if let Some(schema) = schema {
+                    Ok(Some(self.get_record_name(schema).await?))
+                } else {
+                    Ok(None)
+                }
             }
             SubjectNameStrategyType::TopicRecord => {
-                let schema = schema.ok_or_else(|| {
-                    Serialization("Schema is required for record name strategy".to_string())
-                })?;
-                let name = self.get_record_name(schema).await?;
-                Ok(format!("{topic}-{name}"))
+                if let Some(schema) = schema {
+                    let name = self.get_record_name(schema).await?;
+                    Ok(Some(format!("{topic}-{name}")))
+                } else {
+                    Ok(None)
+                }
             }
-            SubjectNameStrategyType::Associated => {
+            SubjectNameStrategyType::Associated => Ok(Some(
                 load_associated_subject(
                     self.base.serde.client,
                     &self.serde.subject_cache,
@@ -544,9 +555,9 @@ impl<'a, T: Client + Sync> JsonDeserializer<'a, T> {
                     serde_type,
                     schema,
                 )
-                .await
-            }
-            _ => Ok(topic_name_strategy(topic, serde_type, schema).unwrap()),
+                .await?,
+            )),
+            _ => Ok(Some(topic_name_strategy(topic, serde_type, schema).unwrap())),
         }
     }
 }

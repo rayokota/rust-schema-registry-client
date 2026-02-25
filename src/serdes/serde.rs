@@ -419,7 +419,7 @@ pub type SubjectNameStrategy =
 /// SubjectNameStrategyFunc is a boxed function that determines the subject for the given parameters.
 /// This is used for strategies that need to capture state (like RecordNameStrategy).
 pub type SubjectNameStrategyFunc =
-    Box<dyn Fn(&str, &SerdeType, Option<&Schema>) -> Result<String, SerdeError> + Send + Sync>;
+    Box<dyn Fn(&str, &SerdeType, Option<&Schema>) -> Result<Option<String>, SerdeError> + Send + Sync>;
 
 /// RecordNameFunc extracts the record name from a schema.
 pub type RecordNameFunc = Box<dyn Fn(Option<&Schema>) -> Result<String, SerdeError> + Send + Sync>;
@@ -432,7 +432,7 @@ pub fn strategy_func(
 ) -> Result<Option<SubjectNameStrategyFunc>, SerdeError> {
     match strategy_type {
         SubjectNameStrategyType::Topic => Ok(Some(Box::new(|topic, serde_type, schema| {
-            Ok(topic_name_strategy(topic, serde_type, schema).unwrap())
+            Ok(Some(topic_name_strategy(topic, serde_type, schema).unwrap()))
         }))),
         SubjectNameStrategyType::Record => Ok(Some(record_name_strategy(get_record_name))),
         SubjectNameStrategyType::TopicRecord => {
@@ -449,16 +449,22 @@ pub fn strategy_func(
 /// RecordNameStrategy creates a subject name from the record name.
 pub fn record_name_strategy(get_record_name: RecordNameFunc) -> SubjectNameStrategyFunc {
     Box::new(move |_topic, serde_type, schema| {
+        if schema.is_none() {
+            return Ok(None);
+        }
         let record_name = get_record_name(schema)?;
-        Ok(record_name)
+        Ok(Some(record_name))
     })
 }
 
 /// TopicRecordNameStrategy creates a subject name from the topic and record name.
 pub fn topic_record_name_strategy(get_record_name: RecordNameFunc) -> SubjectNameStrategyFunc {
     Box::new(move |topic, serde_type, schema| {
+        if schema.is_none() {
+            return Ok(None);
+        }
         let record_name = get_record_name(schema)?;
-        Ok(format!("{topic}-{record_name}"))
+        Ok(Some(format!("{topic}-{record_name}")))
     })
 }
 
@@ -614,7 +620,13 @@ impl<T: Client> AssociatedNameStrategy<T> {
                 .clone()
                 .ok_or_else(|| Serialization("association has no subject".to_string()));
         } else if let Some(ref fallback) = self.fallback_strategy {
-            return fallback(topic, serde_type, schema);
+            return match fallback(topic, serde_type, schema)? {
+                Some(s) => Ok(s),
+                None => Err(Serialization(format!(
+                    "no associated subject found for topic {}",
+                    topic
+                ))),
+            };
         } else {
             return Err(Serialization(format!(
                 "no associated subject found for topic {}",
@@ -706,7 +718,7 @@ pub fn configure_subject_name_strategy(
     } else {
         // Default to TopicNameStrategy for main strategy
         Ok(Box::new(|topic, serde_type, schema| {
-            Ok(topic_name_strategy(topic, serde_type, schema).unwrap())
+            Ok(Some(topic_name_strategy(topic, serde_type, schema).unwrap()))
         }))
     }
 }
