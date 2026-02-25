@@ -6,9 +6,11 @@ use crate::serdes::config::{DeserializerConfig, SerializerConfig};
 use crate::serdes::rule_registry::RuleRegistry;
 use crate::serdes::serde::SerdeError::Serialization;
 use crate::serdes::serde::{
+    FALLBACK_SUBJECT_NAME_STRATEGY_TYPE_CONFIG, KAFKA_CLUSTER_ID_CONFIG,
     BaseDeserializer, BaseSerializer, FieldTransformer, FieldType, RuleContext, SchemaId, Serde,
     SerdeError, SerdeFormat, SerdeSchema, SerdeType, SerdeValue, SerializationContext,
-    SubjectNameStrategyType, get_executor, get_executors, topic_name_strategy,
+    SubjectNameStrategyType, get_executor, get_executors, load_associated_subject,
+    topic_name_strategy,
 };
 use async_recursion::async_recursion;
 use base64::Engine;
@@ -37,6 +39,7 @@ pub mod confluent {
 #[derive(Clone, Debug)]
 pub(crate) struct ProtobufSerde {
     parsed_schemas: DashMap<Schema, (FileDescriptor, DescriptorPool)>,
+    subject_cache: DashMap<(String, bool), String>,
 }
 
 #[derive(Clone)]
@@ -91,6 +94,7 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
             base: BaseSerializer::new(Serde::new(client, rule_registry), serializer_config.clone()),
             serde: ProtobufSerde {
                 parsed_schemas: DashMap::new(),
+                subject_cache: DashMap::new(),
             },
             subject_name_strategy_type: serializer_config.subject_name_strategy_type,
         })
@@ -366,6 +370,17 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
                 let name = self.get_record_name(schema).await?;
                 Ok(format!("{topic}-{name}"))
             }
+            SubjectNameStrategyType::Associated => {
+                load_associated_subject(
+                    self.base.serde.client,
+                    &self.serde.subject_cache,
+                    &self.base.config.strategy_config,
+                    topic,
+                    serde_type,
+                    schema,
+                )
+                .await
+            }
             _ => Ok(topic_name_strategy(topic, serde_type, schema).unwrap()),
         }
     }
@@ -460,6 +475,7 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
             base: BaseDeserializer::new(Serde::new(client, rule_registry), deserializer_config.clone()),
             serde: ProtobufSerde {
                 parsed_schemas: DashMap::new(),
+                subject_cache: DashMap::new(),
             },
             subject_name_strategy_type: deserializer_config.subject_name_strategy_type,
         })
@@ -748,6 +764,17 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
                 })?;
                 let name = self.get_record_name(schema).await?;
                 Ok(format!("{topic}-{name}"))
+            }
+            SubjectNameStrategyType::Associated => {
+                load_associated_subject(
+                    self.base.serde.client,
+                    &self.serde.subject_cache,
+                    &self.base.config.strategy_config,
+                    topic,
+                    serde_type,
+                    schema,
+                )
+                .await
             }
             _ => Ok(topic_name_strategy(topic, serde_type, schema).unwrap()),
         }
@@ -1374,5 +1401,364 @@ mod tests {
         };
         let obj2: Author = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
         assert_eq!(obj2, obj);
+    }
+
+    fn proto_demo_obj() -> Author {
+        Author {
+            name: "Kafka".to_string(),
+            id: 123,
+            picture: vec![1u8, 2u8],
+            works: vec!["Metamorphosis".to_string()],
+            pii_oneof: None,
+        }
+    }
+
+    fn proto_demo_schema(obj: &Author) -> Schema {
+        Schema {
+            schema_type: Some("PROTOBUF".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: None,
+            schema: schema_to_str(&obj.descriptor().parent_file()).unwrap(),
+        }
+    }
+
+    fn proto_make_association(
+        resource_id: &str,
+        subject: &str,
+        association_type: &str,
+    ) -> crate::rest::models::AssociationCreateOrUpdateRequest {
+        use crate::rest::models::{AssociationCreateOrUpdateInfo, AssociationCreateOrUpdateRequest};
+        AssociationCreateOrUpdateRequest {
+            resource_name: Some("topic1".to_string()),
+            resource_namespace: Some("-".to_string()),
+            resource_id: Some(resource_id.to_string()),
+            resource_type: Some("topic".to_string()),
+            associations: Some(vec![AssociationCreateOrUpdateInfo {
+                subject: Some(subject.to_string()),
+                association_type: Some(association_type.to_string()),
+                lifecycle: None,
+                frozen: None,
+                schema: None,
+                normalize: None,
+            }]),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_protobuf_serde_with_associated_name_strategy() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+
+        let obj = proto_demo_obj();
+        let schema = proto_demo_schema(&obj);
+        client
+            .register_schema("my-custom-subject", &schema, false)
+            .await
+            .unwrap();
+        client
+            .create_association(&proto_make_association(
+                "lkc-123:topic1",
+                "my-custom-subject",
+                "value",
+            ))
+            .await
+            .unwrap();
+
+        let rule_registry = RuleRegistry::new();
+        let mut ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            false,
+            false,
+            HashMap::new(),
+        );
+        ser_conf.subject_name_strategy_type = SubjectNameStrategyType::Associated;
+        let ser = ProtobufSerializer::with_reference_subject_name_strategy(
+            &client,
+            default_reference_subject_name_strategy,
+            Some(rule_registry.clone()),
+            ser_conf,
+        )
+        .unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "topic1".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Protobuf,
+            headers: None,
+        };
+        let bytes = ser.serialize(&ser_ctx, &obj).await.unwrap();
+
+        let mut deser_conf = DeserializerConfig::default();
+        deser_conf.subject_name_strategy_type = SubjectNameStrategyType::Associated;
+        let deser =
+            ProtobufDeserializer::new(&client, Some(rule_registry.clone()), deser_conf).unwrap();
+        let obj2: Author = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        assert_eq!(obj2, obj);
+    }
+
+    #[tokio::test]
+    async fn test_protobuf_serde_with_associated_name_strategy_fallback_to_topic() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+
+        let obj = proto_demo_obj();
+        let schema = proto_demo_schema(&obj);
+        // Register under topic name strategy subject (no association)
+        client
+            .register_schema("topic1-value", &schema, false)
+            .await
+            .unwrap();
+
+        let rule_registry = RuleRegistry::new();
+        let mut ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            false,
+            false,
+            HashMap::new(),
+        );
+        ser_conf.subject_name_strategy_type = SubjectNameStrategyType::Associated;
+        let ser = ProtobufSerializer::with_reference_subject_name_strategy(
+            &client,
+            default_reference_subject_name_strategy,
+            Some(rule_registry.clone()),
+            ser_conf,
+        )
+        .unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "topic1".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Protobuf,
+            headers: None,
+        };
+        let bytes = ser.serialize(&ser_ctx, &obj).await.unwrap();
+
+        let deser = ProtobufDeserializer::new(
+            &client,
+            Some(rule_registry.clone()),
+            DeserializerConfig::default(),
+        )
+        .unwrap();
+        let obj2: Author = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        assert_eq!(obj2, obj);
+    }
+
+    #[tokio::test]
+    async fn test_protobuf_serde_with_associated_name_strategy_fallback_none() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+
+        let rule_registry = RuleRegistry::new();
+        let mut ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            false,
+            false,
+            HashMap::new(),
+        );
+        ser_conf.subject_name_strategy_type = SubjectNameStrategyType::Associated;
+        ser_conf.strategy_config = HashMap::from([(
+            FALLBACK_SUBJECT_NAME_STRATEGY_TYPE_CONFIG.to_string(),
+            "NONE".to_string(),
+        )]);
+        let ser = ProtobufSerializer::with_reference_subject_name_strategy(
+            &client,
+            default_reference_subject_name_strategy,
+            Some(rule_registry.clone()),
+            ser_conf,
+        )
+        .unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "topic1".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Protobuf,
+            headers: None,
+        };
+        let result = ser.serialize(&ser_ctx, &proto_demo_obj()).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no associated subject found"));
+    }
+
+    #[tokio::test]
+    async fn test_protobuf_serde_with_associated_name_strategy_multiple_associations() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+
+        let obj = proto_demo_obj();
+        let schema = proto_demo_schema(&obj);
+        client
+            .register_schema("subject1", &schema, false)
+            .await
+            .unwrap();
+        client
+            .register_schema("subject2", &schema, false)
+            .await
+            .unwrap();
+        client
+            .create_association(&proto_make_association("lkc-123:topic1", "subject1", "value"))
+            .await
+            .unwrap();
+        client
+            .create_association(&proto_make_association("lkc-456:topic1", "subject2", "value"))
+            .await
+            .unwrap();
+
+        let rule_registry = RuleRegistry::new();
+        let mut ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            false,
+            false,
+            HashMap::new(),
+        );
+        ser_conf.subject_name_strategy_type = SubjectNameStrategyType::Associated;
+        let ser = ProtobufSerializer::with_reference_subject_name_strategy(
+            &client,
+            default_reference_subject_name_strategy,
+            Some(rule_registry.clone()),
+            ser_conf,
+        )
+        .unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "topic1".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Protobuf,
+            headers: None,
+        };
+        let result = ser.serialize(&ser_ctx, &proto_demo_obj()).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("multiple associated subjects found"));
+    }
+
+    #[tokio::test]
+    async fn test_protobuf_serde_with_associated_name_strategy_with_kafka_cluster_id() {
+        use crate::rest::models::{AssociationCreateOrUpdateInfo, AssociationCreateOrUpdateRequest};
+
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+
+        let obj = proto_demo_obj();
+        let schema = proto_demo_schema(&obj);
+        client
+            .register_schema("my-custom-subject", &schema, false)
+            .await
+            .unwrap();
+
+        let request = AssociationCreateOrUpdateRequest {
+            resource_name: Some("topic1".to_string()),
+            resource_namespace: Some("lkc-my-cluster".to_string()),
+            resource_id: Some("lkc-my-cluster:topic1".to_string()),
+            resource_type: Some("topic".to_string()),
+            associations: Some(vec![AssociationCreateOrUpdateInfo {
+                subject: Some("my-custom-subject".to_string()),
+                association_type: Some("value".to_string()),
+                lifecycle: None,
+                frozen: None,
+                schema: None,
+                normalize: None,
+            }]),
+        };
+        client.create_association(&request).await.unwrap();
+
+        let rule_registry = RuleRegistry::new();
+        let mut ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            false,
+            false,
+            HashMap::new(),
+        );
+        ser_conf.subject_name_strategy_type = SubjectNameStrategyType::Associated;
+        ser_conf.strategy_config = HashMap::from([(
+            KAFKA_CLUSTER_ID_CONFIG.to_string(),
+            "lkc-my-cluster".to_string(),
+        )]);
+        let ser = ProtobufSerializer::with_reference_subject_name_strategy(
+            &client,
+            default_reference_subject_name_strategy,
+            Some(rule_registry.clone()),
+            ser_conf,
+        )
+        .unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "topic1".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Protobuf,
+            headers: None,
+        };
+        let bytes = ser.serialize(&ser_ctx, &obj).await.unwrap();
+
+        let mut deser_conf = DeserializerConfig::default();
+        deser_conf.subject_name_strategy_type = SubjectNameStrategyType::Associated;
+        deser_conf.strategy_config = HashMap::from([(
+            KAFKA_CLUSTER_ID_CONFIG.to_string(),
+            "lkc-my-cluster".to_string(),
+        )]);
+        let deser =
+            ProtobufDeserializer::new(&client, Some(rule_registry.clone()), deser_conf).unwrap();
+        let obj2: Author = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        assert_eq!(obj2, obj);
+    }
+
+    #[tokio::test]
+    async fn test_protobuf_serde_with_associated_name_strategy_caching() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+
+        let obj = proto_demo_obj();
+        let schema = proto_demo_schema(&obj);
+        client
+            .register_schema("my-cached-subject", &schema, false)
+            .await
+            .unwrap();
+        client
+            .create_association(&proto_make_association(
+                "lkc-123:topic1",
+                "my-cached-subject",
+                "value",
+            ))
+            .await
+            .unwrap();
+
+        let rule_registry = RuleRegistry::new();
+        let mut ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            false,
+            false,
+            HashMap::new(),
+        );
+        ser_conf.subject_name_strategy_type = SubjectNameStrategyType::Associated;
+        let ser = ProtobufSerializer::with_reference_subject_name_strategy(
+            &client,
+            default_reference_subject_name_strategy,
+            Some(rule_registry.clone()),
+            ser_conf,
+        )
+        .unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "topic1".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Protobuf,
+            headers: None,
+        };
+
+        let mut deser_conf = DeserializerConfig::default();
+        deser_conf.subject_name_strategy_type = SubjectNameStrategyType::Associated;
+        let deser =
+            ProtobufDeserializer::new(&client, Some(rule_registry.clone()), deser_conf).unwrap();
+
+        for _ in 0..5 {
+            let bytes = ser.serialize(&ser_ctx, &obj).await.unwrap();
+            let obj2: Author = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+            assert_eq!(obj2, obj);
+        }
     }
 }

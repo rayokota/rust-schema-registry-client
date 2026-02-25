@@ -624,6 +624,75 @@ impl<T: Client> AssociatedNameStrategy<T> {
     }
 }
 
+/// Looks up the subject for a topic via schema registry associations.
+/// Used by serializers/deserializers when `SubjectNameStrategyType::Associated` is configured.
+pub(crate) async fn load_associated_subject<T: Client + Sync>(
+    client: &T,
+    subject_cache: &DashMap<(String, bool), String>,
+    strategy_config: &HashMap<String, String>,
+    topic: &str,
+    serde_type: &SerdeType,
+    schema: Option<&Schema>,
+) -> Result<String, SerdeError> {
+    let kafka_cluster_id = strategy_config
+        .get(KAFKA_CLUSTER_ID_CONFIG)
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .unwrap_or_else(|| NAMESPACE_WILDCARD.to_string());
+    let fallback_type = strategy_config
+        .get(FALLBACK_SUBJECT_NAME_STRATEGY_TYPE_CONFIG)
+        .map(|s| parse_subject_name_strategy_type(s))
+        .transpose()?
+        .unwrap_or(SubjectNameStrategyType::Topic);
+    let is_key = *serde_type == SerdeType::Key;
+    let cache_key = (topic.to_string(), is_key);
+    if let Some(cached) = subject_cache.get(&cache_key) {
+        return Ok(cached.clone());
+    }
+    let association_type = if is_key { "key" } else { "value" };
+    let associations = match client
+        .get_associations_by_resource_name(
+            topic,
+            &kafka_cluster_id,
+            "topic",
+            &[association_type],
+            "",
+            0,
+            -1,
+        )
+        .await
+    {
+        Ok(assocs) => assocs,
+        Err(RestError::ResponseError(resp)) if resp.status == reqwest::StatusCode::NOT_FOUND => {
+            Vec::new()
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let subject = if associations.len() > 1 {
+        return Err(Serialization(format!(
+            "multiple associated subjects found for topic {}",
+            topic
+        )));
+    } else if associations.len() == 1 {
+        associations[0]
+            .subject
+            .clone()
+            .ok_or_else(|| Serialization("association has no subject".to_string()))?
+    } else {
+        match fallback_type {
+            SubjectNameStrategyType::None => {
+                return Err(Serialization(format!(
+                    "no associated subject found for topic {}",
+                    topic
+                )));
+            }
+            _ => topic_name_strategy(topic, serde_type, schema).unwrap(),
+        }
+    };
+    subject_cache.insert(cache_key, subject.clone());
+    Ok(subject)
+}
+
 /// ConfigureSubjectNameStrategy configures the subject name strategy based on the strategy type.
 ///
 /// Returns a SubjectNameStrategyFunc that can be used for subject name resolution.
