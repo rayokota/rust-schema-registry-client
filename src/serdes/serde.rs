@@ -412,62 +412,6 @@ pub fn parse_subject_name_strategy_type(s: &str) -> Result<SubjectNameStrategyTy
     }
 }
 
-/// SubjectNameStrategy determines the subject for the given parameters.
-pub type SubjectNameStrategy =
-    fn(topic: &str, serde_type: &SerdeType, schema: Option<&Schema>) -> Option<String>;
-
-/// SubjectNameStrategyFunc is a boxed function that determines the subject for the given parameters.
-/// This is used for strategies that need to capture state (like RecordNameStrategy).
-pub type SubjectNameStrategyFunc =
-    Box<dyn Fn(&str, &SerdeType, Option<&Schema>) -> Result<Option<String>, SerdeError> + Send + Sync>;
-
-/// RecordNameFunc extracts the record name from a schema.
-pub type RecordNameFunc = Box<dyn Fn(Option<&Schema>) -> Result<String, SerdeError> + Send + Sync>;
-
-/// StrategyFunc returns the SubjectNameStrategyFunc for the given strategy type.
-/// Note: This does not handle AssociatedNameStrategy as it requires additional parameters.
-pub fn strategy_func(
-    strategy_type: SubjectNameStrategyType,
-    get_record_name: RecordNameFunc,
-) -> Result<Option<SubjectNameStrategyFunc>, SerdeError> {
-    match strategy_type {
-        SubjectNameStrategyType::Topic => Ok(Some(Box::new(|topic, serde_type, schema| {
-            Ok(Some(topic_name_strategy(topic, serde_type, schema).unwrap()))
-        }))),
-        SubjectNameStrategyType::Record => Ok(Some(record_name_strategy(get_record_name))),
-        SubjectNameStrategyType::TopicRecord => {
-            Ok(Some(topic_record_name_strategy(get_record_name)))
-        }
-        SubjectNameStrategyType::None => Ok(None),
-        SubjectNameStrategyType::Associated => {
-            // AssociatedNameStrategy requires a client and config, use AssociatedNameStrategy::new() instead
-            Ok(None)
-        }
-    }
-}
-
-/// RecordNameStrategy creates a subject name from the record name.
-pub fn record_name_strategy(get_record_name: RecordNameFunc) -> SubjectNameStrategyFunc {
-    Box::new(move |_topic, serde_type, schema| {
-        if schema.is_none() {
-            return Ok(None);
-        }
-        let record_name = get_record_name(schema)?;
-        Ok(Some(record_name))
-    })
-}
-
-/// TopicRecordNameStrategy creates a subject name from the topic and record name.
-pub fn topic_record_name_strategy(get_record_name: RecordNameFunc) -> SubjectNameStrategyFunc {
-    Box::new(move |topic, serde_type, schema| {
-        if schema.is_none() {
-            return Ok(None);
-        }
-        let record_name = get_record_name(schema)?;
-        Ok(Some(format!("{topic}-{record_name}")))
-    })
-}
-
 pub fn topic_name_strategy(
     topic: &str,
     serde_type: &SerdeType,
@@ -481,161 +425,17 @@ pub fn topic_name_strategy(
 
 /// Cache key for association lookups.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-struct AssociationCacheKey {
+pub(crate) struct SubjectCacheKey {
     topic: String,
     is_key: bool,
     schema: String,
-}
-
-/// AssociatedNameStrategy retrieves the associated subject name from schema registry.
-///
-/// The topic is passed as the resource name to schema registry. If there is a configuration
-/// property named "kafka.cluster.id", then its value will be passed as the resource namespace;
-/// otherwise the value "-" will be passed as the resource namespace.
-///
-/// If more than one subject is returned from the query, an error will be returned.
-/// If no subjects are returned from the query, then the behavior will fall back to TopicNameStrategy,
-/// unless the configuration property "fallback.subject.name.strategy.type" is set to "RECORD",
-/// "TOPIC_RECORD", or "NONE".
-pub struct AssociatedNameStrategy<T: Client> {
-    client: Arc<T>,
-    kafka_cluster_id: String,
-    fallback_strategy: Option<SubjectNameStrategyFunc>,
-    subject_name_cache: mini_moka::sync::Cache<AssociationCacheKey, String>,
-}
-
-impl<T: Client> AssociatedNameStrategy<T> {
-    /// Create a new AssociatedNameStrategy.
-    ///
-    /// # Arguments
-    /// * `client` - The schema registry client
-    /// * `config` - Configuration map that may contain "kafka.cluster.id" and "fallback.subject.name.strategy.type"
-    /// * `get_record_name` - Function to extract the record name from a schema (used for fallback strategies)
-    pub fn new(
-        client: Arc<T>,
-        config: &HashMap<String, String>,
-        get_record_name: RecordNameFunc,
-    ) -> Result<Self, SerdeError> {
-        let kafka_cluster_id = config
-            .get(KAFKA_CLUSTER_ID_CONFIG)
-            .filter(|s| !s.is_empty())
-            .cloned()
-            .unwrap_or_else(|| NAMESPACE_WILDCARD.to_string());
-
-        let fallback_type = config
-            .get(FALLBACK_SUBJECT_NAME_STRATEGY_TYPE_CONFIG)
-            .map(|s| parse_subject_name_strategy_type(s))
-            .transpose()?
-            .unwrap_or(SubjectNameStrategyType::Topic);
-
-        let fallback_strategy = strategy_func(fallback_type, get_record_name)?;
-
-        let subject_name_cache = mini_moka::sync::Cache::builder()
-            .max_capacity(DEFAULT_CACHE_CAPACITY)
-            .build();
-
-        Ok(Self {
-            client,
-            kafka_cluster_id,
-            fallback_strategy,
-            subject_name_cache,
-        })
-    }
-
-    /// Get the subject name for the given topic, serde type, and schema.
-    pub async fn get_subject(
-        &self,
-        topic: &str,
-        serde_type: &SerdeType,
-        schema: Option<&Schema>,
-    ) -> Result<Option<String>, SerdeError> {
-        if topic.is_empty() {
-            return Ok(None);
-        }
-
-        let is_key = *serde_type == SerdeType::Key;
-        let schema_str = schema.map(|s| s.schema.clone()).unwrap_or_default();
-
-        let cache_key = AssociationCacheKey {
-            topic: topic.to_string(),
-            is_key,
-            schema: schema_str,
-        };
-
-        // Check cache first
-        if let Some(cached) = self.subject_name_cache.get(&cache_key) {
-            return Ok(Some(cached));
-        }
-
-        // Load from schema registry
-        let subject = self
-            .load_associated_subject_name(topic, is_key, schema, serde_type)
-            .await?;
-
-        // Store in cache only when a subject was found
-        if let Some(ref s) = subject {
-            self.subject_name_cache.insert(cache_key, s.clone());
-        }
-
-        Ok(subject)
-    }
-
-    async fn load_associated_subject_name(
-        &self,
-        topic: &str,
-        is_key: bool,
-        schema: Option<&Schema>,
-        serde_type: &SerdeType,
-    ) -> Result<Option<String>, SerdeError> {
-        let association_type = if is_key { "key" } else { "value" };
-
-        let associations = match self
-            .client
-            .get_associations_by_resource_name(
-                topic,
-                &self.kafka_cluster_id,
-                "topic",
-                &[association_type],
-                "",
-                0,
-                -1,
-            )
-            .await
-        {
-            Ok(assocs) => assocs,
-            Err(RestError::ResponseError(resp))
-                if resp.status == reqwest::StatusCode::NOT_FOUND =>
-            {
-                Vec::new()
-            }
-            Err(e) => return Err(e.into()),
-        };
-
-        if associations.len() > 1 {
-            return Err(Serialization(format!(
-                "multiple associated subjects found for topic {}",
-                topic
-            )));
-        } else if associations.len() == 1 {
-            return Ok(Some(
-                associations[0]
-                    .subject
-                    .clone()
-                    .ok_or_else(|| Serialization("association has no subject".to_string()))?,
-            ));
-        } else if let Some(ref fallback) = self.fallback_strategy {
-            return fallback(topic, serde_type, schema);
-        } else {
-            return Ok(None);
-        }
-    }
 }
 
 /// Looks up the subject for a topic via schema registry associations.
 /// Used by serializers/deserializers when `SubjectNameStrategyType::Associated` is configured.
 pub(crate) async fn load_associated_subject<T: Client + Sync>(
     client: &T,
-    subject_cache: &DashMap<(String, bool), String>,
+    subject_cache: &DashMap<SubjectCacheKey, String>,
     strategy_config: &HashMap<String, String>,
     topic: &str,
     serde_type: &SerdeType,
@@ -646,13 +446,13 @@ pub(crate) async fn load_associated_subject<T: Client + Sync>(
         .filter(|s| !s.is_empty())
         .cloned()
         .unwrap_or_else(|| NAMESPACE_WILDCARD.to_string());
-    let fallback_type = strategy_config
-        .get(FALLBACK_SUBJECT_NAME_STRATEGY_TYPE_CONFIG)
-        .map(|s| parse_subject_name_strategy_type(s))
-        .transpose()?
-        .unwrap_or(SubjectNameStrategyType::Topic);
     let is_key = *serde_type == SerdeType::Key;
-    let cache_key = (topic.to_string(), is_key);
+    let schema_str = schema.map(|s| s.schema.clone()).unwrap_or_default();
+    let cache_key = SubjectCacheKey {
+        topic: topic.to_string(),
+        is_key,
+        schema: schema_str,
+    };
     if let Some(cached) = subject_cache.get(&cache_key) {
         return Ok(Some(cached.clone()));
     }
@@ -688,33 +488,12 @@ pub(crate) async fn load_associated_subject<T: Client + Sync>(
                 .ok_or_else(|| Serialization("association has no subject".to_string()))?,
         )
     } else {
-        match fallback_type {
-            SubjectNameStrategyType::None => None,
-            _ => Some(topic_name_strategy(topic, serde_type, schema).unwrap()),
-        }
+        None // No association found — caller handles fallback via get_subject_for_type
     };
     if let Some(ref s) = subject {
         subject_cache.insert(cache_key, s.clone());
     }
     Ok(subject)
-}
-
-/// ConfigureSubjectNameStrategy configures the subject name strategy based on the strategy type.
-///
-/// Returns a SubjectNameStrategyFunc that can be used for subject name resolution.
-/// For AssociatedNameStrategyType, use AssociatedNameStrategy directly instead.
-pub fn configure_subject_name_strategy(
-    strategy_type: SubjectNameStrategyType,
-    get_record_name: RecordNameFunc,
-) -> Result<SubjectNameStrategyFunc, SerdeError> {
-    if let Some(strategy) = strategy_func(strategy_type, get_record_name)? {
-        Ok(strategy)
-    } else {
-        // Default to TopicNameStrategy for main strategy
-        Ok(Box::new(|topic, serde_type, schema| {
-            Ok(Some(topic_name_strategy(topic, serde_type, schema).unwrap()))
-        }))
-    }
 }
 
 pub type SchemaIdSerializer = fn(

@@ -6,11 +6,11 @@ use crate::serdes::config::{DeserializerConfig, SerializerConfig};
 use crate::serdes::rule_registry::RuleRegistry;
 use crate::serdes::serde::SerdeError::Serialization;
 use crate::serdes::serde::{
-    FALLBACK_SUBJECT_NAME_STRATEGY_TYPE_CONFIG, KAFKA_CLUSTER_ID_CONFIG,
-    BaseDeserializer, BaseSerializer, FieldTransformer, FieldType, RuleContext, SchemaId, Serde,
-    SerdeError, SerdeFormat, SerdeSchema, SerdeType, SerdeValue, SerializationContext,
+    BaseDeserializer, BaseSerializer, FALLBACK_SUBJECT_NAME_STRATEGY_TYPE_CONFIG, FieldTransformer,
+    FieldType, KAFKA_CLUSTER_ID_CONFIG, RuleContext, SchemaId, Serde, SerdeError, SerdeFormat,
+    SerdeSchema, SerdeType, SerdeValue, SerializationContext, SubjectCacheKey,
     SubjectNameStrategyType, get_executor, get_executors, load_associated_subject,
-    topic_name_strategy,
+    parse_subject_name_strategy_type, topic_name_strategy,
 };
 use async_recursion::async_recursion;
 use base64::Engine;
@@ -35,11 +35,10 @@ pub mod confluent {
     }
 }
 
-
 #[derive(Clone, Debug)]
 pub(crate) struct ProtobufSerde {
     parsed_schemas: DashMap<Schema, (FileDescriptor, DescriptorPool)>,
-    subject_cache: DashMap<(String, bool), String>,
+    subject_cache: DashMap<SubjectCacheKey, String>,
 }
 
 #[derive(Clone)]
@@ -55,7 +54,10 @@ impl<'a, T: Client> std::fmt::Debug for ProtobufSerializer<'a, T> {
         f.debug_struct("ProtobufSerializer")
             .field("reference_subject_name_strategy", &"<function>")
             .field("serde", &self.serde)
-            .field("subject_name_strategy_type", &self.subject_name_strategy_type)
+            .field(
+                "subject_name_strategy_type",
+                &self.subject_name_strategy_type,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -362,7 +364,19 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
         serde_type: &SerdeType,
         schema: Option<&Schema>,
     ) -> Result<Option<String>, SerdeError> {
-        match self.subject_name_strategy_type {
+        self.get_subject_for_type(self.subject_name_strategy_type, topic, serde_type, schema)
+            .await
+    }
+
+    #[async_recursion]
+    async fn get_subject_for_type(
+        &self,
+        strategy_type: SubjectNameStrategyType,
+        topic: &str,
+        serde_type: &SerdeType,
+        schema: Option<&Schema>,
+    ) -> Result<Option<String>, SerdeError> {
+        match strategy_type {
             SubjectNameStrategyType::Record => {
                 if let Some(schema) = schema {
                     Ok(Some(self.get_record_name(schema).await?))
@@ -379,7 +393,7 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
                 }
             }
             SubjectNameStrategyType::Associated => {
-                load_associated_subject(
+                match load_associated_subject(
                     self.base.serde.client,
                     &self.serde.subject_cache,
                     &self.base.config.strategy_config,
@@ -387,9 +401,33 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
                     serde_type,
                     schema,
                 )
-                .await
+                .await?
+                {
+                    Some(s) => Ok(Some(s)),
+                    None => {
+                        let fallback_type = self
+                            .base
+                            .config
+                            .strategy_config
+                            .get(FALLBACK_SUBJECT_NAME_STRATEGY_TYPE_CONFIG)
+                            .map(|s| parse_subject_name_strategy_type(s))
+                            .transpose()?
+                            .unwrap_or(SubjectNameStrategyType::Topic);
+                        match fallback_type {
+                            SubjectNameStrategyType::None | SubjectNameStrategyType::Associated => {
+                                Ok(None)
+                            }
+                            other => {
+                                self.get_subject_for_type(other, topic, serde_type, schema)
+                                    .await
+                            }
+                        }
+                    }
+                }
             }
-            _ => Ok(Some(topic_name_strategy(topic, serde_type, schema).unwrap())),
+            _ => Ok(Some(
+                topic_name_strategy(topic, serde_type, schema).unwrap(),
+            )),
         }
     }
 
@@ -465,7 +503,10 @@ impl<'a, T: Client> std::fmt::Debug for ProtobufDeserializer<'a, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProtobufDeserializer")
             .field("serde", &self.serde)
-            .field("subject_name_strategy_type", &self.subject_name_strategy_type)
+            .field(
+                "subject_name_strategy_type",
+                &self.subject_name_strategy_type,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -480,7 +521,10 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
             executor.configure(client.config(), &deserializer_config.rule_config)?;
         }
         Ok(ProtobufDeserializer {
-            base: BaseDeserializer::new(Serde::new(client, rule_registry), deserializer_config.clone()),
+            base: BaseDeserializer::new(
+                Serde::new(client, rule_registry),
+                deserializer_config.clone(),
+            ),
             serde: ProtobufSerde {
                 parsed_schemas: DashMap::new(),
                 subject_cache: DashMap::new(),
@@ -756,7 +800,19 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
         serde_type: &SerdeType,
         schema: Option<&Schema>,
     ) -> Result<Option<String>, SerdeError> {
-        match self.subject_name_strategy_type {
+        self.get_subject_for_type(self.subject_name_strategy_type, topic, serde_type, schema)
+            .await
+    }
+
+    #[async_recursion]
+    async fn get_subject_for_type(
+        &self,
+        strategy_type: SubjectNameStrategyType,
+        topic: &str,
+        serde_type: &SerdeType,
+        schema: Option<&Schema>,
+    ) -> Result<Option<String>, SerdeError> {
+        match strategy_type {
             SubjectNameStrategyType::Record => {
                 if let Some(schema) = schema {
                     Ok(Some(self.get_record_name(schema).await?))
@@ -773,7 +829,7 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
                 }
             }
             SubjectNameStrategyType::Associated => {
-                load_associated_subject(
+                match load_associated_subject(
                     self.base.serde.client,
                     &self.serde.subject_cache,
                     &self.base.config.strategy_config,
@@ -781,9 +837,33 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
                     serde_type,
                     schema,
                 )
-                .await
+                .await?
+                {
+                    Some(s) => Ok(Some(s)),
+                    None => {
+                        let fallback_type = self
+                            .base
+                            .config
+                            .strategy_config
+                            .get(FALLBACK_SUBJECT_NAME_STRATEGY_TYPE_CONFIG)
+                            .map(|s| parse_subject_name_strategy_type(s))
+                            .transpose()?
+                            .unwrap_or(SubjectNameStrategyType::Topic);
+                        match fallback_type {
+                            SubjectNameStrategyType::None | SubjectNameStrategyType::Associated => {
+                                Ok(None)
+                            }
+                            other => {
+                                self.get_subject_for_type(other, topic, serde_type, schema)
+                                    .await
+                            }
+                        }
+                    }
+                }
             }
-            _ => Ok(Some(topic_name_strategy(topic, serde_type, schema).unwrap())),
+            _ => Ok(Some(
+                topic_name_strategy(topic, serde_type, schema).unwrap(),
+            )),
         }
     }
 }
@@ -1435,7 +1515,9 @@ mod tests {
         subject: &str,
         association_type: &str,
     ) -> crate::rest::models::AssociationCreateOrUpdateRequest {
-        use crate::rest::models::{AssociationCreateOrUpdateInfo, AssociationCreateOrUpdateRequest};
+        use crate::rest::models::{
+            AssociationCreateOrUpdateInfo, AssociationCreateOrUpdateRequest,
+        };
         AssociationCreateOrUpdateRequest {
             resource_name: Some("topic1".to_string()),
             resource_namespace: Some("-".to_string()),
@@ -1584,10 +1666,12 @@ mod tests {
         };
         let result = ser.serialize(&ser_ctx, &proto_demo_obj()).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Could not determine subject"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Could not determine subject")
+        );
     }
 
     #[tokio::test]
@@ -1606,11 +1690,19 @@ mod tests {
             .await
             .unwrap();
         client
-            .create_association(&proto_make_association("lkc-123:topic1", "subject1", "value"))
+            .create_association(&proto_make_association(
+                "lkc-123:topic1",
+                "subject1",
+                "value",
+            ))
             .await
             .unwrap();
         client
-            .create_association(&proto_make_association("lkc-456:topic1", "subject2", "value"))
+            .create_association(&proto_make_association(
+                "lkc-456:topic1",
+                "subject2",
+                "value",
+            ))
             .await
             .unwrap();
 
@@ -1638,15 +1730,19 @@ mod tests {
         };
         let result = ser.serialize(&ser_ctx, &proto_demo_obj()).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("multiple associated subjects found"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("multiple associated subjects found")
+        );
     }
 
     #[tokio::test]
     async fn test_protobuf_serde_with_associated_name_strategy_with_kafka_cluster_id() {
-        use crate::rest::models::{AssociationCreateOrUpdateInfo, AssociationCreateOrUpdateRequest};
+        use crate::rest::models::{
+            AssociationCreateOrUpdateInfo, AssociationCreateOrUpdateRequest,
+        };
 
         let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
         let client = MockSchemaRegistryClient::new(client_conf);
