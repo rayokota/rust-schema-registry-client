@@ -232,7 +232,10 @@ impl<'a, T: Client + Sync> AvroSerializer<'a, T> {
     pub async fn get_record_name(&self, schema: &Schema) -> Result<String, SerdeError> {
         let (parsed_schema, _) = self.get_parsed_schema(schema).await?;
         match parsed_schema {
-            apache_avro::Schema::Record(r) => Ok(r.name.name.clone()),
+            apache_avro::Schema::Record(r) => Ok(match &r.name.namespace {
+                Some(ns) => format!("{ns}.{}", r.name.name),
+                None => r.name.name.clone(),
+            }),
             _ => Err(Serialization(
                 "Schema is not an Avro record type".to_string(),
             )),
@@ -579,7 +582,10 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
     pub async fn get_record_name(&self, schema: &Schema) -> Result<String, SerdeError> {
         let (parsed_schema, _) = self.get_parsed_schema(schema).await?;
         match parsed_schema {
-            apache_avro::Schema::Record(r) => Ok(r.name.name.clone()),
+            apache_avro::Schema::Record(r) => Ok(match &r.name.namespace {
+                Some(ns) => format!("{ns}.{}", r.name.name),
+                None => r.name.name.clone(),
+            }),
             _ => Err(Serialization(
                 "Schema is not an Avro record type".to_string(),
             )),

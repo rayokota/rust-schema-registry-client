@@ -352,7 +352,7 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
         file_descriptor
             .messages()
             .next()
-            .map(|m| m.name().to_string())
+            .map(|m| m.full_name().to_string())
             .ok_or_else(|| {
                 Serialization("Could not find message name in protobuf schema".to_string())
             })
@@ -788,7 +788,7 @@ impl<'a, T: Client + Sync> ProtobufDeserializer<'a, T> {
         file_descriptor
             .messages()
             .next()
-            .map(|m| m.name().to_string())
+            .map(|m| m.full_name().to_string())
             .ok_or_else(|| {
                 Serialization("Could not find message name in protobuf schema".to_string())
             })
