@@ -548,9 +548,9 @@ impl<T: Client> AssociatedNameStrategy<T> {
         topic: &str,
         serde_type: &SerdeType,
         schema: Option<&Schema>,
-    ) -> Result<String, SerdeError> {
+    ) -> Result<Option<String>, SerdeError> {
         if topic.is_empty() {
-            return Ok(String::new());
+            return Ok(None);
         }
 
         let is_key = *serde_type == SerdeType::Key;
@@ -564,7 +564,7 @@ impl<T: Client> AssociatedNameStrategy<T> {
 
         // Check cache first
         if let Some(cached) = self.subject_name_cache.get(&cache_key) {
-            return Ok(cached);
+            return Ok(Some(cached));
         }
 
         // Load from schema registry
@@ -572,8 +572,10 @@ impl<T: Client> AssociatedNameStrategy<T> {
             .load_associated_subject_name(topic, is_key, schema, serde_type)
             .await?;
 
-        // Store in cache
-        self.subject_name_cache.insert(cache_key, subject.clone());
+        // Store in cache only when a subject was found
+        if let Some(ref s) = subject {
+            self.subject_name_cache.insert(cache_key, s.clone());
+        }
 
         Ok(subject)
     }
@@ -584,7 +586,7 @@ impl<T: Client> AssociatedNameStrategy<T> {
         is_key: bool,
         schema: Option<&Schema>,
         serde_type: &SerdeType,
-    ) -> Result<String, SerdeError> {
+    ) -> Result<Option<String>, SerdeError> {
         let association_type = if is_key { "key" } else { "value" };
 
         let associations = match self
@@ -615,23 +617,16 @@ impl<T: Client> AssociatedNameStrategy<T> {
                 topic
             )));
         } else if associations.len() == 1 {
-            return associations[0]
-                .subject
-                .clone()
-                .ok_or_else(|| Serialization("association has no subject".to_string()));
+            return Ok(Some(
+                associations[0]
+                    .subject
+                    .clone()
+                    .ok_or_else(|| Serialization("association has no subject".to_string()))?,
+            ));
         } else if let Some(ref fallback) = self.fallback_strategy {
-            return match fallback(topic, serde_type, schema)? {
-                Some(s) => Ok(s),
-                None => Err(Serialization(format!(
-                    "no associated subject found for topic {}",
-                    topic
-                ))),
-            };
+            return fallback(topic, serde_type, schema);
         } else {
-            return Err(Serialization(format!(
-                "no associated subject found for topic {}",
-                topic
-            )));
+            return Ok(None);
         }
     }
 }
@@ -645,7 +640,7 @@ pub(crate) async fn load_associated_subject<T: Client + Sync>(
     topic: &str,
     serde_type: &SerdeType,
     schema: Option<&Schema>,
-) -> Result<String, SerdeError> {
+) -> Result<Option<String>, SerdeError> {
     let kafka_cluster_id = strategy_config
         .get(KAFKA_CLUSTER_ID_CONFIG)
         .filter(|s| !s.is_empty())
@@ -659,7 +654,7 @@ pub(crate) async fn load_associated_subject<T: Client + Sync>(
     let is_key = *serde_type == SerdeType::Key;
     let cache_key = (topic.to_string(), is_key);
     if let Some(cached) = subject_cache.get(&cache_key) {
-        return Ok(cached.clone());
+        return Ok(Some(cached.clone()));
     }
     let association_type = if is_key { "key" } else { "value" };
     let associations = match client
@@ -686,22 +681,21 @@ pub(crate) async fn load_associated_subject<T: Client + Sync>(
             topic
         )));
     } else if associations.len() == 1 {
-        associations[0]
-            .subject
-            .clone()
-            .ok_or_else(|| Serialization("association has no subject".to_string()))?
+        Some(
+            associations[0]
+                .subject
+                .clone()
+                .ok_or_else(|| Serialization("association has no subject".to_string()))?,
+        )
     } else {
         match fallback_type {
-            SubjectNameStrategyType::None => {
-                return Err(Serialization(format!(
-                    "no associated subject found for topic {}",
-                    topic
-                )));
-            }
-            _ => topic_name_strategy(topic, serde_type, schema).unwrap(),
+            SubjectNameStrategyType::None => None,
+            _ => Some(topic_name_strategy(topic, serde_type, schema).unwrap()),
         }
     };
-    subject_cache.insert(cache_key, subject.clone());
+    if let Some(ref s) = subject {
+        subject_cache.insert(cache_key, s.clone());
+    }
     Ok(subject)
 }
 

@@ -257,7 +257,7 @@ impl<'a, T: Client + Sync> AvroSerializer<'a, T> {
                     Ok(None)
                 }
             }
-            SubjectNameStrategyType::Associated => Ok(Some(
+            SubjectNameStrategyType::Associated => {
                 load_associated_subject(
                     self.base.serde.client,
                     &self.serde.subject_cache,
@@ -266,8 +266,8 @@ impl<'a, T: Client + Sync> AvroSerializer<'a, T> {
                     serde_type,
                     schema,
                 )
-                .await?,
-            )),
+                .await
+            }
             _ => Ok(Some(topic_name_strategy(topic, serde_type, schema).unwrap())),
         }
     }
@@ -562,7 +562,7 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
                     Ok(None)
                 }
             }
-            SubjectNameStrategyType::Associated => Ok(Some(
+            SubjectNameStrategyType::Associated => {
                 load_associated_subject(
                     self.base.serde.client,
                     &self.serde.subject_cache,
@@ -571,8 +571,8 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
                     serde_type,
                     schema,
                 )
-                .await?,
-            )),
+                .await
+            }
             _ => Ok(Some(topic_name_strategy(topic, serde_type, schema).unwrap())),
         }
     }
@@ -2403,7 +2403,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("no associated subject found"));
+            .contains("Could not determine subject"));
     }
 
     #[tokio::test]
