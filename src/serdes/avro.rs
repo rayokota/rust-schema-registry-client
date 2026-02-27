@@ -26,7 +26,7 @@ use uuid::Uuid;
 #[derive(Clone, Debug)]
 pub(crate) struct AvroSerde {
     parsed_schemas: DashMap<Schema, (apache_avro::Schema, Vec<apache_avro::Schema>)>,
-    subject_cache: DashMap<SubjectCacheKey, String>,
+    subject_cache: DashMap<SubjectCacheKey, Option<String>>,
 }
 
 #[derive(Clone)]

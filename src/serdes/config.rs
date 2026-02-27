@@ -37,7 +37,7 @@ impl SerializerConfig {
             normalize_schemas,
             validate,
             rule_config,
-            subject_name_strategy_type: SubjectNameStrategyType::Topic,
+            subject_name_strategy_type: SubjectNameStrategyType::Associated,
             strategy_config: HashMap::new(),
             schema_id_serializer: prefix_schema_id_serializer,
         }
@@ -52,7 +52,7 @@ impl Default for SerializerConfig {
             normalize_schemas: false,
             validate: false,
             rule_config: HashMap::new(),
-            subject_name_strategy_type: SubjectNameStrategyType::Topic,
+            subject_name_strategy_type: SubjectNameStrategyType::Associated,
             strategy_config: HashMap::new(),
             schema_id_serializer: prefix_schema_id_serializer,
         }
@@ -79,7 +79,7 @@ impl DeserializerConfig {
             use_schema,
             validate,
             rule_config,
-            subject_name_strategy_type: SubjectNameStrategyType::Topic,
+            subject_name_strategy_type: SubjectNameStrategyType::Associated,
             strategy_config: HashMap::new(),
             schema_id_deserializer: dual_schema_id_deserializer,
         }
@@ -92,7 +92,7 @@ impl Default for DeserializerConfig {
             use_schema: None,
             validate: false,
             rule_config: HashMap::new(),
-            subject_name_strategy_type: SubjectNameStrategyType::Topic,
+            subject_name_strategy_type: SubjectNameStrategyType::Associated,
             strategy_config: HashMap::new(),
             schema_id_deserializer: dual_schema_id_deserializer,
         }

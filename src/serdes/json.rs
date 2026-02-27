@@ -25,7 +25,7 @@ use std::sync::Arc;
 pub(crate) struct JsonSerde {
     parsed_schemas: DashMap<Schema, (Value, Registry)>,
     validators: DashMap<Schema, Arc<Validator>>,
-    subject_cache: DashMap<SubjectCacheKey, String>,
+    subject_cache: DashMap<SubjectCacheKey, Option<String>>,
 }
 
 #[derive(Clone)]

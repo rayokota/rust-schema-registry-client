@@ -435,7 +435,7 @@ pub(crate) struct SubjectCacheKey {
 /// Used by serializers/deserializers when `SubjectNameStrategyType::Associated` is configured.
 pub(crate) async fn load_associated_subject<T: Client + Sync>(
     client: &T,
-    subject_cache: &DashMap<SubjectCacheKey, String>,
+    subject_cache: &DashMap<SubjectCacheKey, Option<String>>,
     strategy_config: &HashMap<String, String>,
     topic: &str,
     serde_type: &SerdeType,
@@ -454,7 +454,7 @@ pub(crate) async fn load_associated_subject<T: Client + Sync>(
         schema: schema_str,
     };
     if let Some(cached) = subject_cache.get(&cache_key) {
-        return Ok(Some(cached.clone()));
+        return Ok(cached.clone());
     }
     let association_type = if is_key { "key" } else { "value" };
     let associations = match client
@@ -490,9 +490,7 @@ pub(crate) async fn load_associated_subject<T: Client + Sync>(
     } else {
         None // No association found — caller handles fallback via get_subject_for_type
     };
-    if let Some(ref s) = subject {
-        subject_cache.insert(cache_key, s.clone());
-    }
+    subject_cache.insert(cache_key, subject.clone());
     Ok(subject)
 }
 

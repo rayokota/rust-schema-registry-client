@@ -38,7 +38,7 @@ pub mod confluent {
 #[derive(Clone, Debug)]
 pub(crate) struct ProtobufSerde {
     parsed_schemas: DashMap<Schema, (FileDescriptor, DescriptorPool)>,
-    subject_cache: DashMap<SubjectCacheKey, String>,
+    subject_cache: DashMap<SubjectCacheKey, Option<String>>,
 }
 
 #[derive(Clone)]
