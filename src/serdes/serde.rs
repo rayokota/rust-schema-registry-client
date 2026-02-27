@@ -393,9 +393,9 @@ pub enum SubjectNameStrategyType {
 }
 
 /// Configuration keys for subject name strategies.
-pub const KAFKA_CLUSTER_ID_CONFIG: &str = "kafka.cluster.id";
+pub const KAFKA_CLUSTER_ID_CONFIG: &str = "subject.name.strategy.kafka.cluster.id";
 pub const NAMESPACE_WILDCARD: &str = "-";
-pub const FALLBACK_SUBJECT_NAME_STRATEGY_TYPE_CONFIG: &str = "fallback.subject.name.strategy.type";
+pub const FALLBACK_TYPE_CONFIG: &str = "subject.name.strategy.fallback.type";
 pub const DEFAULT_CACHE_CAPACITY: u64 = 1000;
 
 /// Parse a string to SubjectNameStrategyType.

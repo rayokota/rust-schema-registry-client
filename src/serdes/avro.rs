@@ -5,11 +5,11 @@ use crate::serdes::config::{DeserializerConfig, SerializerConfig};
 use crate::serdes::rule_registry::RuleRegistry;
 use crate::serdes::serde::SerdeError::Serialization;
 use crate::serdes::serde::{
-    BaseDeserializer, BaseSerializer, FALLBACK_SUBJECT_NAME_STRATEGY_TYPE_CONFIG, FieldTransformer,
-    FieldType, KAFKA_CLUSTER_ID_CONFIG, RuleContext, SchemaId, Serde, SerdeError, SerdeFormat,
-    SerdeSchema, SerdeType, SerdeValue, SerializationContext, SubjectCacheKey,
-    SubjectNameStrategyType, get_executor, get_executors, load_associated_subject,
-    parse_subject_name_strategy_type, topic_name_strategy,
+    BaseDeserializer, BaseSerializer, FALLBACK_TYPE_CONFIG, FieldTransformer, FieldType,
+    KAFKA_CLUSTER_ID_CONFIG, RuleContext, SchemaId, Serde, SerdeError, SerdeFormat, SerdeSchema,
+    SerdeType, SerdeValue, SerializationContext, SubjectCacheKey, SubjectNameStrategyType,
+    get_executor, get_executors, load_associated_subject, parse_subject_name_strategy_type,
+    topic_name_strategy,
 };
 use apache_avro::schema::{Name, RecordField, RecordSchema, UnionSchema};
 use apache_avro::types::Value;
@@ -293,7 +293,7 @@ impl<'a, T: Client + Sync> AvroSerializer<'a, T> {
                             .base
                             .config
                             .strategy_config
-                            .get(FALLBACK_SUBJECT_NAME_STRATEGY_TYPE_CONFIG)
+                            .get(FALLBACK_TYPE_CONFIG)
                             .map(|s| parse_subject_name_strategy_type(s))
                             .transpose()?
                             .unwrap_or(SubjectNameStrategyType::Topic);
@@ -643,7 +643,7 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
                             .base
                             .config
                             .strategy_config
-                            .get(FALLBACK_SUBJECT_NAME_STRATEGY_TYPE_CONFIG)
+                            .get(FALLBACK_TYPE_CONFIG)
                             .map(|s| parse_subject_name_strategy_type(s))
                             .transpose()?
                             .unwrap_or(SubjectNameStrategyType::Topic);
@@ -2486,10 +2486,8 @@ mod tests {
             HashMap::new(),
         );
         ser_conf.subject_name_strategy_type = SubjectNameStrategyType::Associated;
-        ser_conf.strategy_config = HashMap::from([(
-            FALLBACK_SUBJECT_NAME_STRATEGY_TYPE_CONFIG.to_string(),
-            "NONE".to_string(),
-        )]);
+        ser_conf.strategy_config =
+            HashMap::from([(FALLBACK_TYPE_CONFIG.to_string(), "NONE".to_string())]);
         let ser =
             AvroSerializer::new(&client, None, Some(rule_registry.clone()), ser_conf).unwrap();
         let ser_ctx = SerializationContext {
