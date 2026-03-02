@@ -49,14 +49,14 @@ hex = { version = "0.4.3", optional = true }
 hostname-validator = { version ="1.1.1", optional = true }
 integer-encoding = "4.0.2"
 jsonata-rs = { version = "0.3.4", optional = true }
-jsonschema = "0.30.0"
+jsonschema = "0.44.0"
 lazy_static = "1.5.0"
 log = "0.4.27"
 mini-moka = "0.10.3"
 prost = "0.13.5"
 prost-reflect = { version = "0.15.3", features = ["derive", "serde"] }
 prost-types = "0.13.5"
-referencing = "0.30.0"
+referencing = "0.44.0"
 regex = "1.11.1"
 reqwest = { version = "0.13", features = ["json", "query", "multipart"] }
 serde = { version = "1.0", features = ["derive"] }

@@ -16,7 +16,7 @@ use base64::Engine;
 use dashmap::DashMap;
 use futures::future::FutureExt;
 use jsonschema::{ValidationError, Validator, validator_for};
-use referencing::{Draft, Registry, Resolver, Resource};
+use referencing::{Draft, Registry, Resolver, Resource, ResourceRef};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -324,11 +324,11 @@ async fn transform_fields(
     if let Some(SerdeSchema::Json((s, ref_registry))) = ctx.parsed_target.clone()
         && let SerdeValue::Json(v) = value
     {
-        let root_resource = Resource::from_contents(s.clone())?;
-        let base_uri = root_resource.id().unwrap_or("").to_string();
+        let root_resource_ref = ResourceRef::from_contents(&s);
+        let base_uri = root_resource_ref.id().unwrap_or("").to_string();
         let ref_registry = ref_registry
             .clone()
-            .try_with_resource(base_uri.clone(), root_resource)?;
+            .try_with_resource(base_uri.clone(), Resource::from_contents(s.clone()))?;
         let ref_resolver = ref_registry.try_resolver(&base_uri)?;
         let value = transform(ctx, &s, &ref_registry, &ref_resolver, "$", v).await?;
         return Ok(SerdeValue::Json(value));
@@ -674,7 +674,7 @@ where
                     .await?;
             let ref_schema_val: Value =
                 serde_json::from_str(&ref_schema.schema.clone().unwrap_or_default())?;
-            let resource = Resource::from_contents(ref_schema_val.clone())?;
+            let resource = Resource::from_contents(ref_schema_val.clone());
             resources.push((r.name.clone().unwrap_or_default(), resource));
         }
         // TODO fix draft default?
