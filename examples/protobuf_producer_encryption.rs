@@ -103,6 +103,7 @@ message Pizza {
         migration_rules: None,
         domain_rules: Some(vec![rule]),
         encoding_rules: None,
+        enable_at: None,
     };
     let schema = Schema {
         schema_type: Some("PROTOBUF".to_string()),

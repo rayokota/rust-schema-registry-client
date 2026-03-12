@@ -1301,6 +1301,7 @@ mod tests {
             migration_rules: None,
             domain_rules: Some(vec![rule]),
             encoding_rules: None,
+            enable_at: None,
         };
         let schema = Schema {
             schema_type: Some("AVRO".to_string()),
@@ -1396,6 +1397,7 @@ mod tests {
             migration_rules: None,
             domain_rules: Some(vec![rule]),
             encoding_rules: None,
+            enable_at: None,
         };
         let schema = Schema {
             schema_type: Some("AVRO".to_string()),
@@ -1540,6 +1542,7 @@ mod tests {
             migration_rules: Some(vec![rule1]),
             domain_rules: Some(vec![rule2]),
             encoding_rules: None,
+            enable_at: None,
         };
         let metadata = Metadata {
             tags: None,
@@ -1664,6 +1667,7 @@ mod tests {
             migration_rules: None,
             domain_rules: Some(vec![rule]),
             encoding_rules: None,
+            enable_at: None,
         };
         let schema = Schema {
             schema_type: Some("AVRO".to_string()),
@@ -1767,6 +1771,7 @@ mod tests {
             migration_rules: None,
             domain_rules: None,
             encoding_rules: Some(vec![rule]),
+            enable_at: None,
         };
         let schema = Schema {
             schema_type: Some("AVRO".to_string()),
@@ -1859,6 +1864,7 @@ mod tests {
             migration_rules: None,
             domain_rules: Some(vec![rule]),
             encoding_rules: None,
+            enable_at: None,
         };
         let schema = Schema {
             schema_type: Some("AVRO".to_string()),
@@ -1969,6 +1975,7 @@ mod tests {
             migration_rules: None,
             domain_rules: Some(vec![rule]),
             encoding_rules: None,
+            enable_at: None,
         };
         let schema = Schema {
             schema_type: Some("AVRO".to_string()),
@@ -2078,6 +2085,7 @@ mod tests {
             migration_rules: None,
             domain_rules: Some(vec![rule]),
             encoding_rules: None,
+            enable_at: None,
         };
         let schema = Schema {
             schema_type: Some("AVRO".to_string()),
