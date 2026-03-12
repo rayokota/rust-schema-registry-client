@@ -650,14 +650,26 @@ impl<'a, T: Client> Serde<'a, T> {
         msg: &SerdeValue,
         field_transformer: Option<Arc<FieldTransformer>>,
     ) -> Result<SerdeValue, SerdeError> {
+        let mut enabled_env: Option<String> = None;
         let mut rules: Vec<Rule>;
         match rule_mode {
-            Upgrade => rules = self.get_migration_rules(target),
+            Upgrade => {
+                enabled_env = target
+                    .and_then(|t| t.rule_set.as_ref())
+                    .and_then(|rs| rs.enable_at.clone());
+                rules = self.get_migration_rules(target);
+            }
             Downgrade => {
+                enabled_env = source
+                    .and_then(|s| s.rule_set.as_ref())
+                    .and_then(|rs| rs.enable_at.clone());
                 rules = self.get_migration_rules(source);
                 rules.reverse()
             }
             _ => {
+                enabled_env = target
+                    .and_then(|t| t.rule_set.as_ref())
+                    .and_then(|rs| rs.enable_at.clone());
                 rules = if rule_phase == Phase::Encoding {
                     self.get_encoding_rules(target)
                 } else {
@@ -675,7 +687,21 @@ impl<'a, T: Client> Serde<'a, T> {
 
         let mut msg = msg.clone();
         for (index, rule) in rules.iter().enumerate() {
-            if self.is_disabled(rule) {
+            let mut ctx = RuleContext::new(
+                enabled_env.clone(),
+                ser_ctx.clone(),
+                source.cloned(),
+                target.cloned(),
+                parsed_target.cloned(),
+                subject.to_string(),
+                rule_mode,
+                rule.clone(),
+                index,
+                rules.clone(),
+                field_transformer.clone(),
+                self.rule_registry.clone(),
+            );
+            if self.is_disabled(&ctx, rule) {
                 continue;
             }
             let mode = rule.mode.unwrap_or_default();
@@ -696,19 +722,6 @@ impl<'a, T: Client> Serde<'a, T> {
                     }
                 }
             }
-            let mut ctx = RuleContext::new(
-                ser_ctx.clone(),
-                source.cloned(),
-                target.cloned(),
-                parsed_target.cloned(),
-                subject.to_string(),
-                rule_mode,
-                rule.clone(),
-                index,
-                rules.clone(),
-                field_transformer.clone(),
-                self.rule_registry.clone(),
-            );
             let executor = get_executor(self.rule_registry.as_ref(), &rule.r#type);
             if executor.is_none() {
                 self.run_action(
@@ -806,10 +819,17 @@ impl<'a, T: Client> Serde<'a, T> {
             .or(rule.on_failure.clone())
     }
 
-    fn is_disabled(&self, rule: &Rule) -> bool {
-        get_override(self.rule_registry.as_ref(), &rule.r#type)
-            .and_then(|rule_override| rule_override.disabled)
-            .unwrap_or(false)
+    fn is_disabled(&self, ctx: &RuleContext, rule: &Rule) -> bool {
+        let override_disabled = get_override(self.rule_registry.as_ref(), &rule.r#type)
+            .and_then(|rule_override| rule_override.disabled);
+        if let Some(disabled) = override_disabled {
+            return disabled;
+        }
+        let enabled_env = ctx.enabled_env.as_deref().unwrap_or("ALL");
+        if enabled_env != "ALL" && enabled_env != "CLIENT" {
+            return true;
+        }
+        false
     }
 
     async fn run_action(
@@ -1303,6 +1323,7 @@ impl FieldContext {
 }
 
 pub struct RuleContext {
+    pub enabled_env: Option<String>,
     pub ser_ctx: SerializationContext,
     pub source: Option<Schema>,
     pub target: Option<Schema>,
@@ -1319,6 +1340,7 @@ pub struct RuleContext {
 
 impl RuleContext {
     pub fn new(
+        enabled_env: Option<String>,
         ser_ctx: SerializationContext,
         source: Option<Schema>,
         target: Option<Schema>,
@@ -1332,6 +1354,7 @@ impl RuleContext {
         rule_registry: Option<RuleRegistry>,
     ) -> RuleContext {
         RuleContext {
+            enabled_env,
             ser_ctx,
             source,
             target,

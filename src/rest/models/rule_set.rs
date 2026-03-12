@@ -10,6 +10,8 @@ pub struct RuleSet {
     pub domain_rules: Option<Vec<models::Rule>>,
     #[serde(rename = "encodingRules", skip_serializing_if = "Option::is_none")]
     pub encoding_rules: Option<Vec<models::Rule>>,
+    #[serde(rename = "enableAt", skip_serializing_if = "Option::is_none")]
+    pub enable_at: Option<String>,
 }
 
 impl RuleSet {
@@ -19,6 +21,7 @@ impl RuleSet {
             migration_rules: None,
             domain_rules: None,
             encoding_rules: None,
+            enable_at: None,
         }
     }
 }
