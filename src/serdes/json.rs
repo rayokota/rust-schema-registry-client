@@ -693,20 +693,81 @@ async fn transform(
     message: &Value,
 ) -> Result<Value, SerdeError> {
     if let Value::Object(map) = schema {
-        if let Some(Value::Array(subschemas)) = map.get("allOf")
-            && let Some(subschema) = validate_subschemas(subschemas, message, ref_registry)
-        {
-            return transform(ctx, subschema, ref_registry, ref_resolver, path, message).await;
-        }
-        if let Some(Value::Array(subschemas)) = map.get("anyOf")
-            && let Some(subschema) = validate_subschemas(subschemas, message, ref_registry)
-        {
-            return transform(ctx, subschema, ref_registry, ref_resolver, path, message).await;
-        }
-        if let Some(Value::Array(subschemas)) = map.get("oneOf")
-            && let Some(subschema) = validate_subschemas(subschemas, message, ref_registry)
-        {
-            return transform(ctx, subschema, ref_registry, ref_resolver, path, message).await;
+        let all_of = map.get("allOf").and_then(|v| {
+            if let Value::Array(a) = v {
+                Some(a)
+            } else {
+                None
+            }
+        });
+        let any_of = map.get("anyOf").and_then(|v| {
+            if let Value::Array(a) = v {
+                Some(a)
+            } else {
+                None
+            }
+        });
+        let one_of = map.get("oneOf").and_then(|v| {
+            if let Value::Array(a) = v {
+                Some(a)
+            } else {
+                None
+            }
+        });
+        if all_of.is_some() || any_of.is_some() || one_of.is_some() {
+            let mut current = message.clone();
+            if let Some(subschemas) = all_of {
+                for subschema in subschemas {
+                    current = transform(ctx, subschema, ref_registry, ref_resolver, path, &current)
+                        .await?;
+                }
+            } else if let Some(subschemas) = one_of {
+                for subschema in subschemas {
+                    if validate_subschema(subschema, &current, ref_registry) {
+                        current =
+                            transform(ctx, subschema, ref_registry, ref_resolver, path, &current)
+                                .await?;
+                        break;
+                    }
+                }
+            } else if let Some(subschemas) = any_of {
+                for subschema in subschemas {
+                    if validate_subschema(subschema, &current, ref_registry) {
+                        current =
+                            transform(ctx, subschema, ref_registry, ref_resolver, path, &current)
+                                .await?;
+                    }
+                }
+            }
+            // Also visit sibling properties/items at this level
+            // (siblings to allOf/anyOf/oneOf).
+            if let Some(Value::Object(props)) = map.get("properties")
+                && let Value::Object(message_obj) = &current
+            {
+                let mut new_message = message_obj.clone();
+                for (prop_name, prop_schema) in props {
+                    let new_value = transform_field_with_ctx(
+                        ctx,
+                        path,
+                        prop_name,
+                        &new_message,
+                        prop_schema,
+                        ref_registry,
+                        ref_resolver,
+                    )
+                    .await?;
+                    if let Some(new_value) = new_value {
+                        new_message.insert(prop_name.clone(), new_value);
+                    }
+                }
+                current = Value::Object(new_message);
+            }
+            if let Some(items) = map.get("items")
+                && let Value::Array(_) = &current
+            {
+                current = transform(ctx, items, ref_registry, ref_resolver, path, &current).await?;
+            }
+            return Ok(current);
         }
         if let Some(items) = map.get("items")
             && let Value::Array(_) = message
@@ -723,13 +784,13 @@ async fn transform(
             && let Some(Value::Object(props)) = map.get("properties")
             && let Value::Object(message) = message
         {
-            let mut new_message = serde_json::Map::new();
+            let mut new_message = message.clone();
             for (prop_name, prop_schema) in props {
                 let new_value = transform_field_with_ctx(
                     ctx,
                     path,
                     prop_name,
-                    message,
+                    &new_message,
                     prop_schema,
                     ref_registry,
                     ref_resolver,
@@ -811,21 +872,15 @@ async fn transform_field_with_ctx(
     Ok(None)
 }
 
-fn validate_subschemas<'a>(
-    subschemas: &'a [Value],
-    message: &Value,
-    ref_registry: &Registry,
-) -> Option<&'a Value> {
-    subschemas.iter().find(|&subschema| {
-        let validator = jsonschema::options()
-            .with_registry(ref_registry.clone())
-            .build(subschema);
-        if let Ok(validator) = validator {
-            validator.validate(message).is_ok()
-        } else {
-            false
-        }
-    })
+fn validate_subschema(subschema: &Value, message: &Value, ref_registry: &Registry) -> bool {
+    let validator = jsonschema::options()
+        .with_registry(ref_registry.clone())
+        .build(subschema);
+    if let Ok(validator) = validator {
+        validator.validate(message).is_ok()
+    } else {
+        false
+    }
 }
 
 fn get_type(schema: &Value) -> FieldType {
@@ -1487,6 +1542,302 @@ mod tests {
         obj = serde_json::from_str(obj_str).unwrap();
         let obj2 = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
         assert_eq!(obj2, obj);
+    }
+
+    #[tokio::test]
+    async fn test_cel_field_transform_all_of() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            true,
+            true,
+            HashMap::new(),
+        );
+        let schema_str = r#"
+        {
+            "type": "object",
+            "properties": {
+                "pins": {
+                    "type": "object",
+                    "allOf": [
+                        {
+                            "properties": {
+                                "pin": {
+                                    "confluent:tags": ["PII"],
+                                    "type": ["string", "null"]
+                                }
+                            }
+                        },
+                        {
+                            "properties": {
+                                "npin": {
+                                    "confluent:tags": ["PII"],
+                                    "type": ["string", "null"]
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+        "#;
+        let rule = Rule {
+            name: "test-cel".to_string(),
+            doc: None,
+            kind: Some(Kind::Transform),
+            mode: Some(Mode::Write),
+            r#type: "CEL_FIELD".to_string(),
+            tags: Some(vec!["PII".to_string()]),
+            params: None,
+            expr: Some("value + '-suffix'".to_string()),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let rule_set = RuleSet {
+            migration_rules: None,
+            domain_rules: Some(vec![rule]),
+            encoding_rules: None,
+            enable_at: None,
+        };
+        let schema = Schema {
+            schema_type: Some("JSON".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(rule_set)),
+            schema: schema_str.to_string(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+        let obj_str = r#"
+        { "pins": { "pin": "P123456789", "npin": "NP00012345678" } }
+        "#;
+        let obj: Value = serde_json::from_str(obj_str).unwrap();
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(CelFieldExecutor::new());
+        let ser =
+            JsonSerializer::new(&client, None, Some(rule_registry.clone()), ser_conf).unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Json,
+            headers: None,
+        };
+        let bytes = ser.serialize(&ser_ctx, obj).await.unwrap();
+
+        let deser = JsonDeserializer::new(
+            &client,
+            Some(rule_registry.clone()),
+            DeserializerConfig::default(),
+        )
+        .unwrap();
+
+        let expected_str = r#"
+        { "pins": { "pin": "P123456789-suffix", "npin": "NP00012345678-suffix" } }
+        "#;
+        let expected: Value = serde_json::from_str(expected_str).unwrap();
+        let obj2 = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        assert_eq!(obj2, expected);
+    }
+
+    #[tokio::test]
+    async fn test_cel_field_transform_nested_any_of() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            true,
+            true,
+            HashMap::new(),
+        );
+        let schema_str = r#"
+        {
+            "type": "object",
+            "properties": {
+                "pins": {
+                    "type": "object",
+                    "anyOf": [
+                        {
+                            "properties": {
+                                "pin": {
+                                    "confluent:tags": ["PII"],
+                                    "type": ["string", "null"]
+                                }
+                            }
+                        },
+                        {
+                            "properties": {
+                                "npin": {
+                                    "confluent:tags": ["PII"],
+                                    "type": ["string", "null"]
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+        "#;
+        let rule = Rule {
+            name: "test-cel".to_string(),
+            doc: None,
+            kind: Some(Kind::Transform),
+            mode: Some(Mode::Write),
+            r#type: "CEL_FIELD".to_string(),
+            tags: Some(vec!["PII".to_string()]),
+            params: None,
+            expr: Some("value + '-suffix'".to_string()),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let rule_set = RuleSet {
+            migration_rules: None,
+            domain_rules: Some(vec![rule]),
+            encoding_rules: None,
+            enable_at: None,
+        };
+        let schema = Schema {
+            schema_type: Some("JSON".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(rule_set)),
+            schema: schema_str.to_string(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+        let obj_str = r#"
+        { "pins": { "pin": "P123456789", "npin": "NP00012345678" } }
+        "#;
+        let obj: Value = serde_json::from_str(obj_str).unwrap();
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(CelFieldExecutor::new());
+        let ser =
+            JsonSerializer::new(&client, None, Some(rule_registry.clone()), ser_conf).unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Json,
+            headers: None,
+        };
+        let bytes = ser.serialize(&ser_ctx, obj).await.unwrap();
+
+        let deser = JsonDeserializer::new(
+            &client,
+            Some(rule_registry.clone()),
+            DeserializerConfig::default(),
+        )
+        .unwrap();
+
+        let expected_str = r#"
+        { "pins": { "pin": "P123456789-suffix", "npin": "NP00012345678-suffix" } }
+        "#;
+        let expected: Value = serde_json::from_str(expected_str).unwrap();
+        let obj2 = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        assert_eq!(obj2, expected);
+    }
+
+    #[tokio::test]
+    async fn test_cel_field_transform_sibling_any_of() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            true,
+            true,
+            HashMap::new(),
+        );
+        let schema_str = r#"
+        {
+            "type": "object",
+            "properties": {
+                "pins": {
+                    "type": "object",
+                    "anyOf": [
+                        { "required": ["pin"] },
+                        { "required": ["npin"] }
+                    ],
+                    "properties": {
+                        "pin": {
+                            "confluent:tags": ["PII"],
+                            "type": ["string", "null"]
+                        },
+                        "npin": {
+                            "confluent:tags": ["PII"],
+                            "type": ["string", "null"]
+                        }
+                    }
+                }
+            }
+        }
+        "#;
+        let rule = Rule {
+            name: "test-cel".to_string(),
+            doc: None,
+            kind: Some(Kind::Transform),
+            mode: Some(Mode::Write),
+            r#type: "CEL_FIELD".to_string(),
+            tags: Some(vec!["PII".to_string()]),
+            params: None,
+            expr: Some("value + '-suffix'".to_string()),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let rule_set = RuleSet {
+            migration_rules: None,
+            domain_rules: Some(vec![rule]),
+            encoding_rules: None,
+            enable_at: None,
+        };
+        let schema = Schema {
+            schema_type: Some("JSON".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(rule_set)),
+            schema: schema_str.to_string(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+        let obj_str = r#"
+        { "pins": { "pin": "P123456789", "npin": "NP00012345678" } }
+        "#;
+        let obj: Value = serde_json::from_str(obj_str).unwrap();
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(CelFieldExecutor::new());
+        let ser =
+            JsonSerializer::new(&client, None, Some(rule_registry.clone()), ser_conf).unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Json,
+            headers: None,
+        };
+        let bytes = ser.serialize(&ser_ctx, obj).await.unwrap();
+
+        let deser = JsonDeserializer::new(
+            &client,
+            Some(rule_registry.clone()),
+            DeserializerConfig::default(),
+        )
+        .unwrap();
+
+        let expected_str = r#"
+        { "pins": { "pin": "P123456789-suffix", "npin": "NP00012345678-suffix" } }
+        "#;
+        let expected: Value = serde_json::from_str(expected_str).unwrap();
+        let obj2 = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        assert_eq!(obj2, expected);
     }
 
     #[tokio::test]
