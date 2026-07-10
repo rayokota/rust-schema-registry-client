@@ -816,7 +816,13 @@ impl<T: Client> EncryptionExecutorTransform<'_, T> {
         kek: &Kek,
     ) -> Result<Box<dyn Aead>, SerdeError> {
         let kek_url = kek.kms_type.clone() + "://" + &kek.kms_key_id;
-        let kms_client = self.get_kms_client(config, &kek_url)?;
+        // Merge the kek's kms_props (e.g. encrypt.azure.key.version.save) into a copy of the
+        // executor-level config, so KMS-specific per-kek settings reach new_kms_client/get_aead.
+        let mut aead_config = config.clone();
+        if let Some(kms_props) = &kek.kms_props {
+            aead_config.extend(kms_props.clone());
+        }
+        let kms_client = self.get_kms_client(&aead_config, &kek_url)?;
         let aead = kms_client.get_aead(&kek_url)?;
         Ok(aead)
     }

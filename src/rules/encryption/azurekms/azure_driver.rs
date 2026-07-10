@@ -13,6 +13,12 @@ const TENANT_ID: &str = "tenant.id";
 const CLIENT_ID: &str = "client.id";
 const CLIENT_SECRET: &str = "client.secret";
 
+/// Enables making a DEK's encrypted key material self-describing with respect to which exact
+/// Azure Key Vault key version wrapped it (see `AzureAead::encrypt`), matching the same
+/// self-description property AWS KMS and GCP KMS ciphertext already provide natively. Set as a
+/// kek `kms_props` entry.
+pub const ENCRYPT_AZURE_KEY_VERSION_SAVE: &str = "encrypt.azure.key.version.save";
+
 pub struct AzureKmsDriver {}
 
 impl Default for AzureKmsDriver {
@@ -63,10 +69,15 @@ impl KmsDriver for AzureKmsDriver {
                 TokenCredentialOptions::default(),
             )?)
         };
+        let save_version = conf
+            .get(ENCRYPT_AZURE_KEY_VERSION_SAVE)
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         Ok(Arc::new(AzureClient::new(
             key_url,
             creds,
             DEFAULT_ALGORITHM,
+            save_version,
         )?))
     }
 }

@@ -1,7 +1,10 @@
+use crate::rules::encryption::azurekms::azure_aead;
 use crate::rules::encryption::azurekms::azure_aead::AzureAead;
+use crate::rules::encryption::azurekms::azure_driver::ENCRYPT_AZURE_KEY_VERSION_SAVE;
 use azure_core::auth::TokenCredential;
 use azure_security_keyvault::prelude::EncryptionAlgorithm::RsaOaep256;
 use azure_security_keyvault::prelude::{CryptographParamtersEncryption, RsaEncryptionParameters};
+use log::warn;
 use std::sync::Arc;
 use tink_core::TinkError;
 
@@ -18,6 +21,7 @@ pub struct AzureClient {
     key_uri_prefix: String,
     creds: Arc<dyn TokenCredential>,
     algorithm: CryptographParamtersEncryption,
+    save_version: bool,
 }
 
 impl std::fmt::Debug for AzureClient {
@@ -33,11 +37,13 @@ impl AzureClient {
         uri_prefix: &str,
         creds: Arc<dyn TokenCredential>,
         algorithm: CryptographParamtersEncryption,
+        save_version: bool,
     ) -> Result<AzureClient, TinkError> {
         Ok(AzureClient {
             key_uri_prefix: uri_prefix.to_string(),
             creds,
             algorithm,
+            save_version,
         })
     }
 }
@@ -61,10 +67,18 @@ impl tink_core::registry::KmsClient for AzureClient {
         } else {
             key_uri
         };
+        if !self.save_version && azure_aead::is_versionless(uri).unwrap_or(false) {
+            warn!(
+                "Azure Key Vault key '{uri}' is versionless and {ENCRYPT_AZURE_KEY_VERSION_SAVE} \
+                 is not enabled; DEKs wrapped with it may become undecryptable after the key is \
+                 rotated."
+            );
+        }
         Ok(Box::new(AzureAead::new(
             uri,
             self.creds.clone(),
             self.algorithm.clone(),
+            self.save_version,
         )?))
     }
 }
