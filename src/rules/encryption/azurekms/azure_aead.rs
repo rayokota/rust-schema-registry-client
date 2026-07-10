@@ -71,18 +71,28 @@ impl AzureAead {
                 .map_err(|e| wrap_err("failed to encrypt", e));
         }
 
-        // Resolve the currently latest key version and use it to prefix the ciphertext.
-        let key = self
-            .kms
-            .get(self.key_name.clone())
-            .into_future()
-            .await
-            .map_err(|e| wrap_err("failed to resolve current Azure Key Vault key version", e))?;
-        let resolved_id = key
-            .key
-            .id
-            .ok_or_else(|| TinkError::new("resolved Azure Key Vault key is missing an id"))?;
-        let version = resolved_id.rsplit('/').next().unwrap_or_default().to_string();
+        // If the kek's key URI already pins an explicit version, respect it as-is and don't
+        // resolve "current" -- resolving "latest" here would silently substitute a different key
+        // version than the one the user explicitly configured, and would only matter for a
+        // versionless key URI in the first place (a pinned version never "rotates" from this
+        // caller's perspective).
+        let version = if let Some(version) = self.key_version.clone() {
+            version
+        } else {
+            let key = self
+                .kms
+                .get(self.key_name.clone())
+                .into_future()
+                .await
+                .map_err(|e| {
+                    wrap_err("failed to resolve current Azure Key Vault key version", e)
+                })?;
+            let resolved_id = key
+                .key
+                .id
+                .ok_or_else(|| TinkError::new("resolved Azure Key Vault key is missing an id"))?;
+            resolved_id.rsplit('/').next().unwrap_or_default().to_string()
+        };
         if !is_valid_version(&version) {
             // Mirrors decrypt's own validation: a DEK this method wraps must always be one this
             // same type can later unwrap.
@@ -256,8 +266,9 @@ fn extract_version(ciphertext: &[u8]) -> Option<String> {
     {
         return None;
     }
-    String::from_utf8(ciphertext[VERSION_PREFIX.len()..VERSION_PREFIX.len() + VERSION_LENGTH].to_vec())
+    std::str::from_utf8(&ciphertext[VERSION_PREFIX.len()..VERSION_PREFIX.len() + VERSION_LENGTH])
         .ok()
+        .map(|s| s.to_owned())
 }
 
 #[cfg(test)]
