@@ -91,7 +91,11 @@ impl AzureAead {
                 .key
                 .id
                 .ok_or_else(|| TinkError::new("resolved Azure Key Vault key is missing an id"))?;
-            resolved_id.rsplit('/').next().unwrap_or_default().to_string()
+            resolved_id
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string()
         };
         if !is_valid_version(&version) {
             // Mirrors decrypt's own validation: a DEK this method wraps must always be one this
@@ -133,10 +137,10 @@ impl AzureAead {
                     // The encrypted key material is unauthenticated at this layer, so a
                     // corrupted or tampered value could otherwise smuggle arbitrary characters
                     // (e.g. '/') into the key version passed to the Azure SDK below.
-                    return Err(
-                        format!("ciphertext carries an invalid azure:v1: key version: '{v}'")
-                            .into(),
-                    );
+                    return Err(format!(
+                        "ciphertext carries an invalid azure:v1: key version: '{v}'"
+                    )
+                    .into());
                 }
                 (ciphertext[HEADER_LENGTH..].to_vec(), Some(v))
             }
@@ -300,7 +304,10 @@ mod tests {
     #[test]
     fn extract_version_returns_embedded_version_for_prefixed_ciphertext() {
         let ciphertext = format!("azure:v1:{VERSION_A}:wrapped-bytes");
-        assert_eq!(Some(VERSION_A.to_string()), extract_version(ciphertext.as_bytes()));
+        assert_eq!(
+            Some(VERSION_A.to_string()),
+            extract_version(ciphertext.as_bytes())
+        );
     }
 
     #[test]
@@ -322,8 +329,10 @@ mod tests {
 
     #[test]
     fn get_key_info_parses_versioned_id() {
-        let (vault_url, key_name, key_version) =
-            get_key_info(&format!("https://vault.vault.azure.net/keys/key1/{VERSION_A}")).unwrap();
+        let (vault_url, key_name, key_version) = get_key_info(&format!(
+            "https://vault.vault.azure.net/keys/key1/{VERSION_A}"
+        ))
+        .unwrap();
         assert_eq!("https://vault.vault.azure.net", vault_url);
         assert_eq!("key1", key_name);
         assert_eq!(Some(VERSION_A.to_string()), key_version);
@@ -331,8 +340,7 @@ mod tests {
 
     #[test]
     fn get_key_info_parses_versionless_id() {
-        let (_, _, key_version) =
-            get_key_info("https://vault.vault.azure.net/keys/key1").unwrap();
+        let (_, _, key_version) = get_key_info("https://vault.vault.azure.net/keys/key1").unwrap();
         assert_eq!(None, key_version);
     }
 
@@ -349,8 +357,10 @@ mod tests {
     #[test]
     fn is_versionless_false_for_versioned_id() {
         assert!(
-            !is_versionless(&format!("https://vault.vault.azure.net/keys/key1/{VERSION_A}"))
-                .unwrap()
+            !is_versionless(&format!(
+                "https://vault.vault.azure.net/keys/key1/{VERSION_A}"
+            ))
+            .unwrap()
         );
     }
 }
