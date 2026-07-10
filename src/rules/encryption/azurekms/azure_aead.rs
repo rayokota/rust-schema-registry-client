@@ -4,21 +4,34 @@ use azure_security_keyvault::prelude::{
     CryptographParamtersEncryption, DecryptParameters, EncryptParameters,
 };
 use log::error;
-use std::future::IntoFuture;
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, mpsc};
-use std::{cell::RefCell, rc::Rc};
 use tink_core::TinkError;
 use tink_core::utils::wrap_err;
 use url::Url;
 
+const VERSION_PREFIX: &[u8] = b"azure:v1:";
+const VERSION_LENGTH: usize = 32;
+// +1 for the ':' separating the version from the raw ciphertext bytes.
+const HEADER_LENGTH: usize = VERSION_PREFIX.len() + VERSION_LENGTH + 1;
+
 /// `AzureAead` represents a Azure KMS service to a particular URI.
+///
+/// Unlike AWS KMS and GCP KMS, Azure Key Vault wrap/unwrap operations are scoped to an explicit
+/// key version and do not embed that version in the ciphertext. When `save_version` is enabled
+/// (see `azure_driver::ENCRYPT_AZURE_KEY_VERSION_SAVE`), `encrypt` makes its output
+/// self-describing by prepending the exact version that produced it:
+/// `azure:v1:<32-character key version>:<raw ciphertext bytes>`.
+///
+/// `decrypt` always checks for this prefix regardless of the current `save_version` value, since
+/// a DEK wrapped while the toggle was on must remain decryptable even after it is turned back off.
 #[derive(Clone)]
 pub struct AzureAead {
     kms: KeyClient,
     key_name: String,
     key_version: Option<String>,
     algorithm: CryptographParamtersEncryption,
+    save_version: bool,
 }
 
 impl AzureAead {
@@ -27,6 +40,7 @@ impl AzureAead {
         key_url: &str,
         creds: Arc<dyn TokenCredential>,
         algorithm: CryptographParamtersEncryption,
+        save_version: bool,
     ) -> Result<AzureAead, TinkError> {
         let (vault_url, key_name, key_version) = get_key_info(key_url)?;
         let kms = KeyClient::new(&vault_url, creds)
@@ -36,35 +50,124 @@ impl AzureAead {
             key_name,
             key_version,
             algorithm,
+            save_version,
         })
+    }
+
+    async fn encrypt_inner(&self, plaintext: Vec<u8>) -> Result<Vec<u8>, TinkError> {
+        if !self.save_version {
+            let params = EncryptParameters {
+                encrypt_parameters_encryption: self.algorithm.clone(),
+                plaintext,
+            };
+            let mut req = self.kms.encrypt(self.key_name.clone(), params);
+            if let Some(version) = self.key_version.clone() {
+                req = req.version(version);
+            }
+            return req
+                .into_future()
+                .await
+                .map(|r| r.result)
+                .map_err(|e| wrap_err("failed to encrypt", e));
+        }
+
+        // If the kek's key URI already pins an explicit version, respect it as-is and don't
+        // resolve "current" -- resolving "latest" here would silently substitute a different key
+        // version than the one the user explicitly configured, and would only matter for a
+        // versionless key URI in the first place (a pinned version never "rotates" from this
+        // caller's perspective).
+        let version = if let Some(version) = self.key_version.clone() {
+            version
+        } else {
+            let key = self
+                .kms
+                .get(self.key_name.clone())
+                .into_future()
+                .await
+                .map_err(|e| {
+                    wrap_err("failed to resolve current Azure Key Vault key version", e)
+                })?;
+            let resolved_id = key
+                .key
+                .id
+                .ok_or_else(|| TinkError::new("resolved Azure Key Vault key is missing an id"))?;
+            resolved_id
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        };
+        if !is_valid_version(&version) {
+            // Mirrors decrypt's own validation: a DEK this method wraps must always be one this
+            // same type can later unwrap.
+            return Err(format!(
+                "kms key version '{version}' must be a {VERSION_LENGTH}-character hex string; \
+                 cannot be embedded in a fixed-width azure:v1: prefix"
+            )
+            .into());
+        }
+
+        let params = EncryptParameters {
+            encrypt_parameters_encryption: self.algorithm.clone(),
+            plaintext,
+        };
+        let ciphertext = self
+            .kms
+            .encrypt(self.key_name.clone(), params)
+            .version(version.clone())
+            .into_future()
+            .await
+            .map(|r| r.result)
+            .map_err(|e| wrap_err("failed to encrypt", e))?;
+
+        let mut output =
+            Vec::with_capacity(VERSION_PREFIX.len() + version.len() + 1 + ciphertext.len());
+        output.extend_from_slice(VERSION_PREFIX);
+        output.extend_from_slice(version.as_bytes());
+        output.push(b':');
+        output.extend_from_slice(&ciphertext);
+        Ok(output)
+    }
+
+    async fn decrypt_inner(&self, ciphertext: Vec<u8>) -> Result<Vec<u8>, TinkError> {
+        let version = extract_version(&ciphertext);
+        let (wrapped, target_version): (Vec<u8>, Option<String>) = match version {
+            Some(v) => {
+                if !is_valid_version(&v) {
+                    // The encrypted key material is unauthenticated at this layer, so a
+                    // corrupted or tampered value could otherwise smuggle arbitrary characters
+                    // (e.g. '/') into the key version passed to the Azure SDK below.
+                    return Err(format!(
+                        "ciphertext carries an invalid azure:v1: key version: '{v}'"
+                    )
+                    .into());
+                }
+                (ciphertext[HEADER_LENGTH..].to_vec(), Some(v))
+            }
+            None => (ciphertext, self.key_version.clone()),
+        };
+
+        let params = DecryptParameters {
+            decrypt_parameters_encryption: self.algorithm.clone(),
+            ciphertext: wrapped,
+        };
+        let mut req = self.kms.decrypt(self.key_name.clone(), params);
+        if let Some(version) = target_version {
+            req = req.version(version);
+        }
+        req.into_future()
+            .await
+            .map(|r| r.result)
+            .map_err(|e| wrap_err("request failed", e))
     }
 
     async fn encrypt_async(
         self,
         plaintext: Vec<u8>,
-        additional_data: Vec<u8>,
+        _additional_data: Vec<u8>,
         sender: SyncSender<Result<Vec<u8>, TinkError>>,
     ) {
-        let params = EncryptParameters {
-            encrypt_parameters_encryption: self.algorithm.clone(),
-            plaintext,
-        };
-        let mut req = self.kms.encrypt(self.key_name.clone(), params);
-        if let Some(version) = self.key_version.clone() {
-            req = req.version(version);
-        }
-        // TODO additional data
-        /*
-        if !additional_data.is_empty() {
-            req = req.context(additional_data);
-        };
-        */
-        let result = req
-            .into_future()
-            .await
-            .map(|r| r.result)
-            .map_err(|e| wrap_err("failed to encrypt", e));
-
+        let result = self.encrypt_inner(plaintext).await;
         if result.is_err() {
             error!("failed to encrypt: {result:?}");
         }
@@ -76,29 +179,10 @@ impl AzureAead {
     async fn decrypt_async(
         self,
         ciphertext: Vec<u8>,
-        additional_data: Vec<u8>,
+        _additional_data: Vec<u8>,
         sender: SyncSender<Result<Vec<u8>, TinkError>>,
     ) {
-        let params = DecryptParameters {
-            decrypt_parameters_encryption: self.algorithm.clone(),
-            ciphertext,
-        };
-        let mut req = self.kms.decrypt(self.key_name.clone(), params);
-        if let Some(version) = self.key_version.clone() {
-            req = req.version(version);
-        }
-        // TODO additional data
-        /*
-        if !additional_data.is_empty() {
-            req = req.context(additional_data);
-        };
-        */
-        let result = req
-            .into_future()
-            .await
-            .map(|r| r.result)
-            .map_err(|e| wrap_err("request failed", e));
-
+        let result = self.decrypt_inner(ciphertext).await;
         if result.is_err() {
             error!("failed to decrypt: {result:?}");
         }
@@ -155,4 +239,128 @@ fn get_key_info(key_uri: &str) -> Result<(String, String, Option<String>), TinkE
         None
     };
     Ok((vault_url, key_name, key_version))
+}
+
+/// Returns true if `key_uri` has no explicit version segment. Used to warn when
+/// `azure_driver::ENCRYPT_AZURE_KEY_VERSION_SAVE` is not enabled for a versionless key, without
+/// performing any actual resolution (no `KeyClient` call).
+pub(crate) fn is_versionless(key_uri: &str) -> Result<bool, TinkError> {
+    let (_, _, version) = get_key_info(key_uri)?;
+    Ok(version.is_none())
+}
+
+/// Returns true if `version` is exactly 32 hex characters, the only shape that can be embedded
+/// in (and later parsed back out of) the fixed-width `azure:v1:` prefix. Used to validate both a
+/// freshly resolved version (in encrypt) and one extracted from ciphertext (in decrypt), since
+/// the encrypted key material is unauthenticated at this layer and could be corrupted or
+/// tampered with.
+fn is_valid_version(version: &str) -> bool {
+    version.len() == VERSION_LENGTH && version.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Returns the embedded version if `ciphertext` carries the `azure:v1:` prefix (see struct doc),
+/// or `None` if it does not (e.g. a legacy DEK wrapped before `ENCRYPT_AZURE_KEY_VERSION_SAVE`
+/// was enabled on its KEK, or the toggle is not set). Returning `None` rather than an error is
+/// deliberate: the toggle can be flipped on/off over a KEK's lifetime, and old, un-prefixed
+/// ciphertext must remain decryptable.
+fn extract_version(ciphertext: &[u8]) -> Option<String> {
+    if ciphertext.len() < HEADER_LENGTH
+        || &ciphertext[..VERSION_PREFIX.len()] != VERSION_PREFIX
+        || ciphertext[HEADER_LENGTH - 1] != b':'
+    {
+        return None;
+    }
+    std::str::from_utf8(&ciphertext[VERSION_PREFIX.len()..VERSION_PREFIX.len() + VERSION_LENGTH])
+        .ok()
+        .map(|s| s.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VERSION_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn is_valid_version_accepts_exactly_32_hex_chars() {
+        assert!(is_valid_version(VERSION_A));
+        assert!(is_valid_version(&"F".repeat(32)));
+    }
+
+    #[test]
+    fn is_valid_version_rejects_wrong_length() {
+        assert!(!is_valid_version("not-32-chars"));
+        assert!(!is_valid_version(""));
+        assert!(!is_valid_version(&"a".repeat(31)));
+        assert!(!is_valid_version(&"a".repeat(33)));
+    }
+
+    #[test]
+    fn is_valid_version_rejects_non_hex_characters() {
+        let non_hex = format!("g{}", &VERSION_A[1..]);
+        assert!(!is_valid_version(&non_hex));
+    }
+
+    #[test]
+    fn extract_version_returns_embedded_version_for_prefixed_ciphertext() {
+        let ciphertext = format!("azure:v1:{VERSION_A}:wrapped-bytes");
+        assert_eq!(
+            Some(VERSION_A.to_string()),
+            extract_version(ciphertext.as_bytes())
+        );
+    }
+
+    #[test]
+    fn extract_version_returns_none_for_legacy_unprefixed_ciphertext() {
+        assert_eq!(None, extract_version(b"legacy-unprefixed-ciphertext"));
+    }
+
+    #[test]
+    fn extract_version_returns_none_when_too_short() {
+        assert_eq!(None, extract_version(b"azure:v1:short"));
+    }
+
+    #[test]
+    fn extract_version_returns_none_when_missing_colon_separator() {
+        // 32 characters after the prefix but no trailing ':' before the payload.
+        let ciphertext = format!("azure:v1:{VERSION_A}Xwrapped-bytes");
+        assert_eq!(None, extract_version(ciphertext.as_bytes()));
+    }
+
+    #[test]
+    fn get_key_info_parses_versioned_id() {
+        let (vault_url, key_name, key_version) = get_key_info(&format!(
+            "https://vault.vault.azure.net/keys/key1/{VERSION_A}"
+        ))
+        .unwrap();
+        assert_eq!("https://vault.vault.azure.net", vault_url);
+        assert_eq!("key1", key_name);
+        assert_eq!(Some(VERSION_A.to_string()), key_version);
+    }
+
+    #[test]
+    fn get_key_info_parses_versionless_id() {
+        let (_, _, key_version) = get_key_info("https://vault.vault.azure.net/keys/key1").unwrap();
+        assert_eq!(None, key_version);
+    }
+
+    #[test]
+    fn get_key_info_throws_for_malformed_id() {
+        assert!(get_key_info("https://vault.vault.azure.net/notkeys/key1").is_err());
+    }
+
+    #[test]
+    fn is_versionless_true_for_versionless_id() {
+        assert!(is_versionless("https://vault.vault.azure.net/keys/key1").unwrap());
+    }
+
+    #[test]
+    fn is_versionless_false_for_versioned_id() {
+        assert!(
+            !is_versionless(&format!(
+                "https://vault.vault.azure.net/keys/key1/{VERSION_A}"
+            ))
+            .unwrap()
+        );
+    }
 }
