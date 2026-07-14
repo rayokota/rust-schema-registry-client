@@ -9,9 +9,14 @@ use std::sync::{Arc, Mutex};
 pub trait Client {
     fn new(config: client_config::ClientConfig) -> Self;
     fn config(&self) -> &client_config::ClientConfig;
-    async fn register_kek(&self, request: CreateKekRequest) -> Result<Kek, Error>;
+    async fn register_kek(
+        &self,
+        request: CreateKekRequest,
+        context: Option<&str>,
+    ) -> Result<Kek, Error>;
     async fn register_dek(&self, kek_name: &str, request: CreateDekRequest) -> Result<Dek, Error>;
-    async fn get_kek(&self, name: &str, deleted: bool) -> Result<Kek, Error>;
+    async fn get_kek(&self, name: &str, deleted: bool, context: Option<&str>)
+    -> Result<Kek, Error>;
     async fn get_dek(
         &self,
         kek_name: &str,
@@ -54,10 +59,15 @@ impl Client for DekRegistryClient {
         self.rest_service.config()
     }
 
-    async fn register_kek(&self, request: CreateKekRequest) -> Result<Kek, Error> {
+    async fn register_kek(
+        &self,
+        request: CreateKekRequest,
+        context: Option<&str>,
+    ) -> Result<Kek, Error> {
         let cache_key = KekId {
             name: request.name.clone(),
             deleted: false,
+            context: context.map(|c| c.to_string()),
         };
         {
             let store = self.store.lock().unwrap();
@@ -66,10 +76,11 @@ impl Client for DekRegistryClient {
             }
         }
         let url = "/dek-registry/v1/keks";
+        let query = context.map(|c| vec![("context".to_string(), c.to_string())]);
         let body = serde_json::to_string(&request)?;
         let resp = self
             .rest_service
-            .send_request_urls(url, reqwest::Method::POST, None, Some(&body))
+            .send_request_urls(url, reqwest::Method::POST, query.as_deref(), Some(&body))
             .await?;
         let status = resp.status();
         let content = resp.text().await?;
@@ -158,10 +169,16 @@ impl Client for DekRegistryClient {
         }
     }
 
-    async fn get_kek(&self, name: &str, deleted: bool) -> Result<Kek, Error> {
+    async fn get_kek(
+        &self,
+        name: &str,
+        deleted: bool,
+        context: Option<&str>,
+    ) -> Result<Kek, Error> {
         let kek_id = KekId {
             name: name.to_string(),
             deleted,
+            context: context.map(|c| c.to_string()),
         };
         {
             let store = self.store.lock().unwrap();
@@ -170,7 +187,10 @@ impl Client for DekRegistryClient {
             }
         }
         let url = format!("/dek-registry/v1/keks/{name}");
-        let query = vec![("deleted".to_string(), deleted.to_string())];
+        let mut query = vec![("deleted".to_string(), deleted.to_string())];
+        if let Some(context) = context {
+            query.push(("context".to_string(), context.to_string()));
+        }
         let resp = self
             .rest_service
             .send_request_urls(&url, reqwest::Method::GET, Some(&query), None)
@@ -293,6 +313,7 @@ impl Client for DekRegistryClient {
 pub(crate) struct KekId {
     pub name: String,
     pub deleted: bool,
+    pub context: Option<String>,
 }
 
 #[derive(Clone, Default, Debug, Eq, Hash, PartialEq)]

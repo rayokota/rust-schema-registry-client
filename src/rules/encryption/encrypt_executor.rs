@@ -31,6 +31,21 @@ const ENCRYPT_DEK_EXPIRY_DAYS: &str = "encrypt.dek.expiry.days";
 const MILLIS_IN_DAY: i64 = 24 * 60 * 60 * 1000;
 const EMPTY_AAD: &[u8] = b"";
 
+const CONTEXT_DELIMITER: &str = ":";
+const CONTEXT_PREFIX: &str = ":.";
+
+/// Returns the context parsed from the given qualified subject (of the form
+/// ":.context:subject"), or None if the subject has no context prefix or is
+/// explicitly qualified with the default (".") context.
+/// Tenant is not handled here as it is a server-side-only concept.
+fn context_for(subject: &str) -> Option<String> {
+    let rest = subject.strip_prefix(CONTEXT_PREFIX)?;
+    let (ctx, _subject) = rest.split_once(CONTEXT_DELIMITER).unwrap_or((rest, ""));
+    // Re-add the leading "." that is part of the context encoding.
+    let ctx = format!(".{ctx}");
+    if ctx == "." { None } else { Some(ctx) }
+}
+
 pub trait Clock: Send + Sync {
     fn now(&self) -> i64;
 }
@@ -348,6 +363,7 @@ impl<T: Client> EncryptionExecutorTransform<'_, T> {
         let kek_id = KekId {
             name: self.kek_name.clone(),
             deleted: false,
+            context: context_for(&ctx.subject),
         };
         let mut kek = self.retrieve_kek_from_registry(&kek_id).await?;
         if let Some(kek) = kek {
@@ -407,7 +423,7 @@ impl<T: Client> EncryptionExecutorTransform<'_, T> {
             .client
             .get()
             .unwrap()
-            .get_kek(&kek_id.name, kek_id.deleted)
+            .get_kek(&kek_id.name, kek_id.deleted, kek_id.context.as_deref())
             .await;
         match kek {
             Ok(kek) => Ok(Some(kek)),
@@ -444,7 +460,7 @@ impl<T: Client> EncryptionExecutorTransform<'_, T> {
             .client
             .get()
             .unwrap()
-            .register_kek(request)
+            .register_kek(request, kek_id.context.as_deref())
             .await;
         match kek {
             Ok(kek) => Ok(Some(kek)),
@@ -901,5 +917,104 @@ impl<T: Client + Clone + Sync + 'static> FieldRuleExecutor for FieldEncryptionEx
         transform
             .transform(ctx, field_ctx.get_field_type(), field_value)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rest::mock_dek_registry_client::MockDekRegistryClient;
+    use crate::rest::models::{Kind, Rule};
+    use crate::serdes::serde::{SerdeFormat, SerdeType, SerializationContext};
+    use std::collections::BTreeMap;
+
+    fn new_context(subject: &str) -> RuleContext {
+        let mut rule = Rule::new("rule1", "ENCRYPT_PAYLOAD");
+        rule.kind = Some(Kind::Transform);
+        rule.mode = Some(Mode::Write);
+        rule.params = Some(BTreeMap::from([(
+            ENCRYPT_KEK_NAME.to_string(),
+            "kek1".to_string(),
+        )]));
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Json,
+            headers: None,
+        };
+        RuleContext::new(
+            None,
+            ser_ctx,
+            None,
+            None,
+            None,
+            subject.to_string(),
+            Mode::Write,
+            rule.clone(),
+            0,
+            vec![rule],
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_get_or_create_kek_uses_context_from_subject() {
+        let client_config = ClientConfig::new(vec!["mock://".to_string()]);
+        let executor = EncryptionExecutor::<MockDekRegistryClient>::new(FakeClock::new(0));
+        executor.configure(&client_config, &HashMap::new()).unwrap();
+        let dek_client = executor.client().unwrap();
+
+        // Pre-register the same kek name under two different contexts, with a
+        // different kms_key_id each, so a wrong (or dropped) context shows up
+        // as a mismatched kms_key_id rather than just "it didn't error".
+        let ctx_kek_req = CreateKekRequest {
+            name: "kek1".to_string(),
+            kms_type: "local-kms".to_string(),
+            kms_key_id: "myctxkey".to_string(),
+            kms_props: None,
+            doc: None,
+            shared: false,
+        };
+        dek_client
+            .register_kek(ctx_kek_req, Some(".myctx"))
+            .await
+            .unwrap();
+        let default_kek_req = CreateKekRequest {
+            name: "kek1".to_string(),
+            kms_type: "local-kms".to_string(),
+            kms_key_id: "defaultkey".to_string(),
+            kms_props: None,
+            doc: None,
+            shared: false,
+        };
+        dek_client
+            .register_kek(default_kek_req, None)
+            .await
+            .unwrap();
+
+        // Context-qualified subject: the context should be parsed out of the
+        // subject and threaded through to the dek registry client, not
+        // dropped.
+        let mut ctx = new_context(":.myctx:widget-value");
+        let transform = executor.new_transform(&mut ctx).unwrap();
+        let kek = transform.get_or_create_kek(&ctx).await.unwrap();
+        assert_eq!(kek.kms_key_id, "myctxkey");
+
+        // Unqualified subject (default context): the context should
+        // normalize to None rather than being looked up under the literal
+        // "." context.
+        let mut ctx = new_context("widget-value");
+        let transform = executor.new_transform(&mut ctx).unwrap();
+        let kek = transform.get_or_create_kek(&ctx).await.unwrap();
+        assert_eq!(kek.kms_key_id, "defaultkey");
+
+        // Explicitly-qualified default context (":.:subject"): should behave
+        // identically to an unqualified subject, using the "defaultkey" kek
+        // rather than creating a new one under the literal "." context.
+        let mut ctx = new_context(":.:widget-value");
+        let transform = executor.new_transform(&mut ctx).unwrap();
+        let kek = transform.get_or_create_kek(&ctx).await.unwrap();
+        assert_eq!(kek.kms_key_id, "defaultkey");
     }
 }
