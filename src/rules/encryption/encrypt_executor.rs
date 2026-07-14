@@ -970,9 +970,7 @@ mod tests {
     async fn test_get_or_create_kek_uses_context_from_subject() {
         let client_config = ClientConfig::new(vec!["mock://".to_string()]);
         let executor = EncryptionExecutor::<MockDekRegistryClient>::new(FakeClock::new(0));
-        executor
-            .configure(&client_config, &HashMap::new())
-            .unwrap();
+        executor.configure(&client_config, &HashMap::new()).unwrap();
         let dek_client = executor.client().unwrap();
 
         // Pre-register the same kek name under two different contexts, with a

@@ -15,7 +15,8 @@ pub trait Client {
         context: Option<&str>,
     ) -> Result<Kek, Error>;
     async fn register_dek(&self, kek_name: &str, request: CreateDekRequest) -> Result<Dek, Error>;
-    async fn get_kek(&self, name: &str, deleted: bool, context: Option<&str>) -> Result<Kek, Error>;
+    async fn get_kek(&self, name: &str, deleted: bool, context: Option<&str>)
+    -> Result<Kek, Error>;
     async fn get_dek(
         &self,
         kek_name: &str,
@@ -168,7 +169,12 @@ impl Client for DekRegistryClient {
         }
     }
 
-    async fn get_kek(&self, name: &str, deleted: bool, context: Option<&str>) -> Result<Kek, Error> {
+    async fn get_kek(
+        &self,
+        name: &str,
+        deleted: bool,
+        context: Option<&str>,
+    ) -> Result<Kek, Error> {
         let kek_id = KekId {
             name: name.to_string(),
             deleted,

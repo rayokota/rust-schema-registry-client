@@ -85,7 +85,12 @@ impl Client for MockDekRegistryClient {
         Ok(dek)
     }
 
-    async fn get_kek(&self, name: &str, deleted: bool, context: Option<&str>) -> Result<Kek, Error> {
+    async fn get_kek(
+        &self,
+        name: &str,
+        deleted: bool,
+        context: Option<&str>,
+    ) -> Result<Kek, Error> {
         let kek_id = KekId {
             name: name.to_string(),
             deleted,
