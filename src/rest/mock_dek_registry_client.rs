@@ -23,11 +23,16 @@ impl Client for MockDekRegistryClient {
         &self.config
     }
 
-    async fn register_kek(&self, request: CreateKekRequest) -> Result<Kek, Error> {
+    async fn register_kek(
+        &self,
+        request: CreateKekRequest,
+        context: Option<&str>,
+    ) -> Result<Kek, Error> {
         let mut store = self.store.lock().unwrap();
         let cache_key = KekId {
             name: request.name.clone(),
             deleted: false,
+            context: context.map(|c| c.to_string()),
         };
         if let Some(kek) = store.keks.get(&cache_key) {
             return Ok(kek.clone());
@@ -80,10 +85,11 @@ impl Client for MockDekRegistryClient {
         Ok(dek)
     }
 
-    async fn get_kek(&self, name: &str, deleted: bool) -> Result<Kek, Error> {
+    async fn get_kek(&self, name: &str, deleted: bool, context: Option<&str>) -> Result<Kek, Error> {
         let kek_id = KekId {
             name: name.to_string(),
             deleted,
+            context: context.map(|c| c.to_string()),
         };
         let store = self.store.lock().unwrap();
         if let Some(kek) = store.get_kek(&kek_id) {

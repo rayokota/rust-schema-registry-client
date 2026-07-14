@@ -1908,7 +1908,7 @@ mod tests {
             doc: None,
             shared: false,
         };
-        dek_client.register_kek(kek_req).await.unwrap();
+        dek_client.register_kek(kek_req, None).await.unwrap();
 
         let encrypted_dek =
             "07V2ndh02DA73p+dTybwZFm7DKQSZN1tEwQh+FoX1DZLk4Yj2LLu4omYjp/84tAg3BYlkfGSz+zZacJHIE4=";
@@ -2019,7 +2019,7 @@ mod tests {
             doc: None,
             shared: false,
         };
-        dek_client.register_kek(kek_req).await.unwrap();
+        dek_client.register_kek(kek_req, None).await.unwrap();
 
         let encrypted_dek = "YSx3DTlAHrmpoDChquJMifmPntBzxgRVdMzgYL82rgWBKn7aUSnG+WIu9ozBNS3y2vXd++mBtK07w4/W/G6w0da39X9hfOVZsGnkSvry/QRht84V8yz3dqKxGMOK5A==";
         let dek_req = CreateDekRequest {
@@ -2129,7 +2129,7 @@ mod tests {
             doc: None,
             shared: false,
         };
-        dek_client.register_kek(kek_req).await.unwrap();
+        dek_client.register_kek(kek_req, None).await.unwrap();
 
         let encrypted_dek =
             "W/v6hOQYq1idVAcs1pPWz9UUONMVZW4IrglTnG88TsWjeCjxmtRQ4VaNe/I5dCfm2zyY9Cu0nqdvqImtUk4=";
