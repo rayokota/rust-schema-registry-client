@@ -39,19 +39,11 @@ const CONTEXT_PREFIX: &str = ":.";
 /// explicitly qualified with the default (".") context.
 /// Tenant is not handled here as it is a server-side-only concept.
 fn context_for(subject: &str) -> Option<String> {
-    if let Some(rest) = subject.strip_prefix(CONTEXT_PREFIX) {
-        let context = match rest.find(CONTEXT_DELIMITER) {
-            Some(ix) => &subject[1..ix + CONTEXT_PREFIX.len()],
-            None => &subject[1..],
-        };
-        if context == "." {
-            None
-        } else {
-            Some(context.to_string())
-        }
-    } else {
-        None
-    }
+    let rest = subject.strip_prefix(CONTEXT_PREFIX)?;
+    let (ctx, _subject) = rest.split_once(CONTEXT_DELIMITER).unwrap_or((rest, ""));
+    // Re-add the leading "." that is part of the context encoding.
+    let ctx = format!(".{ctx}");
+    if ctx == "." { None } else { Some(ctx) }
 }
 
 pub trait Clock: Send + Sync {
