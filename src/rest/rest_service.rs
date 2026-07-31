@@ -75,7 +75,7 @@ impl RestService {
                 retries,
                 Duration::from_millis(self.config.retries_max_wait_ms as u64),
             );
-            // TODO use async runtime
+            // TODO support async runtimes other than tokio
             tokio::time::sleep(backoff).await;
             retries += 1;
         }
@@ -240,10 +240,8 @@ mod tests {
     async fn fails_over_to_next_url_on_retriable_status() {
         let unavailable = StubServer::start("503 Service Unavailable").await;
         let available = StubServer::start("200 OK").await;
-        let service = RestService::new(config(vec![
-            unavailable.url.clone(),
-            available.url.clone(),
-        ]));
+        let service =
+            RestService::new(config(vec![unavailable.url.clone(), available.url.clone()]));
 
         let response = get_subjects(&service).await;
 

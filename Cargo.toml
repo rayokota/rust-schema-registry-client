@@ -66,7 +66,7 @@ tink-aead = { version = "0.3.0", optional = true }
 tink-core = "0.3.0"
 tink-daead = { version = "0.3.0", optional = true }
 tink-proto = { version = "0.3.0", optional = true }
-tokio = { version = "1.46", features = ["rt-multi-thread"] }
+tokio = { version = "1.46", features = ["rt-multi-thread", "time"] }
 trait-variant = "0.1.2"
 url = "2.5"
 uuid = { version = "1.17", features = ["serde", "v4"] }
