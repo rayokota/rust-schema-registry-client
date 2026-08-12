@@ -746,6 +746,20 @@ async fn transform(
 ) -> Result<Value, SerdeError> {
     match schema {
         apache_avro::Schema::Union(union) => {
+            // A `Value::Union` carries its branch index, and that index is authoritative:
+            // `resolve_union` matches structurally, and a `Value::Record` does not record
+            // which schema it came from, so it cannot tell two records of the same shape
+            // apart. Descend with the unwrapped value - the branch schema describes the
+            // inner value, not the wrapper - then re-wrap so the result is still a valid
+            // union value.
+            if let Value::Union(index, inner) = message {
+                let Some(subschema) = union.variants().get(*index as usize) else {
+                    return Ok(message.clone());
+                };
+                let result = transform(ctx, subschema, named_schemas, inner).await?;
+                return Ok(Value::Union(*index, Box::new(result)));
+            }
+            // Not wrapped in a union: fall back to matching structurally.
             let subschema = resolve_union(union, message);
             if subschema.is_none() {
                 return Ok(message.clone());
@@ -983,8 +997,20 @@ fn validate(
         apache_avro::Schema::Union(union) => {
             // Descend into the branch the value actually holds, carrying the unwrapped
             // value: the branch schema describes the inner value, not the union wrapper.
-            let inner = unwrap_union(message);
-            if let Some((_, subschema)) = resolve_union(union, inner) {
+            //
+            // A `Value::Union` carries its branch index, and that index is authoritative.
+            // `resolve_union` matches structurally, and a `Value::Record` does not record
+            // which schema it came from, so it cannot tell two records of the same shape
+            // apart and would pick whichever resolves first. Only fall back to matching
+            // when the value is not wrapped in a union.
+            let (subschema, inner) = match message {
+                Value::Union(index, inner) => (
+                    union.variants().get(*index as usize),
+                    unwrap_union(inner.as_ref()),
+                ),
+                other => (resolve_union(union, other).map(|(_, schema)| schema), other),
+            };
+            if let Some(subschema) = subschema {
                 validate(
                     executor,
                     subschema,
@@ -3344,5 +3370,129 @@ mod tests {
         assert_eq!(violations.len(), 2, "{violations:?}");
         assert_eq!(violations[0].field_path, "first.zip");
         assert_eq!(violations[1].field_path, "second.zip");
+    }
+
+    const UNION_OF_RECORDS_SCHEMA: &str = r#"
+    {
+        "type": "record", "name": "Outer", "namespace": "test",
+        "fields": [
+            {"name": "choice", "type": [
+                {"type": "record", "name": "A", "fields": [
+                    {"name": "v", "type": "string",
+                     "confluent:rules": [{"name": "ruleA", "expr": "false"}]}
+                ]},
+                {"type": "record", "name": "B", "fields": [
+                    {"name": "v", "type": "string",
+                     "confluent:rules": [{"name": "ruleB", "expr": "false"}]}
+                ]}
+            ]}
+        ]
+    }
+    "#;
+
+    #[test]
+    fn test_validation_uses_the_union_branch_the_value_names() {
+        let parsed = apache_avro::Schema::parse_str(UNION_OF_RECORDS_SCHEMA).unwrap();
+        let validator = CelValidator::new();
+        let branch = Record(vec![("v".to_string(), Value::String("x".to_string()))]);
+
+        // Both branches are records of the same shape, so structural matching cannot tell
+        // them apart; only the union index says which branch the value actually holds.
+        for (index, expected) in [(0u32, "ruleA"), (1u32, "ruleB")] {
+            let message = Record(vec![(
+                "choice".to_string(),
+                Union(index, Box::new(branch.clone())),
+            )]);
+            let violations = validate_message(&validator, &parsed, &[], &message, false);
+            assert_eq!(violations.len(), 1, "index {index}: {violations:?}");
+            assert_eq!(violations[0].rule.name, expected, "index {index}");
+            assert_eq!(violations[0].field_path, "choice.v");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cel_field_transforms_nullable_fields() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            true,
+            false,
+            HashMap::new(),
+        );
+        let schema_str = r#"
+        {
+            "type": "record",
+            "name": "test",
+            "fields": [
+                {"name": "plain", "type": "string"},
+                {"name": "nullable", "type": ["null", "string"]}
+            ]
+        }
+        "#;
+        let rule = Rule {
+            name: "test-cel".to_string(),
+            doc: None,
+            kind: Some(Kind::Transform),
+            mode: Some(Mode::Write),
+            r#type: "CEL_FIELD".to_string(),
+            tags: None,
+            params: None,
+            expr: Some("typeName == 'STRING' ; value + '-suffix'".to_string()),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let schema = Schema {
+            schema_type: Some("AVRO".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(RuleSet {
+                migration_rules: None,
+                domain_rules: Some(vec![rule]),
+                encoding_rules: None,
+                enable_at: None,
+            })),
+            schema: schema_str.to_string(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(CelFieldExecutor::new());
+        let ser = AvroSerializer::new(&client, None, Some(rule_registry), ser_conf).unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Avro,
+            headers: None,
+        };
+        let message = Record(vec![
+            ("plain".to_string(), Value::String("a".to_string())),
+            (
+                "nullable".to_string(),
+                Union(1, Box::new(Value::String("b".to_string()))),
+            ),
+        ]);
+        // The rule must see the value inside the union, not the wrapper, and the
+        // transformed value must go back into the union it came from.
+        let bytes = ser.serialize(&ser_ctx, message).await.unwrap();
+
+        let deser = AvroDeserializer::new(&client, None, DeserializerConfig::default()).unwrap();
+        let obj2 = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        let expected = vec![
+            ("plain".to_string(), Value::String("a-suffix".to_string())),
+            (
+                "nullable".to_string(),
+                Union(1, Box::new(Value::String("b-suffix".to_string()))),
+            ),
+        ];
+        if let Record(v) = obj2.value {
+            assert_eq!(v, expected);
+        } else {
+            unreachable!();
+        }
     }
 }
