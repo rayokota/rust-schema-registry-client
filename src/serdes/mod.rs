@@ -4,4 +4,5 @@ pub mod json;
 pub mod protobuf;
 pub mod rule_registry;
 pub mod serde;
+pub mod validation_rule;
 pub mod wildcard_matcher;

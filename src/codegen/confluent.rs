@@ -14,4 +14,21 @@ pub struct Meta {
     >,
     #[prost(string, repeated, tag = "3")]
     pub tags: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "4")]
+    pub rules: ::prost::alloc::vec::Vec<Rule>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(::prost_reflect::ReflectMessage)]
+#[prost_reflect(message_name = "confluent.Rule")]
+#[prost_reflect(descriptor_pool = "crate::DESCRIPTOR_POOL")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Rule {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub doc: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub expr: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub sql: ::prost::alloc::string::String,
 }

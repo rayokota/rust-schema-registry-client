@@ -11,6 +11,11 @@ use crate::serdes::serde::{
     get_executor, get_executors, load_associated_subject, parse_subject_name_strategy_type,
     topic_name_strategy,
 };
+use crate::serdes::validation_rule::{
+    VALIDATION_RULES_PROP, ValidationRule, ValidationRuleError, ValidationRuleExecutor,
+    ValidationRulesExecution, append_validation_path, evaluate_validation_rule,
+    parse_validation_rules, raise_validation_violations,
+};
 use async_recursion::async_recursion;
 use base64::Engine;
 use dashmap::DashMap;
@@ -124,6 +129,12 @@ impl<'a, T: Client + Sync> JsonSerializer<'a, T> {
         if let Some(ref latest_schema) = latest_schema {
             schema = latest_schema.to_schema();
             (parsed_schema, ref_registry) = self.get_parsed_schema(&schema).await?;
+            if self
+                .base
+                .validation_enabled(Some(ValidationRulesExecution::BeforeDomainRules))
+            {
+                self.validate_inline_rules(&parsed_schema, &ref_registry, &value)?;
+            }
             let field_transformer: FieldTransformer =
                 Box::new(|ctx, value| transform_fields(ctx, value).boxed());
             let serde_value = self
@@ -147,12 +158,23 @@ impl<'a, T: Client + Sync> JsonSerializer<'a, T> {
                 SerdeValue::Json(value) => value,
                 _ => return Err(Serialization("unexpected serde value".to_string())),
             };
+            if self
+                .base
+                .validation_enabled(Some(ValidationRulesExecution::AfterDomainRules))
+            {
+                self.validate_inline_rules(&parsed_schema, &ref_registry, &value)?;
+            }
         } else {
             schema = self
                 .schema
                 .ok_or(Serialization("schema needs to be set".to_string()))?
                 .clone();
             (parsed_schema, ref_registry) = self.get_parsed_schema(&schema).await?;
+            // No domain rules run on this path, so there is a single validation point
+            // regardless of the configured phase.
+            if self.base.validation_enabled(None) {
+                self.validate_inline_rules(&parsed_schema, &ref_registry, &value)?;
+            }
         }
 
         if self.base.config.validate {
@@ -189,6 +211,32 @@ impl<'a, T: Client + Sync> JsonSerializer<'a, T> {
 
         let id_ser = self.base.config.schema_id_serializer;
         id_ser(&encoded_bytes, ctx, &schema_id)
+    }
+
+    /// Evaluates the schema's inline validation rules against `value`, returning a single
+    /// error listing every violation found.
+    fn validate_inline_rules(
+        &self,
+        parsed_schema: &Value,
+        ref_registry: &Registry,
+        value: &Value,
+    ) -> Result<(), SerdeError> {
+        let executor = self.base.validation_executor()?;
+        let root_resource_ref = ResourceRef::from_contents(parsed_schema);
+        let base_uri = root_resource_ref.id().unwrap_or("").to_string();
+        let ref_registry = ref_registry.clone().try_with_resource(
+            base_uri.clone(),
+            Resource::from_contents(parsed_schema.clone()),
+        )?;
+        let ref_resolver = ref_registry.try_resolver(&base_uri)?;
+        raise_validation_violations(validate_message(
+            executor.as_ref(),
+            parsed_schema,
+            &ref_registry,
+            &ref_resolver,
+            value,
+            self.base.config.validation_rules_fail_fast,
+        )?)
     }
 
     async fn get_parsed_schema(&self, schema: &Schema) -> Result<(Value, Registry), SerdeError> {
@@ -872,6 +920,266 @@ async fn transform_field_with_ctx(
     Ok(None)
 }
 
+/// Walks `message` against `schema`, evaluating every inline `confluent:rules` CHECK
+/// constraint encountered and collecting all failures. Read-only — the message is not
+/// modified.
+///
+/// Two kinds of rules are evaluated:
+///   - Object-level (`confluent:rules` on an object schema) — `this` is the object.
+///   - Property-level (`confluent:rules` on a property schema) — `this` is the property
+///     value. Honors the skip-on-null contract: a property that is absent or null does
+///     not have its rules invoked.
+///
+/// Failures carry their location rooted at `$` to match the JVM client (e.g. `$.addr.zip`,
+/// `$.tags[3]`). The walk continues after each failure so callers see the full set rather
+/// than only the first, unless `fail_fast` is set.
+fn validate_message(
+    executor: &dyn ValidationRuleExecutor,
+    schema: &Value,
+    ref_registry: &Registry,
+    ref_resolver: &Resolver,
+    message: &Value,
+    fail_fast: bool,
+) -> Result<Vec<ValidationRuleError>, SerdeError> {
+    let mut violations = Vec::new();
+    validate_with_rules(
+        executor,
+        schema,
+        ref_registry,
+        ref_resolver,
+        "$",
+        message,
+        fail_fast,
+        &mut violations,
+    )?;
+    Ok(violations)
+}
+
+/// Mirrors [`transform`]'s dispatch shape: the combined keywords (allOf/anyOf/oneOf) with
+/// their sibling properties/items, then items, then `$ref`, then object properties.
+#[allow(clippy::too_many_arguments)]
+fn validate_with_rules(
+    executor: &dyn ValidationRuleExecutor,
+    schema: &Value,
+    ref_registry: &Registry,
+    ref_resolver: &Resolver,
+    path: &str,
+    message: &Value,
+    fail_fast: bool,
+    violations: &mut Vec<ValidationRuleError>,
+) -> Result<(), SerdeError> {
+    if fail_fast && !violations.is_empty() {
+        return Ok(());
+    }
+    let Value::Object(map) = schema else {
+        return Ok(());
+    };
+
+    // Rules declared at this level: `this` is the value at this location.
+    if evaluate_rules(
+        executor,
+        parse_validation_rules(map.get(VALIDATION_RULES_PROP)),
+        message,
+        path,
+        fail_fast,
+        violations,
+    ) {
+        return Ok(());
+    }
+
+    let as_array = |key: &str| {
+        map.get(key).and_then(|v| {
+            if let Value::Array(a) = v {
+                Some(a)
+            } else {
+                None
+            }
+        })
+    };
+    let all_of = as_array("allOf");
+    let any_of = as_array("anyOf");
+    let one_of = as_array("oneOf");
+    if all_of.is_some() || any_of.is_some() || one_of.is_some() {
+        // allOf branches all apply; for oneOf/anyOf only the branches the value actually
+        // satisfies do, otherwise violations would be attributed to a branch the value
+        // does not follow.
+        if let Some(subschemas) = all_of {
+            for subschema in subschemas {
+                validate_with_rules(
+                    executor,
+                    subschema,
+                    ref_registry,
+                    ref_resolver,
+                    path,
+                    message,
+                    fail_fast,
+                    violations,
+                )?;
+                if fail_fast && !violations.is_empty() {
+                    return Ok(());
+                }
+            }
+        } else if let Some(subschemas) = one_of {
+            for subschema in subschemas {
+                if validate_subschema(subschema, message, ref_registry) {
+                    validate_with_rules(
+                        executor,
+                        subschema,
+                        ref_registry,
+                        ref_resolver,
+                        path,
+                        message,
+                        fail_fast,
+                        violations,
+                    )?;
+                    break;
+                }
+            }
+        } else if let Some(subschemas) = any_of {
+            for subschema in subschemas {
+                if validate_subschema(subschema, message, ref_registry) {
+                    validate_with_rules(
+                        executor,
+                        subschema,
+                        ref_registry,
+                        ref_resolver,
+                        path,
+                        message,
+                        fail_fast,
+                        violations,
+                    )?;
+                    if fail_fast && !violations.is_empty() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        if fail_fast && !violations.is_empty() {
+            return Ok(());
+        }
+        // Also visit sibling properties/items at this level
+        // (siblings to allOf/anyOf/oneOf).
+        return validate_properties(
+            executor,
+            map,
+            ref_registry,
+            ref_resolver,
+            path,
+            message,
+            fail_fast,
+            violations,
+        );
+    }
+
+    if let Some(reference) = map.get("$ref").and_then(|v| v.as_str()) {
+        // Surface a failed lookup rather than treating the reference as carrying no rules:
+        // silently skipping the referenced subtree would let a message serialize without
+        // the checks the reference was there to supply. The transform path propagates this
+        // failure the same way.
+        let ref_schema = ref_resolver.lookup(reference)?;
+        return validate_with_rules(
+            executor,
+            ref_schema.contents(),
+            ref_registry,
+            ref_resolver,
+            path,
+            message,
+            fail_fast,
+            violations,
+        );
+    }
+
+    validate_properties(
+        executor,
+        map,
+        ref_registry,
+        ref_resolver,
+        path,
+        message,
+        fail_fast,
+        violations,
+    )
+}
+
+/// Descends into an object's properties and an array's items.
+#[allow(clippy::too_many_arguments)]
+fn validate_properties(
+    executor: &dyn ValidationRuleExecutor,
+    map: &serde_json::Map<String, Value>,
+    ref_registry: &Registry,
+    ref_resolver: &Resolver,
+    path: &str,
+    message: &Value,
+    fail_fast: bool,
+    violations: &mut Vec<ValidationRuleError>,
+) -> Result<(), SerdeError> {
+    if let Some(Value::Object(props)) = map.get("properties")
+        && let Value::Object(message) = message
+    {
+        for (prop_name, prop_schema) in props {
+            let Some(value) = message.get(prop_name) else {
+                continue;
+            };
+            validate_with_rules(
+                executor,
+                prop_schema,
+                ref_registry,
+                ref_resolver,
+                &append_validation_path(path, prop_name),
+                value,
+                fail_fast,
+                violations,
+            )?;
+            if fail_fast && !violations.is_empty() {
+                return Ok(());
+            }
+        }
+    }
+    if let Some(items) = map.get("items")
+        && let Value::Array(elements) = message
+    {
+        for (i, element) in elements.iter().enumerate() {
+            validate_with_rules(
+                executor,
+                items,
+                ref_registry,
+                ref_resolver,
+                &format!("{path}[{i}]"),
+                element,
+                fail_fast,
+                violations,
+            )?;
+            if fail_fast && !violations.is_empty() {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Evaluates the given rules against `value`, skipping null values to honor the
+/// skip-on-null contract. Returns whether the walk should stop.
+fn evaluate_rules(
+    executor: &dyn ValidationRuleExecutor,
+    rules: Vec<ValidationRule>,
+    value: &Value,
+    path: &str,
+    fail_fast: bool,
+    violations: &mut Vec<ValidationRuleError>,
+) -> bool {
+    if rules.is_empty() || value.is_null() {
+        return false;
+    }
+    let serde_value = SerdeValue::Json(value.clone());
+    for rule in &rules {
+        evaluate_validation_rule(executor, rule, &serde_value, path, violations);
+        if fail_fast && !violations.is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
 fn validate_subschema(subschema: &Value, message: &Value, ref_registry: &Registry) -> bool {
     let validator = jsonschema::options()
         .with_registry(ref_registry.clone())
@@ -941,7 +1249,9 @@ mod tests {
     use crate::rest::mock_dek_registry_client::MockDekRegistryClient;
     use crate::rest::mock_schema_registry_client::MockSchemaRegistryClient;
     use crate::rest::models::{Rule, RuleSet, SchemaReference};
+    use crate::rules::cel::cel_executor::CelExecutor;
     use crate::rules::cel::cel_field_executor::CelFieldExecutor;
+    use crate::rules::cel::cel_validator::CelValidator;
     use crate::rules::encryption::encrypt_executor::{
         EncryptionExecutor, FakeClock, FieldEncryptionExecutor,
     };
@@ -2514,5 +2824,216 @@ mod tests {
             let obj2 = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
             assert_eq!(obj2, obj);
         }
+    }
+
+    const VALIDATION_SCHEMA: &str = r##"
+    {
+        "type": "object",
+        "confluent:rules": [
+            {"name": "quantity_matches_items",
+             "expr": "this.quantity == size(this.items)"}
+        ],
+        "properties": {
+            "id": {
+                "type": "string",
+                "confluent:rules": [
+                    {"name": "id_prefix", "expr": "this.startsWith('ord-')"}
+                ]
+            },
+            "quantity": {
+                "type": "integer",
+                "confluent:rules": [
+                    {"name": "positive_quantity", "expr": "this > 0"}
+                ]
+            },
+            "items": {"type": "array", "items": {"type": "string"}},
+            "address": {"$ref": "#/definitions/Address"}
+        },
+        "definitions": {
+            "Address": {
+                "type": "object",
+                "properties": {
+                    "zip": {
+                        "type": "string",
+                        "confluent:rules": [
+                            {"name": "zip_digits",
+                             "expr": "this.matches('^[0-9]{5}$') ? '' : 'zip must be 5 digits'"}
+                        ]
+                    }
+                }
+            }
+        }
+    }
+    "##;
+
+    fn json_order(id: &str, quantity: i64, items: &[&str], zip: &str) -> Value {
+        serde_json::json!({
+            "id": id,
+            "quantity": quantity,
+            "items": items,
+            "address": {"zip": zip},
+        })
+    }
+
+    fn validation_schema() -> Schema {
+        Schema {
+            schema_type: Some("JSON".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: None,
+            schema: VALIDATION_SCHEMA.to_string(),
+        }
+    }
+
+    fn validate_json(message: &Value, fail_fast: bool) -> Vec<ValidationRuleError> {
+        let parsed: Value = serde_json::from_str(VALIDATION_SCHEMA).unwrap();
+        let ref_registry = Registry::options()
+            .build(Vec::<(String, Resource)>::new().into_iter())
+            .unwrap();
+        let base_uri = ResourceRef::from_contents(&parsed)
+            .id()
+            .unwrap_or("")
+            .to_string();
+        let ref_registry = ref_registry
+            .try_with_resource(base_uri.clone(), Resource::from_contents(parsed.clone()))
+            .unwrap();
+        let ref_resolver = ref_registry.try_resolver(&base_uri).unwrap();
+        let validator = CelValidator::new();
+        validate_message(
+            &validator,
+            &parsed,
+            &ref_registry,
+            &ref_resolver,
+            message,
+            fail_fast,
+        )
+        .unwrap()
+    }
+
+    fn find_violation<'a>(
+        violations: &'a [ValidationRuleError],
+        name: &str,
+    ) -> &'a ValidationRuleError {
+        violations
+            .iter()
+            .find(|v| v.rule.name == name)
+            .unwrap_or_else(|| panic!("no violation named {name} in {violations:?}"))
+    }
+
+    fn validating_registry() -> RuleRegistry {
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(CelExecutor::new());
+        rule_registry.register_validation_executor(CelValidator::new());
+        rule_registry
+    }
+
+    #[test]
+    fn test_validation_valid_object_has_no_violations() {
+        let message = json_order("ord-1", 2, &["a", "b"], "12345");
+        assert_eq!(validate_json(&message, false), vec![]);
+    }
+
+    #[test]
+    fn test_validation_collects_every_violation_with_dollar_rooted_paths() {
+        let message = json_order("x", 0, &["a"], "abc");
+        let violations = validate_json(&message, false);
+
+        // Properties are walked in the schema's key order, so assert on the set of
+        // violations rather than their sequence.
+        assert_eq!(violations.len(), 4, "{violations:?}");
+        assert_eq!(
+            find_violation(&violations, "quantity_matches_items").field_path,
+            "$"
+        );
+        assert_eq!(find_violation(&violations, "id_prefix").field_path, "$.id");
+        assert_eq!(
+            find_violation(&violations, "positive_quantity").field_path,
+            "$.quantity"
+        );
+        // Resolved through "$ref".
+        assert_eq!(
+            find_violation(&violations, "zip_digits").field_path,
+            "$.address.zip"
+        );
+    }
+
+    #[test]
+    fn test_validation_reports_unresolvable_references() {
+        // A reference that cannot be resolved must not be treated as "no rules here":
+        // that would let the message through without the checks it was meant to supply.
+        let schema: Value = serde_json::from_str(
+            r##"{"type": "object", "properties": {"a": {"$ref": "#/definitions/Missing"}}}"##,
+        )
+        .unwrap();
+        let ref_registry = Registry::options()
+            .build(Vec::<(String, Resource)>::new().into_iter())
+            .unwrap();
+        let base_uri = ResourceRef::from_contents(&schema)
+            .id()
+            .unwrap_or("")
+            .to_string();
+        let ref_registry = ref_registry
+            .try_with_resource(base_uri.clone(), Resource::from_contents(schema.clone()))
+            .unwrap();
+        let ref_resolver = ref_registry.try_resolver(&base_uri).unwrap();
+        let validator = CelValidator::new();
+
+        let message = serde_json::json!({"a": {"x": 1}});
+        let result = validate_message(
+            &validator,
+            &schema,
+            &ref_registry,
+            &ref_resolver,
+            &message,
+            false,
+        );
+        assert!(result.is_err(), "expected the lookup failure to surface");
+    }
+
+    #[test]
+    fn test_validation_fail_fast_stops_at_first_violation() {
+        let message = json_order("x", 0, &["a"], "abc");
+        assert_eq!(validate_json(&message, true).len(), 1);
+    }
+
+    #[test]
+    fn test_validation_skips_absent_and_null_properties() {
+        let mut message = serde_json::json!({"quantity": 1, "items": ["a"]});
+        assert_eq!(validate_json(&message, false), vec![]);
+
+        message["id"] = Value::Null;
+        assert_eq!(validate_json(&message, false), vec![]);
+    }
+
+    #[tokio::test]
+    async fn test_validation_serializer_rejects_invalid_message() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let mut ser_conf = SerializerConfig::default();
+        ser_conf.validation_rules_execution = ValidationRulesExecution::AfterDomainRules;
+        let schema = validation_schema();
+        let ser = JsonSerializer::new(
+            &client,
+            Some(&schema),
+            Some(validating_registry()),
+            ser_conf,
+        )
+        .unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Json,
+            headers: None,
+        };
+
+        let valid = json_order("ord-1", 2, &["a", "b"], "12345");
+        assert!(ser.serialize(&ser_ctx, valid).await.is_ok());
+
+        let invalid = json_order("bad", 2, &["a", "b"], "12345");
+        let err = ser.serialize(&ser_ctx, invalid).await.unwrap_err();
+        assert!(
+            matches!(err, SerdeError::ValidationRules(_)),
+            "unexpected error: {err}"
+        );
     }
 }

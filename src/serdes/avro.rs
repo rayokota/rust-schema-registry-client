@@ -11,6 +11,11 @@ use crate::serdes::serde::{
     get_executor, get_executors, load_associated_subject, parse_subject_name_strategy_type,
     topic_name_strategy,
 };
+use crate::serdes::validation_rule::{
+    VALIDATION_RULES_PROP, ValidationRule, ValidationRuleError, ValidationRuleExecutor,
+    ValidationRulesExecution, append_validation_path, evaluate_validation_rule,
+    parse_validation_rules, raise_validation_violations,
+};
 use apache_avro::schema::{Name, RecordField, RecordSchema, UnionSchema};
 use apache_avro::types::Value;
 use async_recursion::async_recursion;
@@ -131,6 +136,12 @@ impl<'a, T: Client + Sync> AvroSerializer<'a, T> {
         if let Some(ref latest_schema) = latest_schema {
             let schema = latest_schema.to_schema();
             schema_tuple = self.get_parsed_schema(&schema).await?;
+            if self
+                .base
+                .validation_enabled(Some(ValidationRulesExecution::BeforeDomainRules))
+            {
+                self.validate_inline_rules(&schema_tuple, &value)?;
+            }
             let field_transformer: FieldTransformer =
                 Box::new(|ctx, value| transform_fields(ctx, value).boxed());
             let serde_value = self
@@ -150,12 +161,23 @@ impl<'a, T: Client + Sync> AvroSerializer<'a, T> {
             value = match serde_value {
                 SerdeValue::Avro(value) => value,
                 _ => return Err(Serialization("unexpected serde value".to_string())),
+            };
+            if self
+                .base
+                .validation_enabled(Some(ValidationRulesExecution::AfterDomainRules))
+            {
+                self.validate_inline_rules(&schema_tuple, &value)?;
             }
         } else {
             let schema = self
                 .schema
                 .ok_or(Serialization("schema needs to be set".to_string()))?;
             schema_tuple = self.get_parsed_schema(schema).await?;
+            // No domain rules run on this path, so there is a single validation point
+            // regardless of the configured phase.
+            if self.base.validation_enabled(None) {
+                self.validate_inline_rules(&schema_tuple, &value)?;
+            }
         }
 
         let mut encoded_bytes = if matches!(schema_tuple.0, apache_avro::Schema::Bytes) {
@@ -201,6 +223,23 @@ impl<'a, T: Client + Sync> AvroSerializer<'a, T> {
 
         let id_ser = self.base.config.schema_id_serializer;
         id_ser(&encoded_bytes, ctx, &schema_id)
+    }
+
+    /// Evaluates the schema's inline validation rules against `value`, returning a single
+    /// error listing every violation found.
+    fn validate_inline_rules(
+        &self,
+        schema_tuple: &(apache_avro::Schema, Vec<apache_avro::Schema>),
+        value: &Value,
+    ) -> Result<(), SerdeError> {
+        let executor = self.base.validation_executor()?;
+        raise_validation_violations(validate_message(
+            executor.as_ref(),
+            &schema_tuple.0,
+            &schema_tuple.1,
+            value,
+            self.base.config.validation_rules_fail_fast,
+        ))
     }
 
     async fn get_parsed_schema(
@@ -707,6 +746,20 @@ async fn transform(
 ) -> Result<Value, SerdeError> {
     match schema {
         apache_avro::Schema::Union(union) => {
+            // A `Value::Union` carries its branch index, and that index is authoritative:
+            // `resolve_union` matches structurally, and a `Value::Record` does not record
+            // which schema it came from, so it cannot tell two records of the same shape
+            // apart. Descend with the unwrapped value - the branch schema describes the
+            // inner value, not the wrapper - then re-wrap so the result is still a valid
+            // union value.
+            if let Value::Union(index, inner) = message {
+                let Some(subschema) = union.variants().get(*index as usize) else {
+                    return Ok(message.clone());
+                };
+                let result = transform(ctx, subschema, named_schemas, inner).await?;
+                return Ok(Value::Union(*index, Box::new(result)));
+            }
+            // Not wrapped in a union: fall back to matching structurally.
             let subschema = resolve_union(union, message);
             if subschema.is_none() {
                 return Ok(message.clone());
@@ -857,6 +910,254 @@ fn get_inline_tags(field: &RecordField) -> HashSet<String> {
     HashSet::new()
 }
 
+/// Walks `message` against `schema`, evaluating every inline `confluent:rules` CHECK
+/// constraint encountered and collecting all failures. Read-only — the message is not
+/// modified.
+///
+/// Two kinds of rules are evaluated:
+///   - Record-level (`confluent:rules` on a record schema) — `this` is the record.
+///   - Field-level (`confluent:rules` on a record's field) — `this` is the field value.
+///     Honors the skip-on-null contract: a null field value does not have its rules
+///     invoked.
+///
+/// Failures carry their dotted-path location (e.g. `addr.zip`, `tags[3]`,
+/// `scores["foo"]`). The walk continues after each failure so callers see the full set
+/// rather than only the first, unless `fail_fast` is set.
+fn validate_message(
+    executor: &dyn ValidationRuleExecutor,
+    schema: &apache_avro::Schema,
+    named_schemas: &[apache_avro::Schema],
+    message: &Value,
+    fail_fast: bool,
+) -> Vec<ValidationRuleError> {
+    let mut definitions = HashMap::new();
+    collect_named_schemas(schema, &mut definitions);
+    for named in named_schemas {
+        collect_named_schemas(named, &mut definitions);
+    }
+    let mut violations = Vec::new();
+    validate(
+        executor,
+        schema,
+        &definitions,
+        "",
+        message,
+        fail_fast,
+        &mut violations,
+    );
+    violations
+}
+
+/// Indexes every named definition reachable from `schema` by name, so that a
+/// [`apache_avro::Schema::Ref`] can be resolved back to the definition carrying the inline
+/// rules. Recursion terminates because a recursive type reaches itself through a `Ref`,
+/// which has no children.
+fn collect_named_schemas<'a>(
+    schema: &'a apache_avro::Schema,
+    out: &mut HashMap<Name, &'a apache_avro::Schema>,
+) {
+    match schema {
+        apache_avro::Schema::Record(record) => {
+            out.insert(record.name.clone(), schema);
+            for field in &record.fields {
+                collect_named_schemas(&field.schema, out);
+            }
+        }
+        apache_avro::Schema::Enum(enum_schema) => {
+            out.insert(enum_schema.name.clone(), schema);
+        }
+        apache_avro::Schema::Fixed(fixed) => {
+            out.insert(fixed.name.clone(), schema);
+        }
+        apache_avro::Schema::Array(array) => collect_named_schemas(&array.items, out),
+        apache_avro::Schema::Map(map) => collect_named_schemas(&map.types, out),
+        apache_avro::Schema::Union(union) => {
+            for variant in union.variants() {
+                collect_named_schemas(variant, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Mirrors [`transform`]'s switch-on-schema-type dispatch shape.
+fn validate(
+    executor: &dyn ValidationRuleExecutor,
+    schema: &apache_avro::Schema,
+    named_schemas: &HashMap<Name, &apache_avro::Schema>,
+    path: &str,
+    message: &Value,
+    fail_fast: bool,
+    violations: &mut Vec<ValidationRuleError>,
+) {
+    if fail_fast && !violations.is_empty() {
+        return;
+    }
+    match schema {
+        apache_avro::Schema::Union(union) => {
+            // Descend into the branch the value actually holds, carrying the unwrapped
+            // value: the branch schema describes the inner value, not the union wrapper.
+            //
+            // A `Value::Union` carries its branch index, and that index is authoritative.
+            // `resolve_union` matches structurally, and a `Value::Record` does not record
+            // which schema it came from, so it cannot tell two records of the same shape
+            // apart and would pick whichever resolves first. Only fall back to matching
+            // when the value is not wrapped in a union.
+            let (subschema, inner) = match message {
+                Value::Union(index, inner) => (
+                    union.variants().get(*index as usize),
+                    unwrap_union(inner.as_ref()),
+                ),
+                other => (resolve_union(union, other).map(|(_, schema)| schema), other),
+            };
+            if let Some(subschema) = subschema {
+                validate(
+                    executor,
+                    subschema,
+                    named_schemas,
+                    path,
+                    inner,
+                    fail_fast,
+                    violations,
+                );
+            }
+        }
+        apache_avro::Schema::Array(array) => {
+            if let Value::Array(items) = message {
+                for (i, item) in items.iter().enumerate() {
+                    validate(
+                        executor,
+                        &array.items,
+                        named_schemas,
+                        &format!("{path}[{i}]"),
+                        item,
+                        fail_fast,
+                        violations,
+                    );
+                    if fail_fast && !violations.is_empty() {
+                        return;
+                    }
+                }
+            }
+        }
+        apache_avro::Schema::Map(map) => {
+            if let Value::Map(values) = message {
+                for (key, value) in values {
+                    validate(
+                        executor,
+                        &map.types,
+                        named_schemas,
+                        &format!("{path}[\"{key}\"]"),
+                        value,
+                        fail_fast,
+                        violations,
+                    );
+                    if fail_fast && !violations.is_empty() {
+                        return;
+                    }
+                }
+            }
+        }
+        apache_avro::Schema::Record(record) => {
+            let Value::Record(fields) = message else {
+                return;
+            };
+            // Record-level rules: `this` is the record itself.
+            if evaluate_rules(
+                executor,
+                parse_validation_rules(record.attributes.get(VALIDATION_RULES_PROP)),
+                message,
+                path,
+                fail_fast,
+                violations,
+            ) {
+                return;
+            }
+            for (name, value) in fields {
+                let Some(field) = record.fields.iter().find(|f| &f.name == name) else {
+                    continue;
+                };
+                let field_path = append_validation_path(path, name);
+                // Field-level rules: `this` is the field value.
+                if evaluate_rules(
+                    executor,
+                    parse_validation_rules(field.custom_attributes.get(VALIDATION_RULES_PROP)),
+                    value,
+                    &field_path,
+                    fail_fast,
+                    violations,
+                ) {
+                    return;
+                }
+                validate(
+                    executor,
+                    &field.schema,
+                    named_schemas,
+                    &field_path,
+                    value,
+                    fail_fast,
+                    violations,
+                );
+                if fail_fast && !violations.is_empty() {
+                    return;
+                }
+            }
+        }
+        apache_avro::Schema::Ref { name } => {
+            // A reference to a named schema; the rules live on the definition, so resolve
+            // it before descending. Definitions may be inline in the schema being walked
+            // (including recursive references to it) as well as in the referenced schemas.
+            if let Some(resolved) = named_schemas.get(name) {
+                validate(
+                    executor,
+                    resolved,
+                    named_schemas,
+                    path,
+                    message,
+                    fail_fast,
+                    violations,
+                );
+            }
+        }
+        // Primitives, enums and fixed have no children, and their rules were evaluated by
+        // the declaring record.
+        _ => {}
+    }
+}
+
+/// Resolves a value through any enclosing unions, so that a rule on a nullable field sees
+/// the underlying value rather than the union wrapper.
+fn unwrap_union(value: &Value) -> &Value {
+    match value {
+        Value::Union(_, inner) => unwrap_union(inner),
+        _ => value,
+    }
+}
+
+/// Evaluates the given rules against `value`, skipping null values to honor the
+/// skip-on-null contract. Returns whether the walk should stop.
+fn evaluate_rules(
+    executor: &dyn ValidationRuleExecutor,
+    rules: Vec<ValidationRule>,
+    value: &Value,
+    path: &str,
+    fail_fast: bool,
+    violations: &mut Vec<ValidationRuleError>,
+) -> bool {
+    let value = unwrap_union(value);
+    if rules.is_empty() || matches!(value, Value::Null) {
+        return false;
+    }
+    let serde_value = SerdeValue::Avro(value.clone());
+    for rule in &rules {
+        evaluate_validation_rule(executor, rule, &serde_value, path, violations);
+        if fail_fast && !violations.is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
 fn resolve_union<'a>(
     union: &'a UnionSchema,
     message: &Value,
@@ -957,6 +1258,7 @@ mod tests {
     use crate::rest::schema_registry_client::Client;
     use crate::rules::cel::cel_executor::CelExecutor;
     use crate::rules::cel::cel_field_executor::CelFieldExecutor;
+    use crate::rules::cel::cel_validator::CelValidator;
     use crate::rules::encryption::encrypt_executor::{
         EncryptionExecutor, FakeClock, FieldEncryptionExecutor,
     };
@@ -2693,6 +2995,504 @@ mod tests {
             } else {
                 unreachable!();
             }
+        }
+    }
+
+    const VALIDATION_SCHEMA: &str = r#"
+    {
+        "type": "record",
+        "name": "Order",
+        "namespace": "test",
+        "confluent:rules": [
+            {"name": "quantity_matches_items",
+             "expr": "this.quantity == size(this.items)"}
+        ],
+        "fields": [
+            {"name": "id", "type": "string",
+             "confluent:rules": [
+                {"name": "id_prefix", "expr": "this.startsWith('ord-')"},
+                {"name": "id_length", "expr": "size(this) > 4 ? '' : 'id is too short'"}
+             ]},
+            {"name": "quantity", "type": "int",
+             "confluent:rules": [
+                {"name": "positive_quantity", "doc": "quantity must be positive",
+                 "expr": "this > 0"}
+             ]},
+            {"name": "items", "type": {"type": "array", "items": "string"}},
+            {"name": "note", "type": ["null", "string"],
+             "confluent:rules": [
+                {"name": "note_not_empty", "expr": "size(this) > 0"}
+             ]},
+            {"name": "address", "type": {
+                "type": "record",
+                "name": "Address",
+                "fields": [
+                    {"name": "zip", "type": "string",
+                     "confluent:rules": [
+                        {"name": "zip_digits",
+                         "expr": "this.matches('^[0-9]{5}$') ? '' : 'zip must be 5 digits'"}
+                     ]}
+                ]
+            }}
+        ]
+    }
+    "#;
+
+    fn validation_order(
+        id: &str,
+        quantity: i32,
+        items: &[&str],
+        zip: &str,
+        note: Option<&str>,
+    ) -> Value {
+        Record(vec![
+            ("id".to_string(), Value::String(id.to_string())),
+            ("quantity".to_string(), Value::Int(quantity)),
+            (
+                "items".to_string(),
+                Value::Array(items.iter().map(|i| Value::String(i.to_string())).collect()),
+            ),
+            (
+                "note".to_string(),
+                match note {
+                    None => Union(0, Box::new(Value::Null)),
+                    Some(note) => Union(1, Box::new(Value::String(note.to_string()))),
+                },
+            ),
+            (
+                "address".to_string(),
+                Record(vec![("zip".to_string(), Value::String(zip.to_string()))]),
+            ),
+        ])
+    }
+
+    fn validate_avro(message: &Value, fail_fast: bool) -> Vec<ValidationRuleError> {
+        let parsed = apache_avro::Schema::parse_str(VALIDATION_SCHEMA).unwrap();
+        let validator = CelValidator::new();
+        validate_message(&validator, &parsed, &[], message, fail_fast)
+    }
+
+    fn validation_schema() -> Schema {
+        Schema {
+            schema_type: Some("AVRO".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: None,
+            schema: VALIDATION_SCHEMA.to_string(),
+        }
+    }
+
+    fn validating_registry() -> RuleRegistry {
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(CelExecutor::new());
+        rule_registry.register_validation_executor(CelValidator::new());
+        rule_registry
+    }
+
+    #[test]
+    fn test_validation_valid_record_has_no_violations() {
+        let message = validation_order("ord-1234", 2, &["a", "b"], "12345", None);
+        assert_eq!(validate_avro(&message, false), vec![]);
+    }
+
+    #[test]
+    fn test_validation_collects_every_violation() {
+        // Fails: record-level count, id prefix, id length, quantity, nested zip.
+        let message = validation_order("x", 0, &["a"], "abc", None);
+        let violations = validate_avro(&message, false);
+
+        assert_eq!(violations.len(), 5, "{violations:?}");
+        assert_eq!(violations[0].rule.name, "quantity_matches_items");
+        assert_eq!(violations[0].field_path, "");
+        assert_eq!(violations[1].rule.name, "id_prefix");
+        assert_eq!(violations[1].field_path, "id");
+        assert_eq!(violations[2].rule.name, "id_length");
+        assert_eq!(violations[2].message, "id is too short");
+        assert_eq!(violations[3].rule.name, "positive_quantity");
+        assert_eq!(violations[3].field_path, "quantity");
+        assert_eq!(violations[4].rule.name, "zip_digits");
+        assert_eq!(violations[4].field_path, "address.zip");
+        assert_eq!(violations[4].message, "zip must be 5 digits");
+    }
+
+    #[test]
+    fn test_validation_fail_fast_stops_at_first_violation() {
+        let message = validation_order("x", 0, &["a"], "abc", None);
+        assert_eq!(validate_avro(&message, true).len(), 1);
+    }
+
+    #[test]
+    fn test_validation_skips_rules_on_null_fields() {
+        // note is null, so note_not_empty must not be invoked.
+        let message = validation_order("ord-1234", 2, &["a", "b"], "12345", None);
+        assert!(validate_avro(&message, false).is_empty());
+
+        let message = validation_order("ord-1234", 2, &["a", "b"], "12345", Some(""));
+        let violations = validate_avro(&message, false);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].rule.name, "note_not_empty");
+        assert_eq!(violations[0].field_path, "note");
+    }
+
+    #[tokio::test]
+    async fn test_validation_serializer_rejects_invalid_message() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let mut ser_conf = SerializerConfig::default();
+        ser_conf.validation_rules_execution = ValidationRulesExecution::AfterDomainRules;
+        let schema = validation_schema();
+        let ser = AvroSerializer::new(
+            &client,
+            Some(&schema),
+            Some(validating_registry()),
+            ser_conf,
+        )
+        .unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Avro,
+            headers: None,
+        };
+
+        let valid = validation_order("ord-1234", 2, &["a", "b"], "12345", None);
+        assert!(ser.serialize(&ser_ctx, valid).await.is_ok());
+
+        let invalid = validation_order("bad", 2, &["a", "b"], "12345", None);
+        let err = ser.serialize(&ser_ctx, invalid).await.unwrap_err();
+        assert!(
+            matches!(err, SerdeError::ValidationRules(_)),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validation_serializer_skips_validation_when_disabled() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let schema = validation_schema();
+        let ser = AvroSerializer::new(
+            &client,
+            Some(&schema),
+            Some(validating_registry()),
+            SerializerConfig::default(),
+        )
+        .unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Avro,
+            headers: None,
+        };
+
+        let invalid = validation_order("bad", 2, &["a", "b"], "12345", None);
+        assert!(ser.serialize(&ser_ctx, invalid).await.is_ok());
+    }
+
+    /// Registers a schema whose domain rule always fails, so that the order of the two
+    /// failures tells us which phase ran first.
+    async fn register_schema_with_failing_domain_rule(client: &MockSchemaRegistryClient) {
+        let rule = Rule {
+            name: "always-fails".to_string(),
+            doc: None,
+            kind: Some(Kind::Condition),
+            mode: Some(Mode::Write),
+            r#type: "CEL".to_string(),
+            tags: None,
+            params: None,
+            expr: Some("message.quantity > 100".to_string()),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let schema = Schema {
+            schema_type: Some("AVRO".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(RuleSet {
+                migration_rules: None,
+                domain_rules: Some(vec![rule]),
+                encoding_rules: None,
+                enable_at: None,
+            })),
+            schema: VALIDATION_SCHEMA.to_string(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+    }
+
+    fn latest_version_config(execution: ValidationRulesExecution) -> SerializerConfig {
+        let mut config = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            true,
+            false,
+            HashMap::new(),
+        );
+        config.validation_rules_execution = execution;
+        config
+    }
+
+    #[tokio::test]
+    async fn test_validation_runs_before_domain_rules() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        register_schema_with_failing_domain_rule(&client).await;
+        let ser = AvroSerializer::new(
+            &client,
+            None,
+            Some(validating_registry()),
+            latest_version_config(ValidationRulesExecution::BeforeDomainRules),
+        )
+        .unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Avro,
+            headers: None,
+        };
+
+        // Both the inline rules and the domain rule fail; validation first means the
+        // validation failure is what surfaces.
+        let invalid = validation_order("bad", 2, &["a", "b"], "12345", None);
+        let err = ser.serialize(&ser_ctx, invalid).await.unwrap_err();
+        assert!(
+            matches!(err, SerdeError::ValidationRules(_)),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validation_runs_after_domain_rules() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        register_schema_with_failing_domain_rule(&client).await;
+        let ser = AvroSerializer::new(
+            &client,
+            None,
+            Some(validating_registry()),
+            latest_version_config(ValidationRulesExecution::AfterDomainRules),
+        )
+        .unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Avro,
+            headers: None,
+        };
+
+        // Same message, but the domain rule now runs first, so its failure surfaces
+        // instead of the validation failure.
+        let invalid = validation_order("bad", 2, &["a", "b"], "12345", None);
+        let err = ser.serialize(&ser_ctx, invalid).await.unwrap_err();
+        assert!(
+            !matches!(err, SerdeError::ValidationRules(_)),
+            "expected the domain rule to fail, got: {err}"
+        );
+    }
+
+    const UNION_RECORD_SCHEMA: &str = r#"
+    {
+        "type": "record", "name": "Outer", "namespace": "test",
+        "fields": [
+            {"name": "inner", "type": ["null", {
+                "type": "record", "name": "Inner",
+                "fields": [
+                    {"name": "zip", "type": "string",
+                     "confluent:rules": [{"name": "zip_rule", "expr": "size(this) == 5"}]}
+                ]
+            }]}
+        ]
+    }
+    "#;
+
+    const NAMED_REF_SCHEMA: &str = r#"
+    {
+        "type": "record", "name": "Outer", "namespace": "test",
+        "fields": [
+            {"name": "first", "type": {
+                "type": "record", "name": "Inner",
+                "fields": [
+                    {"name": "zip", "type": "string",
+                     "confluent:rules": [{"name": "zip_rule", "expr": "size(this) == 5"}]}
+                ]
+            }},
+            {"name": "second", "type": "Inner"}
+        ]
+    }
+    "#;
+
+    fn inner_record() -> Value {
+        Record(vec![("zip".to_string(), Value::String("abc".to_string()))])
+    }
+
+    #[test]
+    fn test_validation_descends_into_union_branches() {
+        let parsed = apache_avro::Schema::parse_str(UNION_RECORD_SCHEMA).unwrap();
+        let validator = CelValidator::new();
+        let message = Record(vec![(
+            "inner".to_string(),
+            Union(1, Box::new(inner_record())),
+        )]);
+
+        // The record is reached through a union branch, so the branch schema must be walked
+        // against the unwrapped value rather than the union wrapper.
+        let violations = validate_message(&validator, &parsed, &[], &message, false);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].field_path, "inner.zip");
+    }
+
+    #[test]
+    fn test_validation_skips_null_union_branches() {
+        let parsed = apache_avro::Schema::parse_str(UNION_RECORD_SCHEMA).unwrap();
+        let validator = CelValidator::new();
+        let message = Record(vec![("inner".to_string(), Union(0, Box::new(Value::Null)))]);
+        assert_eq!(
+            validate_message(&validator, &parsed, &[], &message, false),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn test_validation_resolves_inline_named_references() {
+        let parsed = apache_avro::Schema::parse_str(NAMED_REF_SCHEMA).unwrap();
+        let validator = CelValidator::new();
+        let message = Record(vec![
+            ("first".to_string(), inner_record()),
+            ("second".to_string(), inner_record()),
+        ]);
+
+        // `second` reaches the same definition through a Schema::Ref, whose target is
+        // declared inline in this schema rather than in the referenced schemas.
+        let violations = validate_message(&validator, &parsed, &[], &message, false);
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert_eq!(violations[0].field_path, "first.zip");
+        assert_eq!(violations[1].field_path, "second.zip");
+    }
+
+    const UNION_OF_RECORDS_SCHEMA: &str = r#"
+    {
+        "type": "record", "name": "Outer", "namespace": "test",
+        "fields": [
+            {"name": "choice", "type": [
+                {"type": "record", "name": "A", "fields": [
+                    {"name": "v", "type": "string",
+                     "confluent:rules": [{"name": "ruleA", "expr": "false"}]}
+                ]},
+                {"type": "record", "name": "B", "fields": [
+                    {"name": "v", "type": "string",
+                     "confluent:rules": [{"name": "ruleB", "expr": "false"}]}
+                ]}
+            ]}
+        ]
+    }
+    "#;
+
+    #[test]
+    fn test_validation_uses_the_union_branch_the_value_names() {
+        let parsed = apache_avro::Schema::parse_str(UNION_OF_RECORDS_SCHEMA).unwrap();
+        let validator = CelValidator::new();
+        let branch = Record(vec![("v".to_string(), Value::String("x".to_string()))]);
+
+        // Both branches are records of the same shape, so structural matching cannot tell
+        // them apart; only the union index says which branch the value actually holds.
+        for (index, expected) in [(0u32, "ruleA"), (1u32, "ruleB")] {
+            let message = Record(vec![(
+                "choice".to_string(),
+                Union(index, Box::new(branch.clone())),
+            )]);
+            let violations = validate_message(&validator, &parsed, &[], &message, false);
+            assert_eq!(violations.len(), 1, "index {index}: {violations:?}");
+            assert_eq!(violations[0].rule.name, expected, "index {index}");
+            assert_eq!(violations[0].field_path, "choice.v");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cel_field_transforms_nullable_fields() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            true,
+            false,
+            HashMap::new(),
+        );
+        let schema_str = r#"
+        {
+            "type": "record",
+            "name": "test",
+            "fields": [
+                {"name": "plain", "type": "string"},
+                {"name": "nullable", "type": ["null", "string"]}
+            ]
+        }
+        "#;
+        let rule = Rule {
+            name: "test-cel".to_string(),
+            doc: None,
+            kind: Some(Kind::Transform),
+            mode: Some(Mode::Write),
+            r#type: "CEL_FIELD".to_string(),
+            tags: None,
+            params: None,
+            expr: Some("typeName == 'STRING' ; value + '-suffix'".to_string()),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let schema = Schema {
+            schema_type: Some("AVRO".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(RuleSet {
+                migration_rules: None,
+                domain_rules: Some(vec![rule]),
+                encoding_rules: None,
+                enable_at: None,
+            })),
+            schema: schema_str.to_string(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(CelFieldExecutor::new());
+        let ser = AvroSerializer::new(&client, None, Some(rule_registry), ser_conf).unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Avro,
+            headers: None,
+        };
+        let message = Record(vec![
+            ("plain".to_string(), Value::String("a".to_string())),
+            (
+                "nullable".to_string(),
+                Union(1, Box::new(Value::String("b".to_string()))),
+            ),
+        ]);
+        // The rule must see the value inside the union, not the wrapper, and the
+        // transformed value must go back into the union it came from.
+        let bytes = ser.serialize(&ser_ctx, message).await.unwrap();
+
+        let deser = AvroDeserializer::new(&client, None, DeserializerConfig::default()).unwrap();
+        let obj2 = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        let expected = vec![
+            ("plain".to_string(), Value::String("a-suffix".to_string())),
+            (
+                "nullable".to_string(),
+                Union(1, Box::new(Value::String("b-suffix".to_string()))),
+            ),
+        ];
+        if let Record(v) = obj2.value {
+            assert_eq!(v, expected);
+        } else {
+            unreachable!();
         }
     }
 }

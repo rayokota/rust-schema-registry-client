@@ -2,10 +2,10 @@ use crate::rules::cel::cel_lib::default_context;
 use crate::serdes::serde::{RuleBase, RuleContext, RuleExecutor, SerdeError, SerdeValue};
 use async_trait::async_trait;
 use cel_interpreter::objects::{Key, Map};
-use cel_interpreter::{Context, ExecutionError, ParseError, Program, Value};
+use cel_interpreter::{Context, ExecutionError, ParseErrors, Program, Value};
 use dashmap::DashMap;
 use prost::bytes::Bytes;
-use prost_reflect::MapKey;
+use prost_reflect::{MapKey, ReflectMessage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -145,19 +145,30 @@ fn from_protobuf_value(value: &prost_reflect::Value) -> Value {
         prost_reflect::Value::Bool(v) => Value::Bool(*v),
         prost_reflect::Value::I32(v) => Value::Int(*v as i64),
         prost_reflect::Value::I64(v) => Value::Int(*v),
-        prost_reflect::Value::U32(v) => Value::Int(*v as i64),
-        prost_reflect::Value::U64(v) => Value::Int(*v as i64),
+        // CEL has a distinct unsigned type; mapping these to Int would wrap any u64
+        // above i64::MAX to a negative number, so `this > 0` would reject valid values.
+        prost_reflect::Value::U32(v) => Value::UInt(*v as u64),
+        prost_reflect::Value::U64(v) => Value::UInt(*v),
         prost_reflect::Value::F32(v) => Value::Float(*v as f64),
         prost_reflect::Value::F64(v) => Value::Float(*v),
         prost_reflect::Value::String(v) => Value::String(Arc::new(v.clone())),
         prost_reflect::Value::Bytes(v) => Value::Bytes(Arc::new(v.to_vec())),
         prost_reflect::Value::EnumNumber(v) => Value::Int(*v as i64),
         prost_reflect::Value::Message(msg) => {
-            let mut map: HashMap<Key, Value> = HashMap::with_capacity(msg.fields().count());
-            for (fd, v) in msg.fields() {
+            // Walk the descriptor rather than only the populated fields: a proto3 scalar
+            // sitting at its default is still set as far as the language is concerned, and
+            // omitting it makes an expression like `msg.count == 0` fail with "no such
+            // key". Fields with explicit presence (optional, oneof members, messages) are
+            // still omitted when unset, so `has(...)` keeps working.
+            let descriptor = msg.descriptor();
+            let mut map: HashMap<Key, Value> = HashMap::with_capacity(descriptor.fields().len());
+            for fd in descriptor.fields() {
+                if fd.supports_presence() && !msg.has_field(&fd) {
+                    continue;
+                }
                 map.insert(
                     Key::String(Arc::new(fd.name().to_string())),
-                    from_protobuf_value(v),
+                    from_protobuf_value(&msg.get_field(&fd)),
                 );
             }
             Value::Map(Map { map: Arc::new(map) })
@@ -378,8 +389,8 @@ impl From<ExecutionError> for SerdeError {
     }
 }
 
-impl From<ParseError> for SerdeError {
-    fn from(value: ParseError) -> Self {
+impl From<ParseErrors> for SerdeError {
+    fn from(value: ParseErrors) -> Self {
         SerdeError::Rule(format!("CEL parse error: {value}"))
     }
 }

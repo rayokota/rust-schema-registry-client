@@ -1,4 +1,5 @@
 use crate::serdes::serde::{RuleAction, RuleExecutor};
+use crate::serdes::validation_rule::ValidationRuleExecutor;
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use std::sync::{Arc, RwLock};
@@ -21,6 +22,9 @@ pub struct RuleRegistry {
     rule_executors: Arc<DashMap<String, Arc<dyn RuleExecutor>>>,
     rule_actions: Arc<DashMap<String, Arc<dyn RuleAction>>>,
     rule_overrides: Arc<DashMap<String, RuleOverride>>,
+    /// Unlike rule executors there is a single validation executor, so registering one
+    /// replaces any previous.
+    validation_executor: Arc<RwLock<Option<Arc<dyn ValidationRuleExecutor>>>>,
 }
 
 impl Default for RuleRegistry {
@@ -35,6 +39,7 @@ impl RuleRegistry {
             rule_executors: Arc::new(DashMap::new()),
             rule_actions: Arc::new(DashMap::new()),
             rule_overrides: Arc::new(DashMap::new()),
+            validation_executor: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -51,6 +56,16 @@ impl RuleRegistry {
     pub fn get_executors(&self) -> Vec<Arc<dyn RuleExecutor>> {
         let rule_executors = &self.rule_executors;
         rule_executors.iter().map(|e| e.value().clone()).collect()
+    }
+
+    pub fn register_validation_executor<T: ValidationRuleExecutor + 'static>(&self, executor: T) {
+        let mut validation_executor = self.validation_executor.write().unwrap();
+        *validation_executor = Some(Arc::new(executor));
+    }
+
+    pub fn get_validation_executor(&self) -> Option<Arc<dyn ValidationRuleExecutor>> {
+        let validation_executor = self.validation_executor.read().unwrap();
+        validation_executor.clone()
     }
 
     pub fn register_action<T: RuleAction + 'static>(&self, action: T) {
@@ -97,6 +112,16 @@ pub fn get_rule_executor(r#type: &str) -> Option<Arc<dyn RuleExecutor>> {
 pub fn get_rule_executors() -> Vec<Arc<dyn RuleExecutor>> {
     let registry = GLOBAL_RULE_REGISTRY.read().unwrap();
     registry.get_executors()
+}
+
+pub fn register_validation_rule_executor<T: ValidationRuleExecutor + 'static>(executor: T) {
+    let registry = GLOBAL_RULE_REGISTRY.write().unwrap();
+    registry.register_validation_executor(executor);
+}
+
+pub fn get_validation_rule_executor() -> Option<Arc<dyn ValidationRuleExecutor>> {
+    let registry = GLOBAL_RULE_REGISTRY.read().unwrap();
+    registry.get_validation_executor()
 }
 
 pub fn register_rule_action<T: RuleAction + 'static>(action: T) {
