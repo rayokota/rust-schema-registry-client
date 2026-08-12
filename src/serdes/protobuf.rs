@@ -196,7 +196,7 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
                 .base
                 .validation_enabled(Some(ValidationRulesExecution::BeforeDomainRules))
             {
-                self.validate_inline_rules(md, &msg)?;
+                self.validate_inline_rules(Some(&fd), md, &msg)?;
             }
             let serde_value = self
                 .base
@@ -220,7 +220,7 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
                 .base
                 .validation_enabled(Some(ValidationRulesExecution::AfterDomainRules))
             {
-                self.validate_inline_rules(md, &msg)?;
+                self.validate_inline_rules(Some(&fd), md, &msg)?;
             }
             msg.encode(&mut encoded_bytes)?;
             if let Some(ref rule_set) = schema.rule_set
@@ -249,7 +249,8 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
             if self.base.validation_enabled(None) {
                 let mut msg = DynamicMessage::new(md.clone());
                 msg.transcode_from(value)?;
-                self.validate_inline_rules(md, &msg)?;
+                // No registry schema on this path, so the local descriptor is all there is.
+                self.validate_inline_rules(None, md, &msg)?;
             }
             value.encode(&mut encoded_bytes)?;
         }
@@ -261,16 +262,32 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
 
     /// Evaluates the message's inline validation rules, returning a single error listing
     /// every violation found.
+    ///
+    /// When a schema was selected from the registry, its descriptor is the one carrying the
+    /// rules — the producer's locally generated descriptor may predate them — so resolve
+    /// the message there and validate against it. Mirrors what the field transformer does
+    /// for domain rules.
     fn validate_inline_rules(
         &self,
+        fd: Option<&FileDescriptor>,
         md: &MessageDescriptor,
         msg: &DynamicMessage,
     ) -> Result<(), SerdeError> {
         let executor = self.base.validation_executor()?;
+        let mut schema_msg = None;
+        let mut schema_md = None;
+        if let Some(fd) = fd
+            && let Some(desc) = fd.parent_pool().get_message_by_name(md.full_name())
+        {
+            let mut transcoded = DynamicMessage::new(desc.clone());
+            transcoded.transcode_from(msg)?;
+            schema_msg = Some(transcoded);
+            schema_md = Some(desc);
+        }
         raise_validation_violations(validate_message(
             executor.as_ref(),
-            md,
-            msg,
+            schema_md.as_ref().unwrap_or(md),
+            schema_msg.as_ref().unwrap_or(msg),
             self.base.config.validation_rules_fail_fast,
         ))
     }
@@ -2233,5 +2250,85 @@ mod tests {
             matches!(err, SerdeError::ValidationRules(_)),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_validation_allows_defaulted_proto3_scalars() {
+        // quantity and items are both at their proto3 defaults, so
+        // `this.quantity == size(this.items)` holds; the message-level rule must be able to
+        // see them rather than failing with "no such key".
+        let message = ValidationOrder {
+            id: "ord-1234".to_string(),
+            quantity: 0,
+            items: vec![],
+            address: None,
+            scores: HashMap::new(),
+        };
+        let violations = validate_proto(&message, false);
+
+        assert!(
+            violations.iter().all(|v| v.cause.is_empty()),
+            "no rule should fail to evaluate: {violations:?}"
+        );
+        assert!(
+            !violations
+                .iter()
+                .any(|v| v.rule.name == "quantity_matches_items"),
+            "{violations:?}"
+        );
+        // quantity = 0 still legitimately fails `this > 0`.
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].rule.name, "positive_quantity");
+    }
+
+    #[tokio::test]
+    async fn test_validation_uses_the_selected_schemas_descriptor() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let invalid = proto_order("bad", 2, &["a", "b"], Some("12345"));
+        let schema = Schema {
+            schema_type: Some("PROTOBUF".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: None,
+            schema: schema_to_str(&invalid.descriptor().parent_file()).unwrap(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+
+        let mut ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            true,
+            false,
+            HashMap::new(),
+        );
+        ser_conf.validation_rules_execution = ValidationRulesExecution::AfterDomainRules;
+        let ser = ProtobufSerializer::with_reference_subject_name_strategy(
+            &client,
+            default_reference_subject_name_strategy,
+            Some(validating_registry()),
+            ser_conf,
+        )
+        .unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Protobuf,
+            headers: None,
+        };
+
+        // Rules are read from the descriptor parsed out of the selected registry schema,
+        // not from the producer's locally generated one.
+        let err = ser.serialize(&ser_ctx, &invalid).await.unwrap_err();
+        assert!(
+            matches!(err, SerdeError::ValidationRules(_)),
+            "unexpected error: {err}"
+        );
+
+        let valid = proto_order("ord-1234", 2, &["a", "b"], Some("12345"));
+        assert!(ser.serialize(&ser_ctx, &valid).await.is_ok());
     }
 }

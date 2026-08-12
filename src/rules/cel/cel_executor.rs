@@ -5,7 +5,7 @@ use cel_interpreter::objects::{Key, Map};
 use cel_interpreter::{Context, ExecutionError, ParseErrors, Program, Value};
 use dashmap::DashMap;
 use prost::bytes::Bytes;
-use prost_reflect::MapKey;
+use prost_reflect::{MapKey, ReflectMessage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -153,11 +153,20 @@ fn from_protobuf_value(value: &prost_reflect::Value) -> Value {
         prost_reflect::Value::Bytes(v) => Value::Bytes(Arc::new(v.to_vec())),
         prost_reflect::Value::EnumNumber(v) => Value::Int(*v as i64),
         prost_reflect::Value::Message(msg) => {
-            let mut map: HashMap<Key, Value> = HashMap::with_capacity(msg.fields().count());
-            for (fd, v) in msg.fields() {
+            // Walk the descriptor rather than only the populated fields: a proto3 scalar
+            // sitting at its default is still set as far as the language is concerned, and
+            // omitting it makes an expression like `msg.count == 0` fail with "no such
+            // key". Fields with explicit presence (optional, oneof members, messages) are
+            // still omitted when unset, so `has(...)` keeps working.
+            let descriptor = msg.descriptor();
+            let mut map: HashMap<Key, Value> = HashMap::with_capacity(descriptor.fields().len());
+            for fd in descriptor.fields() {
+                if fd.supports_presence() && !msg.has_field(&fd) {
+                    continue;
+                }
                 map.insert(
                     Key::String(Arc::new(fd.name().to_string())),
-                    from_protobuf_value(v),
+                    from_protobuf_value(&msg.get_field(&fd)),
                 );
             }
             Value::Map(Map { map: Arc::new(map) })

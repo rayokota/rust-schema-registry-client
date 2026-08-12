@@ -916,11 +916,16 @@ fn validate_message(
     message: &Value,
     fail_fast: bool,
 ) -> Vec<ValidationRuleError> {
+    let mut definitions = HashMap::new();
+    collect_named_schemas(schema, &mut definitions);
+    for named in named_schemas {
+        collect_named_schemas(named, &mut definitions);
+    }
     let mut violations = Vec::new();
     validate(
         executor,
         schema,
-        named_schemas,
+        &definitions,
         "",
         message,
         fail_fast,
@@ -929,11 +934,43 @@ fn validate_message(
     violations
 }
 
+/// Indexes every named definition reachable from `schema` by name, so that a
+/// [`apache_avro::Schema::Ref`] can be resolved back to the definition carrying the inline
+/// rules. Recursion terminates because a recursive type reaches itself through a `Ref`,
+/// which has no children.
+fn collect_named_schemas<'a>(
+    schema: &'a apache_avro::Schema,
+    out: &mut HashMap<Name, &'a apache_avro::Schema>,
+) {
+    match schema {
+        apache_avro::Schema::Record(record) => {
+            out.insert(record.name.clone(), schema);
+            for field in &record.fields {
+                collect_named_schemas(&field.schema, out);
+            }
+        }
+        apache_avro::Schema::Enum(enum_schema) => {
+            out.insert(enum_schema.name.clone(), schema);
+        }
+        apache_avro::Schema::Fixed(fixed) => {
+            out.insert(fixed.name.clone(), schema);
+        }
+        apache_avro::Schema::Array(array) => collect_named_schemas(&array.items, out),
+        apache_avro::Schema::Map(map) => collect_named_schemas(&map.types, out),
+        apache_avro::Schema::Union(union) => {
+            for variant in union.variants() {
+                collect_named_schemas(variant, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Mirrors [`transform`]'s switch-on-schema-type dispatch shape.
 fn validate(
     executor: &dyn ValidationRuleExecutor,
     schema: &apache_avro::Schema,
-    named_schemas: &[apache_avro::Schema],
+    named_schemas: &HashMap<Name, &apache_avro::Schema>,
     path: &str,
     message: &Value,
     fail_fast: bool,
@@ -944,13 +981,16 @@ fn validate(
     }
     match schema {
         apache_avro::Schema::Union(union) => {
-            if let Some((_, subschema)) = resolve_union(union, message) {
+            // Descend into the branch the value actually holds, carrying the unwrapped
+            // value: the branch schema describes the inner value, not the union wrapper.
+            let inner = unwrap_union(message);
+            if let Some((_, subschema)) = resolve_union(union, inner) {
                 validate(
                     executor,
                     subschema,
                     named_schemas,
                     path,
-                    message,
+                    inner,
                     fail_fast,
                     violations,
                 );
@@ -1038,12 +1078,10 @@ fn validate(
             }
         }
         apache_avro::Schema::Ref { name } => {
-            // A reference to a named schema defined elsewhere; the rules live on the
-            // definition, so resolve it before descending.
-            if let Some(resolved) = named_schemas.iter().find(|s| match s {
-                apache_avro::Schema::Record(record) => &record.name == name,
-                _ => false,
-            }) {
+            // A reference to a named schema; the rules live on the definition, so resolve
+            // it before descending. Definitions may be inline in the schema being walked
+            // (including recursive references to it) as well as in the referenced schemas.
+            if let Some(resolved) = named_schemas.get(name) {
                 validate(
                     executor,
                     resolved,
@@ -3227,5 +3265,84 @@ mod tests {
             !matches!(err, SerdeError::ValidationRules(_)),
             "expected the domain rule to fail, got: {err}"
         );
+    }
+
+    const UNION_RECORD_SCHEMA: &str = r#"
+    {
+        "type": "record", "name": "Outer", "namespace": "test",
+        "fields": [
+            {"name": "inner", "type": ["null", {
+                "type": "record", "name": "Inner",
+                "fields": [
+                    {"name": "zip", "type": "string",
+                     "confluent:rules": [{"name": "zip_rule", "expr": "size(this) == 5"}]}
+                ]
+            }]}
+        ]
+    }
+    "#;
+
+    const NAMED_REF_SCHEMA: &str = r#"
+    {
+        "type": "record", "name": "Outer", "namespace": "test",
+        "fields": [
+            {"name": "first", "type": {
+                "type": "record", "name": "Inner",
+                "fields": [
+                    {"name": "zip", "type": "string",
+                     "confluent:rules": [{"name": "zip_rule", "expr": "size(this) == 5"}]}
+                ]
+            }},
+            {"name": "second", "type": "Inner"}
+        ]
+    }
+    "#;
+
+    fn inner_record() -> Value {
+        Record(vec![("zip".to_string(), Value::String("abc".to_string()))])
+    }
+
+    #[test]
+    fn test_validation_descends_into_union_branches() {
+        let parsed = apache_avro::Schema::parse_str(UNION_RECORD_SCHEMA).unwrap();
+        let validator = CelValidator::new();
+        let message = Record(vec![(
+            "inner".to_string(),
+            Union(1, Box::new(inner_record())),
+        )]);
+
+        // The record is reached through a union branch, so the branch schema must be walked
+        // against the unwrapped value rather than the union wrapper.
+        let violations = validate_message(&validator, &parsed, &[], &message, false);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].field_path, "inner.zip");
+    }
+
+    #[test]
+    fn test_validation_skips_null_union_branches() {
+        let parsed = apache_avro::Schema::parse_str(UNION_RECORD_SCHEMA).unwrap();
+        let validator = CelValidator::new();
+        let message = Record(vec![("inner".to_string(), Union(0, Box::new(Value::Null)))]);
+        assert_eq!(
+            validate_message(&validator, &parsed, &[], &message, false),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn test_validation_resolves_inline_named_references() {
+        let parsed = apache_avro::Schema::parse_str(NAMED_REF_SCHEMA).unwrap();
+        let validator = CelValidator::new();
+        let message = Record(vec![
+            ("first".to_string(), inner_record()),
+            ("second".to_string(), inner_record()),
+        ]);
+
+        // `second` reaches the same definition through a Schema::Ref, whose target is
+        // declared inline in this schema rather than in the referenced schemas.
+        let violations = validate_message(&validator, &parsed, &[], &message, false);
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert_eq!(violations[0].field_path, "first.zip");
+        assert_eq!(violations[1].field_path, "second.zip");
     }
 }
