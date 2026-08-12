@@ -11,7 +11,6 @@
 //!
 //!- Support for Avro, Protobuf, and JSON Schema formats
 //!- Data quality rules using Google Common Expression Language (CEL) expressions
-//!- Inline validation rules (CHECK constraints) declared on the schema itself
 //!- Schema migration rules using JSONata expressions
 //!- Client-side field-level encryption (CSFLE) rules using AWS KMS, Azure Key Vault, Google Cloud KMS, or HashiCorp Vault
 //!
