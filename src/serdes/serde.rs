@@ -6,9 +6,12 @@ use crate::rest::schema_registry_client::Client;
 use crate::serdes::config::{DeserializerConfig, SchemaSelector, SerializerConfig};
 use crate::serdes::rule_registry::{
     RuleOverride, RuleRegistry, get_rule_action, get_rule_actions, get_rule_executor,
-    get_rule_executors, get_rule_override, get_rule_overrides,
+    get_rule_executors, get_rule_override, get_rule_overrides, get_validation_rule_executor,
 };
 use crate::serdes::serde::SerdeError::Serialization;
+use crate::serdes::validation_rule::{
+    ValidationRuleExecutor, ValidationRulesExecution, ValidationRulesFailed,
+};
 use crate::serdes::wildcard_matcher::wildcard_match;
 use async_trait::async_trait;
 use base64::Engine;
@@ -262,6 +265,8 @@ pub enum SerdeError {
     Rest(#[from] RestError),
     #[error("serde error: {0}")]
     Serialization(String),
+    #[error("{0}")]
+    ValidationRules(Box<ValidationRulesFailed>),
     #[error("tink error")]
     Tink(#[from] TinkError),
 }
@@ -1047,6 +1052,37 @@ pub(crate) struct BaseSerializer<'a, T: Client> {
 impl<'a, T: Client> BaseSerializer<'a, T> {
     pub fn new(serde: Serde<'a, T>, config: SerializerConfig) -> BaseSerializer<'a, T> {
         BaseSerializer { serde, config }
+    }
+
+    /// Whether inline validation rules should run at the given phase.
+    ///
+    /// Pass `None` when there is a single validation point — a serialization path that
+    /// applies no domain rules has nothing to run before or after, so any enabled mode
+    /// validates there.
+    pub(crate) fn validation_enabled(&self, phase: Option<ValidationRulesExecution>) -> bool {
+        match phase {
+            None => self.config.validation_rules_execution != ValidationRulesExecution::Disabled,
+            Some(phase) => self.config.validation_rules_execution == phase,
+        }
+    }
+
+    /// The executor used to evaluate inline validation rules: the one registered on the
+    /// serializer's rule registry if any, otherwise the globally registered one.
+    pub(crate) fn validation_executor(
+        &self,
+    ) -> Result<Arc<dyn ValidationRuleExecutor>, SerdeError> {
+        if let Some(registry) = self.serde.rule_registry.as_ref()
+            && let Some(executor) = registry.get_validation_executor()
+        {
+            return Ok(executor);
+        }
+        get_validation_rule_executor().ok_or_else(|| {
+            Serialization(
+                "no validation rule executor registered; call CelValidator::register() or \
+                 register one on the serializer's rule registry"
+                    .to_string(),
+            )
+        })
     }
 }
 

@@ -2,7 +2,7 @@ use crate::rules::cel::cel_lib::default_context;
 use crate::serdes::serde::{RuleBase, RuleContext, RuleExecutor, SerdeError, SerdeValue};
 use async_trait::async_trait;
 use cel_interpreter::objects::{Key, Map};
-use cel_interpreter::{Context, ExecutionError, ParseError, Program, Value};
+use cel_interpreter::{Context, ExecutionError, ParseErrors, Program, Value};
 use dashmap::DashMap;
 use prost::bytes::Bytes;
 use prost_reflect::MapKey;
@@ -378,8 +378,8 @@ impl From<ExecutionError> for SerdeError {
     }
 }
 
-impl From<ParseError> for SerdeError {
-    fn from(value: ParseError) -> Self {
+impl From<ParseErrors> for SerdeError {
+    fn from(value: ParseErrors) -> Self {
         SerdeError::Rule(format!("CEL parse error: {value}"))
     }
 }

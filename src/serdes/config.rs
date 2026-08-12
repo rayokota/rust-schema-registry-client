@@ -2,6 +2,7 @@ use crate::serdes::serde::{
     SchemaIdDeserializer, SchemaIdSerializer, SubjectNameStrategyType, dual_schema_id_deserializer,
     prefix_schema_id_serializer,
 };
+use crate::serdes::validation_rule::ValidationRulesExecution;
 use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
@@ -21,6 +22,12 @@ pub struct SerializerConfig {
     pub subject_name_strategy_type: SubjectNameStrategyType,
     pub strategy_config: HashMap<String, String>,
     pub schema_id_serializer: SchemaIdSerializer,
+    /// When to evaluate the schema's inline validation rules. Disabled by default; set to
+    /// `BeforeDomainRules` or `AfterDomainRules` to run them.
+    pub validation_rules_execution: ValidationRulesExecution,
+    /// Stop at the first inline validation rule violation instead of collecting every
+    /// violation in the message.
+    pub validation_rules_fail_fast: bool,
 }
 
 impl SerializerConfig {
@@ -40,6 +47,8 @@ impl SerializerConfig {
             subject_name_strategy_type: SubjectNameStrategyType::Associated,
             strategy_config: HashMap::new(),
             schema_id_serializer: prefix_schema_id_serializer,
+            validation_rules_execution: ValidationRulesExecution::Disabled,
+            validation_rules_fail_fast: false,
         }
     }
 }
@@ -55,6 +64,8 @@ impl Default for SerializerConfig {
             subject_name_strategy_type: SubjectNameStrategyType::Associated,
             strategy_config: HashMap::new(),
             schema_id_serializer: prefix_schema_id_serializer,
+            validation_rules_execution: ValidationRulesExecution::Disabled,
+            validation_rules_fail_fast: false,
         }
     }
 }

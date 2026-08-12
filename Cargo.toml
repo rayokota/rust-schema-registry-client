@@ -14,7 +14,7 @@ edition = "2024"
 
 [features]
 rules = ["rules-cel", "rules-encryption-awskms", "rules-encryption-azurekms", "rules-encryption-gcpkms", "rules-encryption-hcvault", "rules-jsonata"]
-rules-cel = ["dep:cel-interpreter", "dep:email_address", "dep:fluent-uri", "dep:hostname-validator"]
+rules-cel = ["dep:cel-interpreter", "dep:chrono", "dep:email_address", "dep:fluent-uri", "dep:hostname-validator"]
 rules-encryption-awskms = ["dep:aws-config", "dep:aws-credential-types", "dep:aws-sdk-kms", "dep:hex", "rules-encryption-tink"]
 rules-encryption-azurekms = ["dep:azure_core", "dep:azure_identity", "dep:azure_security_keyvault", "rules-encryption-tink"]
 rules-encryption-gcpkms = ["dep:google-cloud-auth", "dep:google-cloud-kms-v1", "rules-encryption-tink"]
@@ -37,7 +37,8 @@ base64 = "0.22.1"
 bumpalo = { version = "3.19.0", optional = true }
 byteorder = "1.5.0"
 bytes = "1"
-cel-interpreter = { version ="0.9.1", optional = true }
+cel-interpreter = { version ="0.10.0", optional = true }
+chrono = { version = "0.4", optional = true }
 dashmap = "6.1.0"
 email_address = { version = "0.2.9", optional = true }
 fastrand = "2.3.0"

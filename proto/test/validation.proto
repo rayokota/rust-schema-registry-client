@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package test;
+
+import "confluent/meta.proto";
+
+message ValidationAddress {
+  string zip = 1 [(confluent.field_meta) = {
+    rules: [
+      { name: "zip_digits", expr: "this.matches('^[0-9]{5}$') ? '' : 'zip must be 5 digits'" }
+    ]
+  }];
+}
+
+message ValidationOrder {
+  option (confluent.message_meta) = {
+    rules: [
+      {
+        name: "quantity_matches_items",
+        doc: "quantity must match the number of items",
+        expr: "this.quantity == size(this.items)"
+      }
+    ]
+  };
+
+  string id = 1 [(confluent.field_meta) = {
+    rules: [
+      { name: "id_prefix", expr: "this.startsWith('ord-')" },
+      { name: "id_length", expr: "size(this) > 4 ? '' : 'id is too short'" }
+    ]
+  }];
+  int32 quantity = 2 [(confluent.field_meta) = {
+    rules: [
+      { name: "positive_quantity", doc: "quantity must be positive", expr: "this > 0" }
+    ]
+  }];
+  repeated string items = 3 [(confluent.field_meta) = {
+    rules: [
+      { name: "item_not_empty", expr: "size(this) > 0" }
+    ]
+  }];
+  ValidationAddress address = 4;
+  map<string, int32> scores = 5 [(confluent.field_meta) = {
+    rules: [
+      { name: "score_not_negative", expr: "this >= 0" }
+    ]
+  }];
+}

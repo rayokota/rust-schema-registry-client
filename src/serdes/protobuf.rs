@@ -12,6 +12,10 @@ use crate::serdes::serde::{
     get_executor, get_executors, load_associated_subject, parse_subject_name_strategy_type,
     topic_name_strategy,
 };
+use crate::serdes::validation_rule::{
+    ValidationRule, ValidationRuleError, ValidationRuleExecutor, ValidationRulesExecution,
+    append_validation_path, evaluate_validation_rule, raise_validation_violations,
+};
 use async_recursion::async_recursion;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
@@ -20,7 +24,7 @@ use futures::future::FutureExt;
 use prost::{Message, bytes};
 use prost_reflect::prost_types::{DescriptorProto, FileDescriptorProto};
 use prost_reflect::{
-    DescriptorPool, DynamicMessage, FieldDescriptor, FileDescriptor, MessageDescriptor,
+    DescriptorPool, DynamicMessage, FieldDescriptor, FileDescriptor, MapKey, MessageDescriptor,
     ReflectMessage, SerializeOptions, Value,
 };
 use prost_types::FileDescriptorSet;
@@ -188,6 +192,12 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
                 Box::new(|ctx, value| transform_fields(ctx, value).boxed());
             let mut msg = DynamicMessage::new(md.clone());
             msg.transcode_from(value)?;
+            if self
+                .base
+                .validation_enabled(Some(ValidationRulesExecution::BeforeDomainRules))
+            {
+                self.validate_inline_rules(md, &msg)?;
+            }
             let serde_value = self
                 .base
                 .serde
@@ -206,6 +216,12 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
                 SerdeValue::Protobuf(Value::Message(msg)) => msg,
                 _ => return Err(Serialization("unexpected serde value".to_string())),
             };
+            if self
+                .base
+                .validation_enabled(Some(ValidationRulesExecution::AfterDomainRules))
+            {
+                self.validate_inline_rules(md, &msg)?;
+            }
             msg.encode(&mut encoded_bytes)?;
             if let Some(ref rule_set) = schema.rule_set
                 && rule_set.encoding_rules.is_some()
@@ -228,12 +244,35 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
                     .as_bytes();
             }
         } else {
+            // No domain rules run on this path, so there is a single validation point
+            // regardless of the configured phase.
+            if self.base.validation_enabled(None) {
+                let mut msg = DynamicMessage::new(md.clone());
+                msg.transcode_from(value)?;
+                self.validate_inline_rules(md, &msg)?;
+            }
             value.encode(&mut encoded_bytes)?;
         }
 
         schema_id.message_indexes = Some(self.to_index_array(md)?);
         let id_ser = self.base.config.schema_id_serializer;
         id_ser(&encoded_bytes, ctx, &schema_id)
+    }
+
+    /// Evaluates the message's inline validation rules, returning a single error listing
+    /// every violation found.
+    fn validate_inline_rules(
+        &self,
+        md: &MessageDescriptor,
+        msg: &DynamicMessage,
+    ) -> Result<(), SerdeError> {
+        let executor = self.base.validation_executor()?;
+        raise_validation_violations(validate_message(
+            executor.as_ref(),
+            md,
+            msg,
+            self.base.config.validation_rules_fail_fast,
+        ))
     }
 
     #[async_recursion]
@@ -1018,6 +1057,220 @@ fn get_type(fd: &FieldDescriptor) -> FieldType {
     }
 }
 
+/// Walks `message` against `descriptor`, evaluating every inline validation rule
+/// (confluent.Meta rules) encountered and collecting all failures. Read-only — the
+/// message is not modified.
+///
+/// Two kinds of rules are evaluated:
+///   - Message-level (rules on `confluent.message_meta`) — `this` is the message.
+///   - Field-level (rules on `confluent.field_meta`) — `this` is the field value. Honors
+///     the skip-on-null contract: a field with explicit presence that is unset does not
+///     have its rules invoked.
+///
+/// Failures carry their dotted-path location (e.g. `addr.zip`, `tags[3]`,
+/// `scores["foo"]`). The walk continues after each failure so callers see the full set
+/// rather than only the first, unless `fail_fast` is set.
+fn validate_message(
+    executor: &dyn ValidationRuleExecutor,
+    descriptor: &MessageDescriptor,
+    message: &DynamicMessage,
+    fail_fast: bool,
+) -> Vec<ValidationRuleError> {
+    let mut violations = Vec::new();
+    validate(
+        executor,
+        descriptor,
+        "",
+        message,
+        fail_fast,
+        &mut violations,
+    );
+    violations
+}
+
+fn validate(
+    executor: &dyn ValidationRuleExecutor,
+    descriptor: &MessageDescriptor,
+    path: &str,
+    message: &DynamicMessage,
+    fail_fast: bool,
+    violations: &mut Vec<ValidationRuleError>,
+) {
+    if fail_fast && !violations.is_empty() {
+        return;
+    }
+
+    // Message-level rules: `this` is the message itself.
+    if evaluate_rules(
+        executor,
+        get_inline_validation_rules(descriptor.options(), "confluent.message_meta"),
+        &Value::Message(message.clone()),
+        path,
+        fail_fast,
+        violations,
+    ) {
+        return;
+    }
+
+    for fd in descriptor.fields() {
+        // Skip-on-null: a field with explicit presence that is unset does not have its
+        // rules invoked. Proto3 scalars without presence always report as set, matching
+        // how the other clients treat a defaulted scalar.
+        if fd.supports_presence() && !message.has_field(&fd) {
+            continue;
+        }
+        let rules = get_inline_validation_rules(fd.options(), "confluent.field_meta");
+        let field_path = append_validation_path(path, fd.name());
+        let value = message.get_field(&fd);
+
+        match value.as_ref() {
+            Value::List(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    let item_path = format!("{field_path}[{i}]");
+                    if evaluate_rules(
+                        executor,
+                        rules.clone(),
+                        item,
+                        &item_path,
+                        fail_fast,
+                        violations,
+                    ) {
+                        return;
+                    }
+                    if let (Value::Message(item), prost_reflect::Kind::Message(nested)) =
+                        (item, fd.kind())
+                    {
+                        validate(executor, &nested, &item_path, item, fail_fast, violations);
+                        if fail_fast && !violations.is_empty() {
+                            return;
+                        }
+                    }
+                }
+            }
+            Value::Map(entries) => {
+                let value_kind = fd
+                    .kind()
+                    .as_message()
+                    .and_then(|entry| entry.map_entry_value_field().kind().as_message().cloned());
+                for (key, entry) in entries {
+                    let entry_path = format!("{field_path}[{}]", map_key_to_path(key));
+                    if evaluate_rules(
+                        executor,
+                        rules.clone(),
+                        entry,
+                        &entry_path,
+                        fail_fast,
+                        violations,
+                    ) {
+                        return;
+                    }
+                    if let (Value::Message(entry), Some(nested)) = (entry, value_kind.as_ref()) {
+                        validate(executor, nested, &entry_path, entry, fail_fast, violations);
+                        if fail_fast && !violations.is_empty() {
+                            return;
+                        }
+                    }
+                }
+            }
+            value => {
+                if evaluate_rules(executor, rules, value, &field_path, fail_fast, violations) {
+                    return;
+                }
+                if let (Value::Message(nested_msg), prost_reflect::Kind::Message(nested)) =
+                    (value, fd.kind())
+                {
+                    validate(
+                        executor,
+                        &nested,
+                        &field_path,
+                        nested_msg,
+                        fail_fast,
+                        violations,
+                    );
+                    if fail_fast && !violations.is_empty() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Reads the inline validation rules from the named `confluent.Meta` extension on the
+/// given options message.
+fn get_inline_validation_rules(
+    options: prost_reflect::DynamicMessage,
+    extension_name: &str,
+) -> Vec<ValidationRule> {
+    let Some(ext) = DESCRIPTOR_POOL.get_extension_by_name(extension_name) else {
+        return Vec::new();
+    };
+    if !options.has_extension(&ext) {
+        return Vec::new();
+    }
+    let Some(meta) = options.get_extension(&ext).as_message().cloned() else {
+        return Vec::new();
+    };
+    let Some(rules) = meta.get_field_by_name("rules") else {
+        return Vec::new();
+    };
+    let Some(rules) = rules.as_list() else {
+        return Vec::new();
+    };
+    rules
+        .iter()
+        .filter_map(|rule| {
+            let rule = rule.as_message()?;
+            let string_field = |name: &str| {
+                rule.get_field_by_name(name)
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_default()
+            };
+            Some(ValidationRule {
+                name: string_field("name"),
+                doc: string_field("doc"),
+                expr: string_field("expr"),
+                sql: string_field("sql"),
+            })
+        })
+        .collect()
+}
+
+/// Renders a map key the way the dotted path notation expects: string keys are quoted,
+/// everything else is rendered bare.
+fn map_key_to_path(key: &MapKey) -> String {
+    match key {
+        MapKey::String(v) => format!("\"{v}\""),
+        MapKey::Bool(v) => v.to_string(),
+        MapKey::I32(v) => v.to_string(),
+        MapKey::I64(v) => v.to_string(),
+        MapKey::U32(v) => v.to_string(),
+        MapKey::U64(v) => v.to_string(),
+    }
+}
+
+/// Evaluates the given rules against `value`. Returns whether the walk should stop.
+fn evaluate_rules(
+    executor: &dyn ValidationRuleExecutor,
+    rules: Vec<ValidationRule>,
+    value: &Value,
+    path: &str,
+    fail_fast: bool,
+    violations: &mut Vec<ValidationRuleError>,
+) -> bool {
+    if rules.is_empty() {
+        return false;
+    }
+    let serde_value = SerdeValue::Protobuf(value.clone());
+    for rule in &rules {
+        evaluate_validation_rule(executor, rule, &serde_value, path, violations);
+        if fail_fast && !violations.is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
 fn get_inline_tags(fd: &FieldDescriptor) -> HashSet<String> {
     let mut tag_set = HashSet::new();
     let field_ext = DESCRIPTOR_POOL
@@ -1053,7 +1306,9 @@ mod tests {
     use crate::rest::mock_schema_registry_client::MockSchemaRegistryClient;
     use crate::rest::models::{Rule, RuleSet};
     use crate::rest::schema_registry_client::SchemaRegistryClient;
+    use crate::rules::cel::cel_executor::CelExecutor;
     use crate::rules::cel::cel_field_executor::CelFieldExecutor;
+    use crate::rules::cel::cel_validator::CelValidator;
     use crate::rules::encryption::encrypt_executor::{
         EncryptionExecutor, FakeClock, FieldEncryptionExecutor,
     };
@@ -1063,6 +1318,7 @@ mod tests {
     use crate::serdes::protobuf::tests::test::DependencyMessage;
     use crate::serdes::protobuf::tests::test::TestMessage;
     use crate::serdes::protobuf::tests::test::author::PiiOneof;
+    use crate::serdes::protobuf::tests::test::{ValidationAddress, ValidationOrder};
     use crate::serdes::serde::{SerdeFormat, SerdeHeaders, header_schema_id_serializer};
     use std::collections::BTreeMap;
 
@@ -1864,5 +2120,118 @@ mod tests {
             let obj2: Author = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
             assert_eq!(obj2, obj);
         }
+    }
+
+    fn proto_order(id: &str, quantity: i32, items: &[&str], zip: Option<&str>) -> ValidationOrder {
+        ValidationOrder {
+            id: id.to_string(),
+            quantity,
+            items: items.iter().map(|i| i.to_string()).collect(),
+            address: zip.map(|zip| ValidationAddress {
+                zip: zip.to_string(),
+            }),
+            scores: HashMap::new(),
+        }
+    }
+
+    fn validate_proto(message: &ValidationOrder, fail_fast: bool) -> Vec<ValidationRuleError> {
+        let md = message.descriptor();
+        let mut msg = DynamicMessage::new(md.clone());
+        msg.transcode_from(message).unwrap();
+        let validator = CelValidator::new();
+        validate_message(&validator, &md, &msg, fail_fast)
+    }
+
+    fn validating_registry() -> RuleRegistry {
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(CelExecutor::new());
+        rule_registry.register_validation_executor(CelValidator::new());
+        rule_registry
+    }
+
+    #[test]
+    fn test_validation_valid_message_has_no_violations() {
+        let message = proto_order("ord-1234", 2, &["a", "b"], Some("12345"));
+        assert_eq!(validate_proto(&message, false), vec![]);
+    }
+
+    #[test]
+    fn test_validation_collects_every_violation() {
+        let message = proto_order("x", -1, &["a", ""], Some("abc"));
+        let violations = validate_proto(&message, false);
+
+        // Fields are walked in declaration order: id, quantity, items, address.
+        assert_eq!(violations.len(), 6, "{violations:?}");
+        assert_eq!(violations[0].rule.name, "quantity_matches_items");
+        assert_eq!(violations[0].field_path, "");
+        assert_eq!(violations[1].rule.name, "id_prefix");
+        assert_eq!(violations[1].field_path, "id");
+        assert_eq!(violations[2].rule.name, "id_length");
+        assert_eq!(violations[2].message, "id is too short");
+        assert_eq!(violations[3].rule.name, "positive_quantity");
+        assert_eq!(violations[3].field_path, "quantity");
+        // Repeated fields are validated element by element.
+        assert_eq!(violations[4].rule.name, "item_not_empty");
+        assert_eq!(violations[4].field_path, "items[1]");
+        assert_eq!(violations[5].rule.name, "zip_digits");
+        assert_eq!(violations[5].field_path, "address.zip");
+    }
+
+    #[test]
+    fn test_validation_validates_nested_messages_and_map_values() {
+        let mut message = proto_order("ord-1234", 1, &["a"], Some("abc"));
+        message.scores.insert("good".to_string(), 1);
+        message.scores.insert("bad".to_string(), -1);
+        let violations = validate_proto(&message, false);
+
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert_eq!(violations[0].rule.name, "zip_digits");
+        assert_eq!(violations[0].field_path, "address.zip");
+        assert_eq!(violations[1].rule.name, "score_not_negative");
+        assert_eq!(violations[1].field_path, "scores[\"bad\"]");
+    }
+
+    #[test]
+    fn test_validation_fail_fast_stops_at_first_violation() {
+        let message = proto_order("x", -1, &["a", ""], Some("abc"));
+        assert_eq!(validate_proto(&message, true).len(), 1);
+    }
+
+    #[test]
+    fn test_validation_skips_rules_on_unset_message_fields() {
+        // address is unset, so the nested zip rule must not be invoked.
+        let message = proto_order("ord-1234", 1, &["a"], None);
+        assert_eq!(validate_proto(&message, false), vec![]);
+    }
+
+    #[tokio::test]
+    async fn test_validation_serializer_rejects_invalid_message() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let mut ser_conf = SerializerConfig::default();
+        ser_conf.validation_rules_execution = ValidationRulesExecution::AfterDomainRules;
+        let ser = ProtobufSerializer::with_reference_subject_name_strategy(
+            &client,
+            default_reference_subject_name_strategy,
+            Some(validating_registry()),
+            ser_conf,
+        )
+        .unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Protobuf,
+            headers: None,
+        };
+
+        let valid = proto_order("ord-1234", 2, &["a", "b"], Some("12345"));
+        assert!(ser.serialize(&ser_ctx, &valid).await.is_ok());
+
+        let invalid = proto_order("bad", 2, &["a", "b"], Some("12345"));
+        let err = ser.serialize(&ser_ctx, &invalid).await.unwrap_err();
+        assert!(
+            matches!(err, SerdeError::ValidationRules(_)),
+            "unexpected error: {err}"
+        );
     }
 }
