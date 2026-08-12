@@ -45,4 +45,11 @@ message ValidationOrder {
       { name: "score_not_negative", expr: "this >= 0" }
     ]
   }];
+  // Exercises the unsigned conversion: a value above int64 max must still compare as
+  // positive, which it would not if it were narrowed to a signed integer.
+  uint64 serial = 6 [(confluent.field_meta) = {
+    rules: [
+      { name: "serial_positive", expr: "this > 0" }
+    ]
+  }];
 }

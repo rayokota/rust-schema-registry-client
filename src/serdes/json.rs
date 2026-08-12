@@ -236,7 +236,7 @@ impl<'a, T: Client + Sync> JsonSerializer<'a, T> {
             &ref_resolver,
             value,
             self.base.config.validation_rules_fail_fast,
-        ))
+        )?)
     }
 
     async fn get_parsed_schema(&self, schema: &Schema) -> Result<(Value, Registry), SerdeError> {
@@ -940,7 +940,7 @@ fn validate_message(
     ref_resolver: &Resolver,
     message: &Value,
     fail_fast: bool,
-) -> Vec<ValidationRuleError> {
+) -> Result<Vec<ValidationRuleError>, SerdeError> {
     let mut violations = Vec::new();
     validate_with_rules(
         executor,
@@ -951,8 +951,8 @@ fn validate_message(
         message,
         fail_fast,
         &mut violations,
-    );
-    violations
+    )?;
+    Ok(violations)
 }
 
 /// Mirrors [`transform`]'s dispatch shape: the combined keywords (allOf/anyOf/oneOf) with
@@ -967,12 +967,12 @@ fn validate_with_rules(
     message: &Value,
     fail_fast: bool,
     violations: &mut Vec<ValidationRuleError>,
-) {
+) -> Result<(), SerdeError> {
     if fail_fast && !violations.is_empty() {
-        return;
+        return Ok(());
     }
     let Value::Object(map) = schema else {
-        return;
+        return Ok(());
     };
 
     // Rules declared at this level: `this` is the value at this location.
@@ -984,7 +984,7 @@ fn validate_with_rules(
         fail_fast,
         violations,
     ) {
-        return;
+        return Ok(());
     }
 
     let as_array = |key: &str| {
@@ -1014,9 +1014,9 @@ fn validate_with_rules(
                     message,
                     fail_fast,
                     violations,
-                );
+                )?;
                 if fail_fast && !violations.is_empty() {
-                    return;
+                    return Ok(());
                 }
             }
         } else if let Some(subschemas) = one_of {
@@ -1031,7 +1031,7 @@ fn validate_with_rules(
                         message,
                         fail_fast,
                         violations,
-                    );
+                    )?;
                     break;
                 }
             }
@@ -1047,19 +1047,19 @@ fn validate_with_rules(
                         message,
                         fail_fast,
                         violations,
-                    );
+                    )?;
                     if fail_fast && !violations.is_empty() {
-                        return;
+                        return Ok(());
                     }
                 }
             }
         }
         if fail_fast && !violations.is_empty() {
-            return;
+            return Ok(());
         }
         // Also visit sibling properties/items at this level
         // (siblings to allOf/anyOf/oneOf).
-        validate_properties(
+        return validate_properties(
             executor,
             map,
             ref_registry,
@@ -1069,13 +1069,15 @@ fn validate_with_rules(
             fail_fast,
             violations,
         );
-        return;
     }
 
-    if let Some(reference) = map.get("$ref").and_then(|v| v.as_str())
-        && let Ok(ref_schema) = ref_resolver.lookup(reference)
-    {
-        validate_with_rules(
+    if let Some(reference) = map.get("$ref").and_then(|v| v.as_str()) {
+        // Surface a failed lookup rather than treating the reference as carrying no rules:
+        // silently skipping the referenced subtree would let a message serialize without
+        // the checks the reference was there to supply. The transform path propagates this
+        // failure the same way.
+        let ref_schema = ref_resolver.lookup(reference)?;
+        return validate_with_rules(
             executor,
             ref_schema.contents(),
             ref_registry,
@@ -1085,7 +1087,6 @@ fn validate_with_rules(
             fail_fast,
             violations,
         );
-        return;
     }
 
     validate_properties(
@@ -1097,7 +1098,7 @@ fn validate_with_rules(
         message,
         fail_fast,
         violations,
-    );
+    )
 }
 
 /// Descends into an object's properties and an array's items.
@@ -1111,7 +1112,7 @@ fn validate_properties(
     message: &Value,
     fail_fast: bool,
     violations: &mut Vec<ValidationRuleError>,
-) {
+) -> Result<(), SerdeError> {
     if let Some(Value::Object(props)) = map.get("properties")
         && let Value::Object(message) = message
     {
@@ -1128,9 +1129,9 @@ fn validate_properties(
                 value,
                 fail_fast,
                 violations,
-            );
+            )?;
             if fail_fast && !violations.is_empty() {
-                return;
+                return Ok(());
             }
         }
     }
@@ -1147,12 +1148,13 @@ fn validate_properties(
                 element,
                 fail_fast,
                 violations,
-            );
+            )?;
             if fail_fast && !violations.is_empty() {
-                return;
+                return Ok(());
             }
         }
     }
+    Ok(())
 }
 
 /// Evaluates the given rules against `value`, skipping null values to honor the
@@ -2905,6 +2907,7 @@ mod tests {
             message,
             fail_fast,
         )
+        .unwrap()
     }
 
     fn find_violation<'a>(
@@ -2952,6 +2955,39 @@ mod tests {
             find_violation(&violations, "zip_digits").field_path,
             "$.address.zip"
         );
+    }
+
+    #[test]
+    fn test_validation_reports_unresolvable_references() {
+        // A reference that cannot be resolved must not be treated as "no rules here":
+        // that would let the message through without the checks it was meant to supply.
+        let schema: Value = serde_json::from_str(
+            r##"{"type": "object", "properties": {"a": {"$ref": "#/definitions/Missing"}}}"##,
+        )
+        .unwrap();
+        let ref_registry = Registry::options()
+            .build(Vec::<(String, Resource)>::new().into_iter())
+            .unwrap();
+        let base_uri = ResourceRef::from_contents(&schema)
+            .id()
+            .unwrap_or("")
+            .to_string();
+        let ref_registry = ref_registry
+            .try_with_resource(base_uri.clone(), Resource::from_contents(schema.clone()))
+            .unwrap();
+        let ref_resolver = ref_registry.try_resolver(&base_uri).unwrap();
+        let validator = CelValidator::new();
+
+        let message = serde_json::json!({"a": {"x": 1}});
+        let result = validate_message(
+            &validator,
+            &schema,
+            &ref_registry,
+            &ref_resolver,
+            &message,
+            false,
+        );
+        assert!(result.is_err(), "expected the lookup failure to surface");
     }
 
     #[test]

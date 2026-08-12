@@ -24,6 +24,10 @@ pub struct ValidationOrder {
     pub address: ::core::option::Option<ValidationAddress>,
     #[prost(map = "string, int32", tag = "5")]
     pub scores: ::std::collections::HashMap<::prost::alloc::string::String, i32>,
+    /// Exercises the unsigned conversion: a value above int64 max must still compare as
+    /// positive, which it would not if it were narrowed to a signed integer.
+    #[prost(uint64, tag = "6")]
+    pub serial: u64,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(::prost_reflect::ReflectMessage)]

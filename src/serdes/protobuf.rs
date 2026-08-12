@@ -2148,6 +2148,7 @@ mod tests {
                 zip: zip.to_string(),
             }),
             scores: HashMap::new(),
+            serial: 1,
         }
     }
 
@@ -2209,6 +2210,20 @@ mod tests {
     }
 
     #[test]
+    fn test_validation_preserves_unsigned_values() {
+        // u64::MAX narrowed to i64 would be negative, so `this > 0` would wrongly fail.
+        let mut message = proto_order("ord-1234", 1, &["a"], Some("12345"));
+        message.serial = u64::MAX;
+        assert_eq!(validate_proto(&message, false), vec![]);
+
+        // and zero still fails the rule, so the check is really running
+        message.serial = 0;
+        let violations = validate_proto(&message, false);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].rule.name, "serial_positive");
+    }
+
+    #[test]
     fn test_validation_fail_fast_stops_at_first_violation() {
         let message = proto_order("x", -1, &["a", ""], Some("abc"));
         assert_eq!(validate_proto(&message, true).len(), 1);
@@ -2263,6 +2278,7 @@ mod tests {
             items: vec![],
             address: None,
             scores: HashMap::new(),
+            serial: 1,
         };
         let violations = validate_proto(&message, false);
 

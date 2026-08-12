@@ -145,8 +145,10 @@ fn from_protobuf_value(value: &prost_reflect::Value) -> Value {
         prost_reflect::Value::Bool(v) => Value::Bool(*v),
         prost_reflect::Value::I32(v) => Value::Int(*v as i64),
         prost_reflect::Value::I64(v) => Value::Int(*v),
-        prost_reflect::Value::U32(v) => Value::Int(*v as i64),
-        prost_reflect::Value::U64(v) => Value::Int(*v as i64),
+        // CEL has a distinct unsigned type; mapping these to Int would wrap any u64
+        // above i64::MAX to a negative number, so `this > 0` would reject valid values.
+        prost_reflect::Value::U32(v) => Value::UInt(*v as u64),
+        prost_reflect::Value::U64(v) => Value::UInt(*v),
         prost_reflect::Value::F32(v) => Value::Float(*v as f64),
         prost_reflect::Value::F64(v) => Value::Float(*v),
         prost_reflect::Value::String(v) => Value::String(Arc::new(v.clone())),
