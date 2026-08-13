@@ -5,6 +5,14 @@ package test;
 import "confluent/meta.proto";
 
 message ValidationAddress {
+  // A message-level rule on a nested type: `this` is the address, so the message handed to
+  // the rule has to name its fields the way the registered schema does.
+  option (confluent.message_meta) = {
+    rules: [
+      { name: "zip_present", expr: "size(this.zip) > 0" }
+    ]
+  };
+
   string zip = 1 [(confluent.field_meta) = {
     rules: [
       { name: "zip_digits", expr: "this.matches('^[0-9]{5}$') ? '' : 'zip must be 5 digits'" }

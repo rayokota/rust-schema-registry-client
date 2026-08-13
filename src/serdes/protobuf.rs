@@ -30,7 +30,7 @@ use prost_reflect::{
 use prost_types::FileDescriptorSet;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufReader, Cursor};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, RwLock};
 
 pub mod confluent {
     include!("../codegen/confluent.rs");
@@ -279,15 +279,34 @@ impl<'a, T: Client + Sync> ProtobufSerializer<'a, T> {
         if let Some(fd) = fd
             && let Some(desc) = fd.parent_pool().get_message_by_name(md.full_name())
         {
-            let mut transcoded = DynamicMessage::new(desc.clone());
-            transcoded.transcode_from(msg)?;
-            schema_msg = Some(transcoded);
+            // The walk is driven by the caller's message throughout: it decides which fields
+            // exist, which are absent, and what the values are. A rule that binds `this` to a
+            // message needs one more thing - a view of that message in the schema's terms,
+            // since a rule's CEL environment is built from the schema and `this.renamed`
+            // cannot read a field the caller's type calls something else. Protobuf pairs
+            // fields by number on the wire, so re-reading the message through the registered
+            // descriptor produces exactly that view.
+            //
+            // Whether that is needed is decided once per descriptor pair (see
+            // needs_schema_view) rather than per record. A type describing the same fields as
+            // the registered schema skips it entirely, even though the two descriptors are
+            // distinct. A type that has fallen behind the schema does not: under
+            // use.latest.version the schema may declare a field the type has never heard of,
+            // and a rule that binds `this` can read the schema's default for it, so those
+            // producers re-read every record. That cost is the price of evaluating rules in
+            // the schema's terms, not an accident.
+            if needs_schema_view(&desc, md) {
+                let mut transcoded = DynamicMessage::new(desc.clone());
+                transcoded.transcode_from(msg)?;
+                schema_msg = Some(transcoded);
+            }
             schema_md = Some(desc);
         }
         raise_validation_violations(validate_message(
             executor.as_ref(),
             schema_md.as_ref().unwrap_or(md),
-            schema_msg.as_ref().unwrap_or(msg),
+            msg,
+            schema_msg.as_ref(),
             self.base.config.validation_rules_fail_fast,
         ))
     }
@@ -1162,6 +1181,7 @@ fn validate_message(
     executor: &dyn ValidationRuleExecutor,
     descriptor: &MessageDescriptor,
     message: &DynamicMessage,
+    schema_message: Option<&DynamicMessage>,
     fail_fast: bool,
 ) -> Vec<ValidationRuleError> {
     let mut violations = Vec::new();
@@ -1170,10 +1190,103 @@ fn validate_message(
         descriptor,
         "",
         message,
+        schema_message,
         fail_fast,
         &mut violations,
     );
     violations
+}
+
+/// Memoizes [`needs_schema_view`]. `MessageDescriptor` compares by pool pointer and index, so
+/// a lookup is a handful of cheap comparisons; the set of pairs a process sees is bounded by
+/// the message types it serializes. The answer is no only for a type that describes the same
+/// fields as the registered schema; a type that has fallen behind it re-reads every record.
+static SCHEMA_VIEW_NEEDED: LazyLock<RwLock<Vec<(MessageDescriptor, MessageDescriptor, bool)>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
+
+/// Whether a message whose descriptor is `runtime_desc` has to be re-read through `descriptor`
+/// before rules can bind `this` to it - true when the two disagree about any field a rule could
+/// observe: its name, its kind, or its cardinality, at any depth.
+///
+/// Presence deliberately does not count. Whether an unset field is absent is decided by the
+/// producer's field on the producer's message, which the walk reads directly, so a schema that
+/// only moved a field into or out of a oneof needs no re-read.
+///
+/// A field the schema declares and the caller's type does not does count, which means a type
+/// running behind the registered schema - the use.latest.version case - re-reads every record.
+/// Only an exact match skips the re-read. Narrowing that to the rules that could actually
+/// observe the added field is possible but not simple: a rule binding `this` at any ancestor
+/// can traverse into the field, and a field-level rule on a message-valued field binds `this`
+/// to a type that need not declare rules of its own, so a per-descriptor test for message-level
+/// rules would be wrong in both directions.
+fn needs_schema_view(descriptor: &MessageDescriptor, runtime_desc: &MessageDescriptor) -> bool {
+    if descriptor == runtime_desc {
+        return false;
+    }
+    if let Ok(cache) = SCHEMA_VIEW_NEEDED.read() {
+        for (schema, runtime, needed) in cache.iter() {
+            if schema == descriptor && runtime == runtime_desc {
+                return *needed;
+            }
+        }
+    }
+    let needed = !presents_same_values(descriptor, runtime_desc, &mut HashSet::new());
+    if let Ok(mut cache) = SCHEMA_VIEW_NEEDED.write() {
+        cache.push((descriptor.clone(), runtime_desc.clone(), needed));
+    }
+    needed
+}
+
+/// Whether the two descriptors present every field they share - paired by number, which is how
+/// protobuf identifies a field - under the same name, kind and cardinality, recursively through
+/// message-valued fields. Fields only the caller declares are ignored: no rule can name them,
+/// and the walk skips them.
+///
+/// `visited` holds the descriptor pairs already compared, so a self-referential message type
+/// terminates.
+fn presents_same_values(
+    descriptor: &MessageDescriptor,
+    runtime_desc: &MessageDescriptor,
+    visited: &mut HashSet<(String, String)>,
+) -> bool {
+    let pair = (
+        descriptor.full_name().to_string(),
+        runtime_desc.full_name().to_string(),
+    );
+    if !visited.insert(pair) {
+        // Already compared on another path, or cycling back to it. Either way this pair
+        // contributes no new disagreement.
+        return true;
+    }
+    for schema_fd in descriptor.fields() {
+        if runtime_desc.get_field(schema_fd.number()).is_none() {
+            return false;
+        }
+    }
+    for runtime_fd in runtime_desc.fields() {
+        let Some(schema_fd) = descriptor.get_field(runtime_fd.number()) else {
+            continue;
+        };
+        if schema_fd.name() != runtime_fd.name()
+            || schema_fd.is_list() != runtime_fd.is_list()
+            || schema_fd.is_map() != runtime_fd.is_map()
+        {
+            return false;
+        }
+        match (schema_fd.kind(), runtime_fd.kind()) {
+            (prost_reflect::Kind::Message(schema_nested), prost_reflect::Kind::Message(nested)) => {
+                if !presents_same_values(&schema_nested, &nested, visited) {
+                    return false;
+                }
+            }
+            (schema_kind, runtime_kind) => {
+                if schema_kind != runtime_kind {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 fn validate(
@@ -1181,6 +1294,7 @@ fn validate(
     descriptor: &MessageDescriptor,
     path: &str,
     message: &DynamicMessage,
+    schema_message: Option<&DynamicMessage>,
     fail_fast: bool,
     violations: &mut Vec<ValidationRuleError>,
 ) {
@@ -1188,11 +1302,11 @@ fn validate(
         return;
     }
 
-    // Message-level rules: `this` is the message itself.
+    // Message-level rules: `this` is the message itself, read as the schema names it.
     if evaluate_rules(
         executor,
         get_inline_validation_rules(descriptor.options(), "confluent.message_meta"),
-        &Value::Message(message.clone()),
+        &Value::Message(schema_message.unwrap_or(message).clone()),
         path,
         fail_fast,
         violations,
@@ -1200,18 +1314,40 @@ fn validate(
         return;
     }
 
-    for fd in descriptor.fields() {
+    // The walk is driven by the caller's message: it decides which fields exist, which are
+    // absent, and what the values are. Each field is paired to the registered schema by
+    // number, and the schema's field supplies the rules and the name used in the reported
+    // path. Fields the schema does not declare are skipped, so the walk visits the
+    // intersection.
+    for runtime_fd in message.descriptor().fields() {
+        let Some(fd) = descriptor.get_field(runtime_fd.number()) else {
+            continue;
+        };
         // Skip-on-null: a field with explicit presence that is unset does not have its
         // rules invoked. Proto3 scalars without presence always report as set, matching
         // how the other clients treat a defaulted scalar.
-        if fd.supports_presence() && !message.has_field(&fd) {
+        //
+        // Both halves are read from the caller's message: whether an unset field counts as
+        // absent is decided by the type that wrote it, not by the registered schema, and the
+        // two can disagree - moving a field into or out of a oneof is a compatible change.
+        if runtime_fd.supports_presence() && !message.has_field(&runtime_fd) {
             continue;
         }
         let rules = get_inline_validation_rules(fd.options(), "confluent.field_meta");
         let field_path = append_validation_path(path, fd.name());
-        let value = message.get_field(&fd);
+        // Where a schema view exists, values come from it: the two descriptors can disagree
+        // about representation as well as naming. bytes and string are interchangeable at the
+        // same number - a compatible change - and a rule authored as `this == 'hello'` cannot
+        // match a byte string.
+        let value = match schema_message {
+            Some(schema_message) => schema_message.get_field(&fd),
+            None => message.get_field(&runtime_fd),
+        };
+        let runtime_value = message.get_field(&runtime_fd);
 
-        match value.as_ref() {
+        // The structure walked is the caller's; only what a rule is handed comes from the
+        // schema's view of it.
+        match runtime_value.as_ref() {
             Value::List(items) => {
                 // A repeated field's own rules see the whole list, matching the JVM
                 // client: `this` is the list, so a rule about the elements is written as
@@ -1226,12 +1362,26 @@ fn validate(
                 ) {
                     return;
                 }
+                let schema_items = value.as_ref().as_list();
                 for (i, item) in items.iter().enumerate() {
                     let item_path = format!("{field_path}[{i}]");
                     if let (Value::Message(item), prost_reflect::Kind::Message(nested)) =
                         (item, fd.kind())
                     {
-                        validate(executor, &nested, &item_path, item, fail_fast, violations);
+                        // Both lists came from the same bytes, so they line up; the lookup
+                        // yields None only if they somehow do not.
+                        let schema_item = schema_items
+                            .and_then(|items| items.get(i))
+                            .and_then(|item| item.as_message());
+                        validate(
+                            executor,
+                            &nested,
+                            &item_path,
+                            item,
+                            schema_item,
+                            fail_fast,
+                            violations,
+                        );
                         if fail_fast && !violations.is_empty() {
                             return;
                         }
@@ -1254,28 +1404,49 @@ fn validate(
                     .kind()
                     .as_message()
                     .and_then(|entry| entry.map_entry_value_field().kind().as_message().cloned());
+                let schema_entries = value.as_ref().as_map();
                 for (key, entry) in entries {
                     let entry_path = format!("{field_path}[{}]", map_key_to_path(key));
                     if let (Value::Message(entry), Some(nested)) = (entry, value_kind.as_ref()) {
-                        validate(executor, nested, &entry_path, entry, fail_fast, violations);
+                        // Map values pair by key rather than position.
+                        let schema_entry = schema_entries
+                            .and_then(|entries| entries.get(key))
+                            .and_then(|entry| entry.as_message());
+                        validate(
+                            executor,
+                            nested,
+                            &entry_path,
+                            entry,
+                            schema_entry,
+                            fail_fast,
+                            violations,
+                        );
                         if fail_fast && !violations.is_empty() {
                             return;
                         }
                     }
                 }
             }
-            value => {
-                if evaluate_rules(executor, rules, value, &field_path, fail_fast, violations) {
+            runtime_value => {
+                if evaluate_rules(
+                    executor,
+                    rules,
+                    value.as_ref(),
+                    &field_path,
+                    fail_fast,
+                    violations,
+                ) {
                     return;
                 }
                 if let (Value::Message(nested_msg), prost_reflect::Kind::Message(nested)) =
-                    (value, fd.kind())
+                    (runtime_value, fd.kind())
                 {
                     validate(
                         executor,
                         &nested,
                         &field_path,
                         nested_msg,
+                        value.as_ref().as_message(),
                         fail_fast,
                         violations,
                     );
@@ -2377,7 +2548,124 @@ mod tests {
         let mut msg = DynamicMessage::new(md.clone());
         msg.transcode_from(message).unwrap();
         let validator = CelValidator::new();
-        validate_message(&validator, &md, &msg, fail_fast)
+        // The message is already in the schema's terms here, so there is no separate view.
+        validate_message(&validator, &md, &msg, None, fail_fast)
+    }
+
+    /// Rebuilds the test descriptor set with `mutate` applied to validation.proto, so a test
+    /// can pair a registered schema against the generated types the way use.latest.version
+    /// does. The result is a pool distinct from the generated one.
+    fn rebuilt_validation_pool(mutate: impl FnOnce(&mut FileDescriptorProto)) -> DescriptorPool {
+        let mut set = FileDescriptorSet::decode(TEST_FILE_DESCRIPTOR_SET).unwrap();
+        let file = set
+            .file
+            .iter_mut()
+            .find(|f| f.name().ends_with("validation.proto"))
+            .unwrap();
+        mutate(file);
+        let mut pool = DescriptorPool::global();
+        pool.add_file_descriptor_set(set).unwrap();
+        pool
+    }
+
+    fn message_of<'a>(file: &'a mut FileDescriptorProto, name: &str) -> &'a mut DescriptorProto {
+        file.message_type
+            .iter_mut()
+            .find(|m| m.name() == name)
+            .unwrap()
+    }
+
+    /// A message read through the registered schema, as validate_inline_rules produces it.
+    fn schema_view(schema_md: &MessageDescriptor, msg: &DynamicMessage) -> DynamicMessage {
+        let mut view = DynamicMessage::new(schema_md.clone());
+        view.transcode_from(msg).unwrap();
+        view
+    }
+
+    #[test]
+    fn test_needs_schema_view_only_when_the_descriptors_differ() {
+        let order = proto_order("ord-1234", 1, &["a"], Some("12345"));
+        let runtime_md = order.descriptor();
+
+        // Structurally identical, but a distinct descriptor object: nothing to gain from a
+        // re-read, so it is skipped even though the identity check does not match.
+        let same = rebuilt_validation_pool(|_| {})
+            .get_message_by_name(runtime_md.full_name())
+            .unwrap();
+        assert_ne!(same, runtime_md);
+        assert!(!needs_schema_view(&same, &runtime_md));
+
+        // A renamed field: the values are the same, but a rule cannot read them by the
+        // schema's name without a re-read.
+        let renamed = rebuilt_validation_pool(|file| {
+            let message = message_of(file, "ValidationOrder");
+            let field = message.field.iter_mut().find(|f| f.number() == 1).unwrap();
+            field.name = Some("renamed_id".to_string());
+            field.json_name = Some("renamedId".to_string());
+        })
+        .get_message_by_name(runtime_md.full_name())
+        .unwrap();
+        assert!(needs_schema_view(&renamed, &runtime_md));
+
+        // A field only the schema declares: adding a field is a compatible change, and a rule
+        // may reference the added field expecting the schema's default for it.
+        let added = rebuilt_validation_pool(|file| {
+            let message = message_of(file, "ValidationOrder");
+            let mut field = message.field[0].clone();
+            field.name = Some("added".to_string());
+            field.json_name = Some("added".to_string());
+            field.number = Some(99);
+            field.options = None;
+            message.field.push(field);
+        })
+        .get_message_by_name(runtime_md.full_name())
+        .unwrap();
+        assert!(needs_schema_view(&added, &runtime_md));
+
+        // A field only the caller declares is ignored: no rule can name it, and the walk
+        // skips it.
+        let dropped = rebuilt_validation_pool(|file| {
+            let message = message_of(file, "ValidationOrder");
+            message.field.retain(|f| f.number() != 5);
+        })
+        .get_message_by_name(runtime_md.full_name())
+        .unwrap();
+        assert!(!needs_schema_view(&dropped, &runtime_md));
+    }
+
+    #[test]
+    fn test_validation_nested_message_rule_sees_schema_names_under_a_rename() {
+        // A rule that binds `this` to a nested message needs that message in the schema's
+        // terms, not just the top-level one. The registered schema here is the real one, rules
+        // and all; it is the producer's type that has the field under a different name, which
+        // is what a compatible rename looks like from the serializer's side.
+        //
+        // (The rules have to live on the schema side: a descriptor set round-tripped through
+        // prost_types loses the confluent.Meta extensions, since prost keeps no unknown
+        // fields, so a rebuilt pool carries no rules at all.)
+        let order = proto_order("ord-1234", 1, &["a"], Some("12345"));
+        let schema_md = order.descriptor();
+        let runtime_md = rebuilt_validation_pool(|file| {
+            let message = message_of(file, "ValidationAddress");
+            let field = message.field.iter_mut().find(|f| f.number() == 1).unwrap();
+            field.name = Some("renamed_zip".to_string());
+            field.json_name = Some("renamedZip".to_string());
+        })
+        .get_message_by_name(schema_md.full_name())
+        .unwrap();
+        assert!(needs_schema_view(&schema_md, &runtime_md));
+
+        // Build the message the producer would: its address names the field renamed_zip.
+        let mut msg = DynamicMessage::new(runtime_md.clone());
+        msg.transcode_from(&order).unwrap();
+        let view = schema_view(&schema_md, &msg);
+
+        let violations =
+            validate_message(&CelValidator::new(), &schema_md, &msg, Some(&view), false);
+
+        // zip_present is declared on ValidationAddress and reads `this.zip`, which only
+        // resolves if the nested message was handed over in the schema's terms.
+        assert!(violations.is_empty(), "{violations:?}");
     }
 
     fn validating_registry() -> RuleRegistry {
