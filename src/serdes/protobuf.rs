@@ -963,22 +963,6 @@ async fn transform(
     message: &Value,
 ) -> Result<Value, SerdeError> {
     match message {
-        Value::List(items) => {
-            let mut result = Vec::with_capacity(items.len());
-            for item in items {
-                let item = transform(ctx, descriptor, item).await?;
-                result.push(item);
-            }
-            return Ok(Value::List(result));
-        }
-        Value::Map(map) => {
-            let mut result = HashMap::new();
-            for (key, value) in map {
-                let value = transform(ctx, descriptor, value).await?;
-                result.insert(key.clone(), value);
-            }
-            return Ok(Value::Map(result));
-        }
         Value::Message(message) => {
             let mut result = message.clone();
             for fd in descriptor.fields() {
@@ -1038,15 +1022,96 @@ async fn transform_field_with_ctx(
         return Ok(None);
     }
     let value = message.get_field(fd);
-    let new_value = transform(ctx, desc, &value).await?;
+    let new_value = transform_field_value(ctx, fd, &value).await;
+    ctx.exit_field();
+    let new_value = new_value?;
     if let Some(Kind::Condition) = ctx.rule.kind
         && let Value::Bool(b) = new_value
         && !b
     {
         return Err(SerdeError::RuleCondition(Box::new(ctx.rule.clone())));
     }
-    ctx.exit_field();
     Ok(Some(new_value))
+}
+
+/// Transforms one field's value, descending exactly the way the validation walk does: into a
+/// message-valued field with that field's own descriptor, into every element of a repeated
+/// field, and into every value of a message-valued map. Anything else is a leaf.
+#[async_recursion]
+async fn transform_field_value(
+    ctx: &mut RuleContext,
+    fd: &FieldDescriptor,
+    value: &Value,
+) -> Result<Value, SerdeError> {
+    match value {
+        Value::List(items) => {
+            let nested = fd.kind().as_message().cloned();
+            let mut result = Vec::with_capacity(items.len());
+            for item in items {
+                let item = match (&nested, item) {
+                    (Some(nested), Value::Message(_)) => transform(ctx, nested, item).await?,
+                    _ => transform_leaf(ctx, item).await?,
+                };
+                result.push(item);
+            }
+            Ok(Value::List(result))
+        }
+        Value::Map(entries) => {
+            let value_kind = fd
+                .kind()
+                .as_message()
+                .and_then(|entry| entry.map_entry_value_field().kind().as_message().cloned());
+            let Some(value_kind) = value_kind else {
+                // A map of scalars has nothing below it to descend into, which is also why
+                // the validation walk does not descend into one.
+                return Ok(value.clone());
+            };
+            let mut result = HashMap::new();
+            for (key, entry) in entries {
+                let entry = transform(ctx, &value_kind, entry).await?;
+                result.insert(key.clone(), entry);
+            }
+            Ok(Value::Map(result))
+        }
+        Value::Message(_) => match fd.kind().as_message() {
+            Some(nested) => transform(ctx, &nested, value).await,
+            None => Ok(value.clone()),
+        },
+        value => transform_leaf(ctx, value).await,
+    }
+}
+
+/// Hands a leaf value to the field transform, when the rule's tags overlap the field's.
+async fn transform_leaf(ctx: &mut RuleContext, value: &Value) -> Result<Value, SerdeError> {
+    let Some(field_ctx) = ctx.current_field() else {
+        return Ok(value.clone());
+    };
+    let rule_tags = ctx
+        .rule
+        .tags
+        .clone()
+        .map(|v| HashSet::from_iter(v.into_iter()));
+    if let Some(tags) = rule_tags
+        && tags.is_disjoint(&field_ctx.tags)
+    {
+        return Ok(value.clone());
+    }
+    let message_value = SerdeValue::Protobuf(value.clone());
+    let field_executor_type = ctx.rule.r#type.clone();
+    let executor = get_executor(ctx.rule_registry.as_ref(), &field_executor_type);
+    let Some(executor) = executor else {
+        return Ok(value.clone());
+    };
+    let field_executor = executor
+        .as_field_rule_executor()
+        .ok_or(SerdeError::Rule(format!(
+            "executor {field_executor_type} is not a field rule executor"
+        )))?;
+    let new_value = field_executor.transform_field(ctx, &message_value).await?;
+    match new_value {
+        SerdeValue::Protobuf(v) => Ok(v),
+        _ => Ok(value.clone()),
+    }
 }
 
 fn get_type(fd: &FieldDescriptor) -> FieldType {
@@ -1080,9 +1145,11 @@ fn get_type(fd: &FieldDescriptor) -> FieldType {
 ///
 /// Two kinds of rules are evaluated:
 ///   - Message-level (rules on `confluent.message_meta`) — `this` is the message.
-///   - Field-level (rules on `confluent.field_meta`) — `this` is the field value. Honors
-///     the skip-on-null contract: a field with explicit presence that is unset does not
-///     have its rules invoked.
+///   - Field-level (rules on `confluent.field_meta`) — `this` is the field value. A
+///     repeated or map field binds the whole collection, once, so a rule about the
+///     elements is written as a comprehension over them. Honors the skip-on-null
+///     contract: a field with explicit presence that is unset does not have its rules
+///     invoked.
 ///
 /// Failures carry their dotted-path location (e.g. `addr.zip`, `tags[3]`,
 /// `scores["foo"]`). The walk continues after each failure so callers see the full set
@@ -1142,18 +1209,21 @@ fn validate(
 
         match value.as_ref() {
             Value::List(items) => {
+                // A repeated field's own rules see the whole list, matching the JVM
+                // client: `this` is the list, so a rule about the elements is written as
+                // a comprehension over them rather than being invoked once per element.
+                if evaluate_rules(
+                    executor,
+                    rules.clone(),
+                    value.as_ref(),
+                    &field_path,
+                    fail_fast,
+                    violations,
+                ) {
+                    return;
+                }
                 for (i, item) in items.iter().enumerate() {
                     let item_path = format!("{field_path}[{i}]");
-                    if evaluate_rules(
-                        executor,
-                        rules.clone(),
-                        item,
-                        &item_path,
-                        fail_fast,
-                        violations,
-                    ) {
-                        return;
-                    }
                     if let (Value::Message(item), prost_reflect::Kind::Message(nested)) =
                         (item, fd.kind())
                     {
@@ -1165,22 +1235,23 @@ fn validate(
                 }
             }
             Value::Map(entries) => {
+                // As for a repeated field: the whole map is bound to `this`.
+                if evaluate_rules(
+                    executor,
+                    rules.clone(),
+                    value.as_ref(),
+                    &field_path,
+                    fail_fast,
+                    violations,
+                ) {
+                    return;
+                }
                 let value_kind = fd
                     .kind()
                     .as_message()
                     .and_then(|entry| entry.map_entry_value_field().kind().as_message().cloned());
                 for (key, entry) in entries {
                     let entry_path = format!("{field_path}[{}]", map_key_to_path(key));
-                    if evaluate_rules(
-                        executor,
-                        rules.clone(),
-                        entry,
-                        &entry_path,
-                        fail_fast,
-                        violations,
-                    ) {
-                        return;
-                    }
                     if let (Value::Message(entry), Some(nested)) = (entry, value_kind.as_ref()) {
                         validate(executor, nested, &entry_path, entry, fail_fast, violations);
                         if fail_fast && !violations.is_empty() {
@@ -2152,6 +2223,78 @@ mod tests {
         }
     }
 
+    /// The transform walk drives field-level rules such as CSFLE, and has to descend the
+    /// same way the validation walk does - into a nested message with that message's own
+    /// descriptor, and into every element of a repeated field. Walking a nested message
+    /// against the containing descriptor reads the parent's fields off the child.
+    #[tokio::test]
+    async fn test_cel_field_descends_into_nested_messages() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            true,
+            false,
+            HashMap::new(),
+        );
+        let obj = proto_order("ord-1234", 2, &["a", "b"], Some("12345"));
+        let rule = Rule {
+            name: "test-cel".to_string(),
+            doc: None,
+            kind: Some(Kind::Transform),
+            mode: Some(Mode::Write),
+            r#type: "CEL_FIELD".to_string(),
+            tags: None,
+            params: None,
+            expr: Some("typeName == 'STRING' ; value + '-suffix'".to_string()),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let rule_set = RuleSet {
+            migration_rules: None,
+            domain_rules: Some(vec![rule]),
+            encoding_rules: None,
+            enable_at: None,
+        };
+        let schema = Schema {
+            schema_type: Some("PROTOBUF".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(rule_set)),
+            schema: schema_to_str(&obj.descriptor().parent_file()).unwrap(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(CelFieldExecutor::new());
+        let ser = ProtobufSerializer::new(&client, Some(rule_registry.clone()), ser_conf).unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Protobuf,
+            headers: None,
+        };
+        let bytes = ser.serialize(&ser_ctx, &obj).await.unwrap();
+
+        // The rule is write-only, so deserializing shows what was written.
+        let deser = ProtobufDeserializer::new(
+            &client,
+            Some(rule_registry.clone()),
+            DeserializerConfig::default(),
+        )
+        .unwrap();
+        let result: ValidationOrder = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+
+        assert_eq!(result.id, "ord-1234-suffix");
+        assert_eq!(result.items, vec!["a-suffix", "b-suffix"]);
+        // Reached only by descending with the nested message's own descriptor.
+        assert_eq!(result.address.unwrap().zip, "12345-suffix");
+    }
+
     fn validate_proto(message: &ValidationOrder, fail_fast: bool) -> Vec<ValidationRuleError> {
         let md = message.descriptor();
         let mut msg = DynamicMessage::new(md.clone());
@@ -2188,9 +2331,10 @@ mod tests {
         assert_eq!(violations[2].message, "id is too short");
         assert_eq!(violations[3].rule.name, "positive_quantity");
         assert_eq!(violations[3].field_path, "quantity");
-        // Repeated fields are validated element by element.
+        // A repeated field's own rules see the whole list, so the violation is reported
+        // against the field rather than an element.
         assert_eq!(violations[4].rule.name, "item_not_empty");
-        assert_eq!(violations[4].field_path, "items[1]");
+        assert_eq!(violations[4].field_path, "items");
         assert_eq!(violations[5].rule.name, "zip_digits");
         assert_eq!(violations[5].field_path, "address.zip");
     }
@@ -2205,8 +2349,41 @@ mod tests {
         assert_eq!(violations.len(), 2, "{violations:?}");
         assert_eq!(violations[0].rule.name, "zip_digits");
         assert_eq!(violations[0].field_path, "address.zip");
+        // As for a repeated field, a map field's own rules see the whole map.
         assert_eq!(violations[1].rule.name, "score_not_negative");
-        assert_eq!(violations[1].field_path, "scores[\"bad\"]");
+        assert_eq!(violations[1].field_path, "scores");
+    }
+
+    /// A field-level rule on a repeated or map field is evaluated once, with the whole
+    /// collection bound to `this` - matching the JVM client - rather than once per element.
+    /// A rule about the elements is therefore written as a comprehension over them.
+    #[test]
+    fn test_validation_collection_rules_see_the_whole_collection() {
+        let mut message = proto_order("ord-1234", 2, &["a", "b"], Some("12345"));
+        message.scores.insert("ok".to_string(), 1);
+        assert!(validate_proto(&message, false).is_empty());
+
+        // One empty element fails the comprehension, and the violation is reported
+        // against the field, once.
+        let with_empty = proto_order("ord-1234", 2, &["a", ""], Some("12345"));
+        let violations = validate_proto(&with_empty, false);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].rule.name, "item_not_empty");
+        assert_eq!(violations[0].field_path, "items");
+        assert!(violations[0].cause.is_empty(), "{violations:?}");
+
+        // An empty map is bound as an empty map, not skipped and not an error.
+        let no_scores = proto_order("ord-1234", 2, &["a", "b"], Some("12345"));
+        assert!(validate_proto(&no_scores, false).is_empty());
+
+        // A negative entry fails the comprehension over the map's keys.
+        let mut negative = proto_order("ord-1234", 2, &["a", "b"], Some("12345"));
+        negative.scores.insert("bad".to_string(), -1);
+        let map_violations = validate_proto(&negative, false);
+        assert_eq!(map_violations.len(), 1, "{map_violations:?}");
+        assert_eq!(map_violations[0].rule.name, "score_not_negative");
+        assert_eq!(map_violations[0].field_path, "scores");
+        assert!(map_violations[0].cause.is_empty(), "{map_violations:?}");
     }
 
     #[test]
