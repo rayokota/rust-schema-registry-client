@@ -1017,8 +1017,12 @@ async fn transform_field_with_ctx(
         get_type(fd),
         get_inline_tags(fd),
     );
-    if fd.containing_oneof().is_some() && !message.has_field(fd) {
-        // skip oneof fields that are not set
+    // Skip-on-null, exactly as the validation walk does it: a field with explicit
+    // presence that is unset has no value to transform, and writing one back would
+    // materialize it - turning an absent message or unset optional scalar into a present
+    // one carrying a transformed default. supports_presence covers oneof members too.
+    if fd.supports_presence() && !message.has_field(fd) {
+        ctx.exit_field();
         return Ok(None);
     }
     let value = message.get_field(fd);
@@ -2221,6 +2225,79 @@ mod tests {
             scores: HashMap::new(),
             serial: 1,
         }
+    }
+
+    /// A field with explicit presence that is unset has nothing to transform, and writing
+    /// a value back would materialize it: an absent message or unset optional scalar would
+    /// become present, carrying a transformed default. The validation walk already skips
+    /// those, and the transform walk has to skip them the same way.
+    #[tokio::test]
+    async fn test_cel_field_leaves_absent_fields_absent() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            true,
+            false,
+            HashMap::new(),
+        );
+        // address is absent, and `maybe`-style optional presence is what is at stake.
+        let obj = proto_order("ord-1234", 2, &["a", "b"], None);
+        let rule = Rule {
+            name: "test-cel".to_string(),
+            doc: None,
+            kind: Some(Kind::Transform),
+            mode: Some(Mode::Write),
+            r#type: "CEL_FIELD".to_string(),
+            tags: None,
+            params: None,
+            expr: Some("typeName == 'STRING' ; value + '-suffix'".to_string()),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let rule_set = RuleSet {
+            migration_rules: None,
+            domain_rules: Some(vec![rule]),
+            encoding_rules: None,
+            enable_at: None,
+        };
+        let schema = Schema {
+            schema_type: Some("PROTOBUF".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(rule_set)),
+            schema: schema_to_str(&obj.descriptor().parent_file()).unwrap(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(CelFieldExecutor::new());
+        let ser = ProtobufSerializer::new(&client, Some(rule_registry.clone()), ser_conf).unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Protobuf,
+            headers: None,
+        };
+        let bytes = ser.serialize(&ser_ctx, &obj).await.unwrap();
+        let deser = ProtobufDeserializer::new(
+            &client,
+            Some(rule_registry.clone()),
+            DeserializerConfig::default(),
+        )
+        .unwrap();
+        let result: ValidationOrder = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        assert!(
+            result.address.is_none(),
+            "the absent message was materialized: {:?}",
+            result.address
+        );
+        // The fields that are present are still transformed.
+        assert_eq!(result.id, "ord-1234-suffix");
     }
 
     /// The transform walk drives field-level rules such as CSFLE, and has to descend the
