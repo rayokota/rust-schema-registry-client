@@ -741,6 +741,11 @@ async fn transform(
     message: &Value,
 ) -> Result<Value, SerdeError> {
     if let Value::Object(map) = schema {
+        // A type union is narrowed to the member the value satisfies before dispatching, as
+        // the validation walk does.
+        if let Some(narrowed) = narrow_subtype(schema, message, ref_registry) {
+            return transform(ctx, &narrowed, ref_registry, ref_resolver, path, message).await;
+        }
         let all_of = map.get("allOf").and_then(|v| {
             if let Value::Array(a) = v {
                 Some(a)
@@ -823,9 +828,24 @@ async fn transform(
             return transform(ctx, items, ref_registry, ref_resolver, path, message).await;
         }
         if let Some(reference) = map.get("$ref") {
-            let ref_schema = ref_resolver.lookup(reference.as_str().unwrap())?;
-            let ref_schema = ref_schema.contents();
-            return transform(ctx, ref_schema, ref_registry, ref_resolver, path, message).await;
+            let Some(reference) = reference.as_str() else {
+                return Err(SerdeError::Serialization(format!(
+                    "$ref must be a string, found {reference}"
+                )));
+            };
+            let ref_schema = ref_resolver.lookup(reference)?;
+            // Recurse with the resolver the lookup returned, not the original one: it is
+            // scoped to the referenced resource, so a relative or fragment-only `$ref`
+            // inside it resolves against the right base URI.
+            return transform(
+                ctx,
+                ref_schema.contents(),
+                ref_registry,
+                ref_schema.resolver(),
+                path,
+                message,
+            )
+            .await;
         }
         let field_type = get_type(schema);
         if field_type == FieldType::Record
@@ -975,6 +995,23 @@ fn validate_with_rules(
         return Ok(());
     };
 
+    // A type union is narrowed to the member the value satisfies before anything else, so
+    // that the walk dispatches on a single type - as the transform walk does. Narrowing
+    // first also keeps this level's rules from being evaluated twice: the recursive call
+    // sees the same rules on the narrowed copy.
+    if let Some(narrowed) = narrow_subtype(schema, message, ref_registry) {
+        return validate_with_rules(
+            executor,
+            &narrowed,
+            ref_registry,
+            ref_resolver,
+            path,
+            message,
+            fail_fast,
+            violations,
+        );
+    }
+
     // Rules declared at this level: `this` is the value at this location.
     if evaluate_rules(
         executor,
@@ -1077,11 +1114,14 @@ fn validate_with_rules(
         // the checks the reference was there to supply. The transform path propagates this
         // failure the same way.
         let ref_schema = ref_resolver.lookup(reference)?;
+        // Recurse with the resolver the lookup returned, not the original one: it is scoped
+        // to the referenced resource, so a relative or fragment-only `$ref` inside it
+        // resolves against the right base URI.
         return validate_with_rules(
             executor,
             ref_schema.contents(),
             ref_registry,
-            ref_resolver,
+            ref_schema.resolver(),
             path,
             message,
             fail_fast,
@@ -1180,6 +1220,29 @@ fn evaluate_rules(
     false
 }
 
+/// Narrows a schema whose `type` is a union to the first member the message satisfies,
+/// returning a copy with that single type. A union is not a type the walks can dispatch on -
+/// without narrowing, a nullable field (`"type": ["null", "string"]`) is typed as Combined
+/// and never reaches its own case. The copy leaves the parsed schema untouched, which
+/// matters because it is cached and shared across serializations.
+fn narrow_subtype(schema: &Value, message: &Value, ref_registry: &Registry) -> Option<Value> {
+    let Value::Object(map) = schema else {
+        return None;
+    };
+    let Some(Value::Array(types)) = map.get("type") else {
+        return None;
+    };
+    for member in types {
+        let mut candidate = map.clone();
+        candidate.insert("type".to_string(), member.clone());
+        let candidate = Value::Object(candidate);
+        if validate_subschema(&candidate, message, ref_registry) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn validate_subschema(subschema: &Value, message: &Value, ref_registry: &Registry) -> bool {
     let validator = jsonschema::options()
         .with_registry(ref_registry.clone())
@@ -1192,15 +1255,16 @@ fn validate_subschema(subschema: &Value, message: &Value, ref_registry: &Registr
 }
 
 fn get_type(schema: &Value) -> FieldType {
-    if let Value::Array(_) = schema {
-        return FieldType::Combined;
-    }
     let mut schema_type = "null";
     if let Value::Object(schema) = schema {
-        if let Some(Value::String(_)) = schema.get("const") {
+        // `const` takes any JSON value and `enum` is always an array, so both are matched
+        // by presence rather than by holding a string.
+        if schema.get("const").is_some() || schema.get("enum").is_some() {
             return FieldType::Enum;
-        } else if let Some(Value::String(_)) = schema.get("enum") {
-            return FieldType::Enum;
+        } else if let Some(Value::Array(_)) = schema.get("type") {
+            // A type union: the walks narrow it to the type the value satisfies before
+            // dispatching, so this is only reached when nothing matched.
+            return FieldType::Combined;
         } else if let Some(Value::String(s)) = schema.get("type") {
             schema_type = s;
         } else if schema.get("properties").is_some() {
@@ -2251,6 +2315,111 @@ mod tests {
         assert_eq!(obj2, obj);
     }
 
+    /// A nullable field is the ordinary shape for an optional encrypted field. Its type is
+    /// a union, which is not a type the walk can dispatch on: without narrowing it to the
+    /// member the value satisfies, the field is reported to the executor as Null and
+    /// encryption fails with "unsupported field type".
+    #[tokio::test]
+    async fn test_encryption_with_nullable_field() {
+        LocalKmsDriver::register();
+
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let rule_conf = HashMap::from([("secret".to_string(), "mysecret".to_string())]);
+        let ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            false,
+            true,
+            rule_conf,
+        );
+        let schema_str = r#"
+        {
+            "type": "object",
+            "properties": {
+                "intField": {"type": "integer"},
+                "doubleField": {"type": "number"},
+                "stringField": {
+                    "type": ["string", "null"],
+                    "confluent:tags": ["PII"]
+                },
+                "booleanField": {"type": "boolean"},
+                "bytesField": {
+                    "type": "string",
+                    "contentEncoding": "base64",
+                    "confluent:tags": ["PII"]
+                }
+            }
+        }
+        "#;
+        let rule = Rule {
+            name: "test-encrypt".to_string(),
+            doc: None,
+            kind: Some(Kind::Transform),
+            mode: Some(Mode::WriteRead),
+            r#type: "ENCRYPT".to_string(),
+            tags: Some(vec!["PII".to_string()]),
+            params: Some(BTreeMap::from([
+                ("encrypt.kek.name".to_string(), "kek1".to_string()),
+                ("encrypt.kms.type".to_string(), "local-kms".to_string()),
+                ("encrypt.kms.key.id".to_string(), "mykey".to_string()),
+            ])),
+            expr: None,
+            on_success: None,
+            on_failure: Some("ERROR,NONE".to_string()),
+            disabled: None,
+        };
+        let rule_set = RuleSet {
+            migration_rules: None,
+            domain_rules: Some(vec![rule]),
+            encoding_rules: None,
+            enable_at: None,
+        };
+        let schema = Schema {
+            schema_type: Some("JSON".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(rule_set)),
+            schema: schema_str.to_string(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+        let obj_str = r#"
+        {
+            "intField": 123,
+            "doubleField": 45.67,
+            "stringField": "hi",
+            "booleanField": true,
+            "bytesField": "Zm9vYmFy"
+        }
+        "#;
+        let obj: Value = serde_json::from_str(obj_str).unwrap();
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(FieldEncryptionExecutor::<MockDekRegistryClient>::new(
+            FakeClock::new(0),
+        ));
+        let ser =
+            JsonSerializer::new(&client, None, Some(rule_registry.clone()), ser_conf).unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Json,
+            headers: None,
+        };
+        let bytes = ser.serialize(&ser_ctx, obj.clone()).await.unwrap();
+        let deser = JsonDeserializer::new(
+            &client,
+            Some(rule_registry.clone()),
+            DeserializerConfig::default(),
+        )
+        .unwrap();
+
+        let obj2 = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        assert_eq!(obj2, obj);
+    }
+
     #[tokio::test]
     async fn test_payload_encryption() {
         LocalKmsDriver::register();
@@ -2908,6 +3077,69 @@ mod tests {
             fail_fast,
         )
         .unwrap()
+    }
+
+    /// A `$ref` into another resource has to be followed with the resolver the lookup
+    /// returned: that resolver is scoped to the referenced resource, so a fragment-only
+    /// `$ref` inside it (`#/$defs/...`) resolves against that resource rather than the root
+    /// document, which does not have those definitions at all.
+    #[test]
+    fn test_validation_follows_refs_scoped_to_the_referenced_resource() {
+        let root: Value = serde_json::from_str(
+            r#"{
+                "type": "object",
+                "properties": { "p": { "$ref": "https://example.com/inner.json" } }
+            }"#,
+        )
+        .unwrap();
+        let inner: Value = serde_json::from_str(
+            r##"{
+                "$id": "https://example.com/inner.json",
+                "type": "object",
+                "properties": { "x": { "$ref": "#/$defs/tagged" } },
+                "$defs": {
+                    "tagged": {
+                        "type": "string",
+                        "confluent:rules": [ { "name": "r", "expr": "false" } ]
+                    }
+                }
+            }"##,
+        )
+        .unwrap();
+        // Registered the way the serde registers a schema and its references.
+        let ref_registry = Registry::options()
+            .build(Vec::<(String, Resource)>::new().into_iter())
+            .unwrap();
+        let ref_registry = ref_registry
+            .try_with_resources(
+                vec![
+                    (
+                        "https://example.com/inner.json".to_string(),
+                        Resource::from_contents(inner),
+                    ),
+                    ("".to_string(), Resource::from_contents(root.clone())),
+                ]
+                .into_iter(),
+                Draft::default(),
+            )
+            .unwrap();
+        let ref_resolver = ref_registry.try_resolver("").unwrap();
+        let message: Value = serde_json::from_str(r#"{ "p": { "x": "hi" } }"#).unwrap();
+
+        let validator = CelValidator::new();
+        let violations = validate_message(
+            &validator,
+            &root,
+            &ref_registry,
+            &ref_resolver,
+            &message,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].rule.name, "r");
+        assert_eq!(violations[0].field_path, "$.p.x");
     }
 
     fn find_violation<'a>(
