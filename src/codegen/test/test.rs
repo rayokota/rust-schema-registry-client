@@ -18,6 +18,9 @@ pub struct ValidationOrder {
     pub id: ::prost::alloc::string::String,
     #[prost(int32, tag = "2")]
     pub quantity: i32,
+    /// A field-level rule on a repeated or map field is evaluated once, with the whole
+    /// collection bound to `this`, so a rule about the elements is written as a
+    /// comprehension over them.
     #[prost(string, repeated, tag = "3")]
     pub items: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(message, optional, tag = "4")]
