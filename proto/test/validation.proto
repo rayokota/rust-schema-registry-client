@@ -3,6 +3,9 @@ syntax = "proto3";
 package test;
 
 import "confluent/meta.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/wrappers.proto";
 
 message ValidationAddress {
   // A message-level rule on a nested type: `this` is the address, so the message handed to
@@ -61,6 +64,34 @@ message ValidationOrder {
   uint64 serial = 6 [(confluent.field_meta) = {
     rules: [
       { name: "serial_positive", expr: "this > 0" }
+    ]
+  }];
+}
+
+// A well-known type stands for the thing it wraps, not a message with a `value` field: a
+// StringValue is a string and an Int64Value is an int. Without unwrapping, `size(this)` has
+// no overload for a message and a rule would have to read `this.value` in this client alone.
+// Timestamp and Duration are covered by a unit test instead: prost maps them to
+// prost_types, which does not implement the serde derives applied to generated code here.
+message ValidationWellKnown {
+  google.protobuf.StringValue name = 1 [(confluent.field_meta) = {
+    rules: [
+      { name: "name_not_empty", expr: "size(this) > 0" }
+    ]
+  }];
+  google.protobuf.Int64Value count = 2 [(confluent.field_meta) = {
+    rules: [
+      { name: "count_positive", expr: "this > 0" }
+    ]
+  }];
+  google.protobuf.BoolValue active = 3 [(confluent.field_meta) = {
+    rules: [
+      { name: "must_be_active", expr: "this" }
+    ]
+  }];
+  google.protobuf.UInt64Value big = 4 [(confluent.field_meta) = {
+    rules: [
+      { name: "big_positive", expr: "this > 0u" }
     ]
   }];
 }

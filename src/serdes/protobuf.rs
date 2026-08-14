@@ -2543,6 +2543,86 @@ mod tests {
         assert_eq!(result.address.unwrap().zip, "12345-suffix");
     }
 
+    /// A well-known type stands for what it wraps: a StringValue is a string, an
+    /// Int64Value is an int. Without unwrapping, every rule here fails - `size(this)` has no
+    /// overload for a message - and a rule would have to be written against `this.value` in
+    /// this client alone.
+    #[test]
+    fn well_known_types_bind_as_the_value_they_wrap() {
+        let message = test::ValidationWellKnown {
+            name: Some("widget".to_string()),
+            count: Some(7),
+            active: Some(true),
+            big: Some(9_000_000_000_000_000_000),
+        };
+        let md = message.descriptor();
+        let mut msg = DynamicMessage::new(md.clone());
+        msg.transcode_from(&message).unwrap();
+        let violations = validate_message(&CelValidator::new(), &md, &msg, None, false);
+        assert!(
+            violations.is_empty(),
+            "expected no violations, got {violations:?}"
+        );
+    }
+
+    /// And the rules still fire when the wrapped value fails them, so the test above is not
+    /// passing merely because nothing was evaluated.
+    #[test]
+    fn well_known_type_rules_still_fire() {
+        let message = test::ValidationWellKnown {
+            name: Some(String::new()),
+            count: Some(-1),
+            active: Some(false),
+            big: Some(0),
+        };
+        let md = message.descriptor();
+        let mut msg = DynamicMessage::new(md.clone());
+        msg.transcode_from(&message).unwrap();
+        let violations = validate_message(&CelValidator::new(), &md, &msg, None, false);
+        let mut names: Vec<&str> = violations.iter().map(|v| v.rule.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "big_positive",
+                "count_positive",
+                "must_be_active",
+                "name_not_empty"
+            ]
+        );
+    }
+
+    /// Timestamp and Duration cannot appear in a generated type here - prost maps them to
+    /// prost_types, which does not implement the serde derives applied to generated code - so
+    /// the conversion is exercised directly on a dynamic message.
+    #[test]
+    fn timestamp_and_duration_bind_as_cel_values() {
+        use crate::rules::cel::cel_executor::from_protobuf_value_for_test;
+
+        let pool = &crate::TEST_DESCRIPTOR_POOL;
+        let ts_desc = pool
+            .get_message_by_name("google.protobuf.Timestamp")
+            .expect("timestamp.proto is imported by validation.proto");
+        let mut ts = DynamicMessage::new(ts_desc);
+        ts.set_field_by_name("seconds", prost_reflect::Value::I64(1_600_000_000));
+        ts.set_field_by_name("nanos", prost_reflect::Value::I32(0));
+        match from_protobuf_value_for_test(&prost_reflect::Value::Message(ts)) {
+            cel_interpreter::Value::Timestamp(t) => assert_eq!(t.timestamp(), 1_600_000_000),
+            other => panic!("expected a CEL timestamp, got {other:?}"),
+        }
+
+        let dur_desc = pool
+            .get_message_by_name("google.protobuf.Duration")
+            .expect("duration.proto is imported by validation.proto");
+        let mut dur = DynamicMessage::new(dur_desc);
+        dur.set_field_by_name("seconds", prost_reflect::Value::I64(30));
+        dur.set_field_by_name("nanos", prost_reflect::Value::I32(0));
+        match from_protobuf_value_for_test(&prost_reflect::Value::Message(dur)) {
+            cel_interpreter::Value::Duration(d) => assert_eq!(d.num_seconds(), 30),
+            other => panic!("expected a CEL duration, got {other:?}"),
+        }
+    }
+
     fn validate_proto(message: &ValidationOrder, fail_fast: bool) -> Vec<ValidationRuleError> {
         let md = message.descriptor();
         let mut msg = DynamicMessage::new(md.clone());

@@ -32,6 +32,26 @@ pub struct ValidationOrder {
     #[prost(uint64, tag = "6")]
     pub serial: u64,
 }
+/// A well-known type stands for the thing it wraps, not a message with a `value` field: a
+/// StringValue is a string and an Int64Value is an int. Without unwrapping, `size(this)` has
+/// no overload for a message and a rule would have to read `this.value` in this client alone.
+/// Timestamp and Duration are covered by a unit test instead: prost maps them to
+/// prost_types, which does not implement the serde derives applied to generated code here.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(::prost_reflect::ReflectMessage)]
+#[prost_reflect(message_name = "test.ValidationWellKnown")]
+#[prost_reflect(descriptor_pool = "crate::TEST_DESCRIPTOR_POOL")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ValidationWellKnown {
+    #[prost(message, optional, tag = "1")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "2")]
+    pub count: ::core::option::Option<i64>,
+    #[prost(message, optional, tag = "3")]
+    pub active: ::core::option::Option<bool>,
+    #[prost(message, optional, tag = "4")]
+    pub big: ::core::option::Option<u64>,
+}
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(::prost_reflect::ReflectMessage)]
 #[prost_reflect(message_name = "test.TestMessage")]

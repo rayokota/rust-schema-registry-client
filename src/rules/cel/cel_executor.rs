@@ -140,6 +140,12 @@ fn from_avro_value(value: &apache_avro::types::Value) -> Value {
     }
 }
 
+/// Test hook for [`from_protobuf_value`], which is otherwise private to this module.
+#[cfg(test)]
+pub(crate) fn from_protobuf_value_for_test(value: &prost_reflect::Value) -> Value {
+    from_protobuf_value(value)
+}
+
 fn from_protobuf_value(value: &prost_reflect::Value) -> Value {
     match value {
         prost_reflect::Value::Bool(v) => Value::Bool(*v),
@@ -155,6 +161,14 @@ fn from_protobuf_value(value: &prost_reflect::Value) -> Value {
         prost_reflect::Value::Bytes(v) => Value::Bytes(Arc::new(v.to_vec())),
         prost_reflect::Value::EnumNumber(v) => Value::Int(*v as i64),
         prost_reflect::Value::Message(msg) => {
+            // A well-known type is the thing it wraps, not a message with a `value` field:
+            // a Timestamp is a CEL timestamp, a StringValue is a string. Every other client
+            // does this - the Go, C++, Java and JS engines natively, and the Python client
+            // through a table of its own - so without it a rule on a Timestamp field would
+            // have to read `this.seconds` here and `this` everywhere else.
+            if let Some(unwrapped) = unwrap_well_known(msg) {
+                return unwrapped;
+            }
             // Walk the descriptor rather than only the populated fields: a proto3 scalar
             // sitting at its default is still set as far as the language is concerned, and
             // omitting it makes an expression like `msg.count == 0` fail with "no such
@@ -183,6 +197,63 @@ fn from_protobuf_value(value: &prost_reflect::Value) -> Value {
                 .collect();
             Value::Map(Map { map: Arc::new(map) })
         }
+    }
+}
+
+/// The CEL value a well-known message stands for, or None when it is an ordinary message.
+///
+/// Mirrors prost-protovalidate's `try_unwrap_well_known_message`. A Timestamp or Duration
+/// whose fields are out of range falls through to the map representation rather than being
+/// clamped, so the rule can still inspect the raw seconds and nanos.
+fn unwrap_well_known(msg: &prost_reflect::DynamicMessage) -> Option<Value> {
+    let field = |name: &str| msg.get_field_by_name(name);
+    match msg.descriptor().full_name() {
+        "google.protobuf.BoolValue" => Some(Value::Bool(
+            field("value").and_then(|v| v.as_bool()).unwrap_or(false),
+        )),
+        "google.protobuf.Int32Value" => Some(Value::Int(i64::from(
+            field("value").and_then(|v| v.as_i32()).unwrap_or(0),
+        ))),
+        "google.protobuf.Int64Value" => Some(Value::Int(
+            field("value").and_then(|v| v.as_i64()).unwrap_or(0),
+        )),
+        "google.protobuf.UInt32Value" => Some(Value::UInt(u64::from(
+            field("value").and_then(|v| v.as_u32()).unwrap_or(0),
+        ))),
+        "google.protobuf.UInt64Value" => Some(Value::UInt(
+            field("value").and_then(|v| v.as_u64()).unwrap_or(0),
+        )),
+        "google.protobuf.FloatValue" => Some(Value::Float(f64::from(
+            field("value").and_then(|v| v.as_f32()).unwrap_or(0.0),
+        ))),
+        "google.protobuf.DoubleValue" => Some(Value::Float(
+            field("value").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        )),
+        "google.protobuf.StringValue" => Some(Value::String(Arc::new(
+            field("value")
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default(),
+        ))),
+        "google.protobuf.BytesValue" => Some(Value::Bytes(Arc::new(
+            field("value")
+                .and_then(|v| v.as_bytes().map(|b| b.to_vec()))
+                .unwrap_or_default(),
+        ))),
+        "google.protobuf.Duration" => {
+            let seconds = field("seconds").and_then(|v| v.as_i64()).unwrap_or(0);
+            let nanos = field("nanos").and_then(|v| v.as_i32()).unwrap_or(0);
+            let duration = chrono::Duration::try_seconds(seconds)?
+                .checked_add(&chrono::Duration::nanoseconds(i64::from(nanos)))?;
+            Some(Value::Duration(duration))
+        }
+        "google.protobuf.Timestamp" => {
+            let seconds = field("seconds").and_then(|v| v.as_i64()).unwrap_or(0);
+            let nanos = field("nanos").and_then(|v| v.as_i32()).unwrap_or(0);
+            let utc = chrono::DateTime::from_timestamp(seconds, nanos.max(0) as u32)?;
+            let offset = chrono::FixedOffset::east_opt(0)?;
+            Some(Value::Timestamp(utc.with_timezone(&offset)))
+        }
+        _ => None,
     }
 }
 
