@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 pub struct CelExecutor {
     cache: DashMap<String, Program>,
+    presence_cache: DashMap<(String, String), Arc<PresencePaths>>,
 }
 
 impl RuleBase for CelExecutor {
@@ -33,7 +34,44 @@ impl CelExecutor {
     pub fn new() -> Self {
         CelExecutor {
             cache: DashMap::new(),
+            presence_cache: DashMap::new(),
         }
+    }
+
+    /// The `message` binding for a rule: the message, with the keys of unset fields the rule
+    /// tests with `has()` dropped.
+    ///
+    /// The JVM client hands the message itself to its engine, which answers `has()` from
+    /// protobuf presence and a plain read from the field's default. A message bound as a map
+    /// cannot do both from one key, so the keys a rule actually tests are the ones dropped -
+    /// the same resolution [`crate::rules::cel::cel_validator::CelValidator`] applies to
+    /// `this`, and applied here so that a rule reads the same either way.
+    pub(crate) fn message_binding(&self, ctx: &RuleContext, msg: &SerdeValue) -> Value {
+        match ctx.rule.expr.as_deref() {
+            Some(expr) => {
+                from_serde_value_with_presence(msg, &self.presence_paths(expr, "message"))
+            }
+            None => from_serde_value(msg),
+        }
+    }
+
+    /// The paths `expr` tests `binding` for presence on, compiled once per expression.
+    ///
+    /// A rule's expression can be a `guard ; body` pair, which is not itself a CEL
+    /// expression. The parts are scanned separately and their paths pooled: both are
+    /// evaluated against the same bindings, so a `has()` in either one has to drop the key.
+    fn presence_paths(&self, expr: &str, binding: &str) -> Arc<PresencePaths> {
+        let key = (expr.to_string(), binding.to_string());
+        if let Some(cached) = self.presence_cache.get(&key) {
+            return cached.value().clone();
+        }
+        let mut paths = PresencePaths::new();
+        for part in expr.split(';') {
+            paths.extend(collect_has_paths(part, binding));
+        }
+        let paths = Arc::new(paths);
+        self.presence_cache.insert(key, paths.clone());
+        paths
     }
 
     pub(crate) fn execute(
@@ -94,14 +132,15 @@ impl RuleExecutor for CelExecutor {
         msg: &SerdeValue,
     ) -> Result<SerdeValue, SerdeError> {
         let mut args = HashMap::new();
-        args.insert("message".to_string(), from_serde_value(msg));
+        args.insert("message".to_string(), self.message_binding(ctx, msg));
         self.execute(ctx, msg, &args)
     }
 }
 
 pub fn from_serde_value(value: &SerdeValue) -> Value {
-    // No paths, so every field keeps its key: the historical behaviour, and the right one
-    // for a caller that has no rule to inspect.
+    // No paths, so every field keeps its key. That is the right conversion for a caller with
+    // no rule to inspect; a caller that has one binds through
+    // [`CelExecutor::message_binding`] instead, so that `has()` reports presence.
     from_serde_value_with_presence(value, &PresencePaths::new())
 }
 

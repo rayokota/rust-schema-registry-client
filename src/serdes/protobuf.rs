@@ -2624,6 +2624,110 @@ mod tests {
         }
     }
 
+    /// Evaluates `expr` as a CEL rule - the kind that binds the message to `message` rather
+    /// than to `this` - through the executor a serializer would use.
+    fn eval_cel_rule<M: ReflectMessage>(message: &M, expr: &str) -> SerdeValue {
+        let md = message.descriptor();
+        let mut msg = DynamicMessage::new(md.clone());
+        msg.transcode_from(message).unwrap();
+
+        let rule = Rule {
+            name: "r".to_string(),
+            doc: None,
+            kind: Some(Kind::Transform),
+            mode: Some(Mode::Write),
+            r#type: "CEL".to_string(),
+            tags: None,
+            params: None,
+            expr: Some(expr.to_string()),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let mut ctx = RuleContext::new(
+            None,
+            SerializationContext {
+                topic: "test".to_string(),
+                serde_type: SerdeType::Value,
+                serde_format: SerdeFormat::Protobuf,
+                headers: None,
+            },
+            None,
+            None,
+            None,
+            "test-value".to_string(),
+            Mode::Write,
+            rule.clone(),
+            0,
+            vec![rule],
+            None,
+            None,
+        );
+        let executor = CelExecutor::new();
+        let mut args = HashMap::new();
+        args.insert(
+            "message".to_string(),
+            executor.message_binding(&ctx, &SerdeValue::Protobuf(prost_reflect::Value::Message(
+                msg.clone(),
+            ))),
+        );
+        executor
+            .execute(
+                &mut ctx,
+                &SerdeValue::Protobuf(prost_reflect::Value::Message(msg)),
+                &args,
+            )
+            .unwrap()
+    }
+
+    /// True when a CEL rule answered with that boolean, rather than returning the message
+    /// untouched - which is what a rule whose guard did not hold does.
+    fn answered(result: &SerdeValue, expected: bool) -> bool {
+        matches!(result, SerdeValue::Protobuf(prost_reflect::Value::Bool(b)) if *b == expected)
+    }
+
+    /// A CEL rule reads `has(message.field)` the same way a validation rule reads
+    /// `has(this.field)`, and the same way the JVM client does - it hands the message to its
+    /// engine, which answers from protobuf presence. Binding the message as a map with every
+    /// key present would answer true for a field the producer never wrote.
+    #[test]
+    fn has_on_the_message_binding_reports_protobuf_presence() {
+        let unset = test::ValidationOrder::default();
+        let written = proto_order("ord-1234", 2, &["a"], Some("12345"));
+        for expr in [
+            "has(message.quantity)", // implicit-presence scalar
+            "has(message.address)",  // message: explicit presence
+            "has(message.items)",    // repeated: empty
+        ] {
+            assert!(
+                answered(&eval_cel_rule(&unset, expr), false),
+                "{expr} on an unset field"
+            );
+            assert!(
+                answered(&eval_cel_rule(&written, expr), true),
+                "{expr} on a written field"
+            );
+        }
+
+        // A guarded rule is a `guard ; body` pair, which is not itself a CEL expression, so
+        // both halves have to be scanned: a has() in the guard is answered from the same
+        // bindings the body sees. A guard that does not hold leaves the message untouched.
+        assert!(matches!(
+            eval_cel_rule(&unset, "has(message.address) ; true"),
+            SerdeValue::Protobuf(prost_reflect::Value::Message(_))
+        ));
+        assert!(answered(
+            &eval_cel_rule(&written, "has(message.address) ; true"),
+            true
+        ));
+
+        // A field the rule does not test is still readable at its default.
+        assert!(answered(
+            &eval_cel_rule(&unset, "message.quantity == 0"),
+            true
+        ));
+    }
+
     /// Evaluates `expr` against `message` as a message-level rule.
     fn eval_rule<M: ReflectMessage>(
         message: &M,
