@@ -32,6 +32,40 @@ pub struct ValidationOrder {
     #[prost(uint64, tag = "6")]
     pub serial: u64,
 }
+/// A `has()` written inside a comprehension is rooted at the comprehension's own variable
+/// rather than at `this`, so the presence prescan has to follow that variable back to the
+/// path of the collection it iterates. Both shapes an element can be reached through are
+/// here: a repeated field and the values of a map.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(::prost_reflect::ReflectMessage)]
+#[prost_reflect(message_name = "test.ValidationChild")]
+#[prost_reflect(descriptor_pool = "crate::TEST_DESCRIPTOR_POOL")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ValidationChild {
+    /// Explicit presence, which is the case a comprehension used to get wrong: the field was
+    /// omitted whenever unset before the prescan, and always present after it.
+    #[prost(string, optional, tag = "1")]
+    pub nickname: ::core::option::Option<::prost::alloc::string::String>,
+    /// Implicit presence: unset means equal to the default.
+    #[prost(int32, tag = "2")]
+    pub count: i32,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(::prost_reflect::ReflectMessage)]
+#[prost_reflect(message_name = "test.ValidationParent")]
+#[prost_reflect(descriptor_pool = "crate::TEST_DESCRIPTOR_POOL")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ValidationParent {
+    #[prost(message, repeated, tag = "1")]
+    pub children: ::prost::alloc::vec::Vec<ValidationChild>,
+    #[prost(map = "string, message", tag = "2")]
+    pub by_name: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ValidationChild,
+    >,
+    #[prost(message, optional, tag = "3")]
+    pub only: ::core::option::Option<ValidationChild>,
+}
 /// A well-known type stands for the thing it wraps, not a message with a `value` field: a
 /// StringValue is a string and an Int64Value is an int. Without unwrapping, `size(this)` has
 /// no overload for a message and a rule would have to read `this.value` in this client alone.

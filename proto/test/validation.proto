@@ -68,6 +68,24 @@ message ValidationOrder {
   }];
 }
 
+// A `has()` written inside a comprehension is rooted at the comprehension's own variable
+// rather than at `this`, so the presence prescan has to follow that variable back to the
+// path of the collection it iterates. Both shapes an element can be reached through are
+// here: a repeated field and the values of a map.
+message ValidationChild {
+  // Explicit presence, which is the case a comprehension used to get wrong: the field was
+  // omitted whenever unset before the prescan, and always present after it.
+  optional string nickname = 1;
+  // Implicit presence: unset means equal to the default.
+  int32 count = 2;
+}
+
+message ValidationParent {
+  repeated ValidationChild children = 1;
+  map<string, ValidationChild> by_name = 2;
+  ValidationChild only = 3;
+}
+
 // A well-known type stands for the thing it wraps, not a message with a `value` field: a
 // StringValue is a string and an Int64Value is an int. Without unwrapping, `size(this)` has
 // no overload for a message and a rule would have to read `this.value` in this client alone.

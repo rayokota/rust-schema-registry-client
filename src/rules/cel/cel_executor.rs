@@ -163,68 +163,100 @@ pub(crate) type PresencePaths = HashSet<Vec<String>>;
 /// unset field has to be missing from the map for `has()` to answer `false`. But the key
 /// also has to be there for a plain read like `this.count == 0` to resolve at all. The two
 /// cannot both hold, so the key is omitted only for the paths a rule actually tests - which
-/// is what this finds. prost-protovalidate resolves it the same way, for the same reason.
+/// is what this finds. prost-protovalidate resolves it the same way, for the same reason,
+/// though it stops at the binding rather than following comprehension variables.
 ///
 /// The expression is parsed a second time here: `Program` keeps its AST private, and
 /// re-parsing once per distinct rule is cheap next to evaluating it per message.
-/// Paths rooted at anything other than `binding` - comprehension variables, other bindings -
-/// are ignored, and those fields keep their key.
+///
+/// A `has()` inside a comprehension is rooted at the comprehension's own variable rather
+/// than at the binding, so the variables are followed back to the path they stand for - see
+/// [`Roots`]. What remains untracked is a root that only exists at run time, such as the
+/// element of an indexed read; those fields keep their key, which is the safe direction:
+/// `has()` over-reports rather than a plain read failing.
 pub(crate) fn collect_has_paths(expr: &str, binding: &str) -> PresencePaths {
     let mut paths = PresencePaths::new();
     if let Ok(parsed) = cel_parser::Parser::default().parse(expr) {
-        walk_for_has(&parsed, binding, &mut paths);
+        let roots = Roots::from([(binding.to_string(), Vec::new())]);
+        walk_for_has(&parsed, &roots, &mut paths);
     }
     paths
 }
 
-fn walk_for_has(ided: &cel_parser::ast::IdedExpr, binding: &str, paths: &mut PresencePaths) {
+/// The path each identifier in scope stands for, relative to the binding.
+///
+/// The binding itself stands for the empty path. A comprehension variable stands for the
+/// path of the collection it iterates: an element of a list, or a value of a map, is reached
+/// by the same path as the collection that holds it, because `has()` cannot address an index
+/// or a key and the conversion gives elements their parent's path to match.
+type Roots = HashMap<String, Vec<String>>;
+
+fn walk_for_has(ided: &cel_parser::ast::IdedExpr, roots: &Roots, paths: &mut PresencePaths) {
     use cel_parser::ast::Expr;
     match &ided.expr {
         Expr::Select(select) => {
-            walk_for_has(&select.operand, binding, paths);
+            walk_for_has(&select.operand, roots, paths);
             // A "test-only" select is how the parser records `has(operand.field)`.
             if select.test
-                && let Some(path) = select_path(&select.operand, &select.field, binding)
+                && let Some(path) = select_path(&select.operand, &select.field, roots)
             {
                 paths.insert(path);
             }
         }
         Expr::Call(call) => {
             if let Some(target) = &call.target {
-                walk_for_has(target, binding, paths);
+                walk_for_has(target, roots, paths);
             }
             for arg in &call.args {
-                walk_for_has(arg, binding, paths);
+                walk_for_has(arg, roots, paths);
             }
         }
         Expr::Comprehension(comp) => {
-            for part in [
-                &comp.iter_range,
-                &comp.accu_init,
-                &comp.loop_cond,
-                &comp.loop_step,
-                &comp.result,
-            ] {
-                walk_for_has(part, binding, paths);
+            // The range and the accumulator's initial value are evaluated outside the loop,
+            // where the iteration variables do not yet exist.
+            walk_for_has(&comp.iter_range, roots, paths);
+            walk_for_has(&comp.accu_init, roots, paths);
+
+            let mut inner = roots.clone();
+            // The two-variable form binds the key or index first and the element second;
+            // the one-variable form binds the element alone. Only the element stands for a
+            // path - a key is not part of the message, and neither is the accumulator - and
+            // a variable that stands for nothing shadows whatever its name meant outside.
+            let element = comp.iter_var2.as_ref().unwrap_or(&comp.iter_var);
+            match path_under_binding(&comp.iter_range, roots) {
+                Some(path) => {
+                    inner.insert(element.clone(), path);
+                }
+                None => {
+                    inner.remove(element);
+                }
+            }
+            if comp.iter_var2.is_some() {
+                inner.remove(&comp.iter_var);
+            }
+            inner.remove(&comp.accu_var);
+
+            for part in [&comp.loop_cond, &comp.loop_step, &comp.result] {
+                walk_for_has(part, &inner, paths);
             }
         }
         Expr::List(list) => {
             for element in &list.elements {
-                walk_for_has(element, binding, paths);
+                walk_for_has(element, roots, paths);
             }
         }
         Expr::Struct(structure) => {
             for entry in &structure.entries {
                 if let cel_parser::ast::EntryExpr::StructField(field) = &entry.expr {
-                    walk_for_has(&field.value, binding, paths);
+                    walk_for_has(&field.value, roots, paths);
                 }
             }
         }
         Expr::Map(map) => {
             for entry in &map.entries {
                 if let cel_parser::ast::EntryExpr::MapEntry(pair) = &entry.expr {
-                    walk_for_has(&pair.key, binding, paths);
-                    walk_for_has(&pair.value, binding, paths);
+                    walk_for_has(&pair.key, roots, paths);
+                    walk_for_has(&pair.value, roots, paths);
                 }
             }
         }
@@ -232,25 +264,26 @@ fn walk_for_has(ided: &cel_parser::ast::IdedExpr, binding: &str, paths: &mut Pre
     }
 }
 
-/// The dotted path of `operand.field` when it is rooted at `binding`, else None.
+/// The dotted path of `operand.field` when its root is one of `roots`, else None.
 fn select_path(
     operand: &cel_parser::ast::IdedExpr,
     field: &str,
-    binding: &str,
+    roots: &Roots,
 ) -> Option<Vec<String>> {
-    let mut path = path_under_binding(operand, binding)?;
+    let mut path = path_under_binding(operand, roots)?;
     path.push(field.to_string());
     Some(path)
 }
 
-/// The path an expression names under `binding`: empty for the binding itself, one entry per
-/// field selected from it. None when the expression is rooted anywhere else.
-fn path_under_binding(ided: &cel_parser::ast::IdedExpr, binding: &str) -> Option<Vec<String>> {
+/// The path an expression names: the path its root identifier stands for, plus one entry per
+/// field selected from it. None when the expression is rooted at an identifier not in scope,
+/// or at anything that is not a chain of selects.
+fn path_under_binding(ided: &cel_parser::ast::IdedExpr, roots: &Roots) -> Option<Vec<String>> {
     use cel_parser::ast::Expr;
     match &ided.expr {
-        Expr::Ident(name) if name == binding => Some(Vec::new()),
+        Expr::Ident(name) => roots.get(name).cloned(),
         Expr::Select(select) if !select.test => {
-            let mut path = path_under_binding(&select.operand, binding)?;
+            let mut path = path_under_binding(&select.operand, roots)?;
             path.push(select.field.clone());
             Some(path)
         }
@@ -323,7 +356,9 @@ fn from_protobuf_value_with_presence(
             Value::Map(Map { map: Arc::new(map) })
         }
         prost_reflect::Value::List(v) => {
-            // List elements share the parent's path: `has()` cannot address an index.
+            // List elements share the parent's path: `has()` cannot address an index, so a
+            // rule reaches an element only through a comprehension variable, which
+            // [`collect_has_paths`] resolves to this same path.
             Value::List(Arc::new(
                 v.iter()
                     .map(|item| from_protobuf_value_with_presence(item, presence, path))

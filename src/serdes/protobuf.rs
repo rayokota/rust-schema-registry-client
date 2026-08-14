@@ -2625,8 +2625,8 @@ mod tests {
     }
 
     /// Evaluates `expr` against `message` as a message-level rule.
-    fn eval_rule(
-        message: &test::ValidationOrder,
+    fn eval_rule<M: ReflectMessage>(
+        message: &M,
         expr: &str,
     ) -> Result<ValidationRuleResult, SerdeError> {
         let md = message.descriptor();
@@ -2729,6 +2729,103 @@ mod tests {
             format!("{err:?}").contains("No such key"),
             "expected a missing-key error, got {err:?}"
         );
+    }
+
+    /// A `has()` inside a comprehension is rooted at the comprehension's variable, so the
+    /// prescan has to follow that variable back to the collection it iterates. Without
+    /// that, no path is recorded for the element's field, its key is always present, and
+    /// `has()` answers true for every element whether or not the field was written.
+    #[test]
+    fn has_inside_a_comprehension_reports_presence() {
+        let unset = test::ValidationParent {
+            children: vec![test::ValidationChild::default(); 2],
+            ..Default::default()
+        };
+        for expr in [
+            "this.children.all(c, !has(c.nickname))", // explicit presence
+            "this.children.all(c, !has(c.count))",    // implicit presence
+            "!this.children.exists(c, has(c.nickname))",
+        ] {
+            assert_eq!(
+                eval_rule(&unset, expr).unwrap(),
+                ValidationRuleResult::Bool(true),
+                "{expr} over unwritten children"
+            );
+        }
+
+        let written = test::ValidationParent {
+            children: vec![
+                test::ValidationChild {
+                    nickname: Some("a".to_string()),
+                    count: 1,
+                },
+                test::ValidationChild::default(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            eval_rule(&written, "this.children.exists(c, has(c.nickname))").unwrap(),
+            ValidationRuleResult::Bool(true),
+            "the written child is found"
+        );
+        assert_eq!(
+            eval_rule(&written, "this.children.all(c, has(c.count))").unwrap(),
+            ValidationRuleResult::Bool(false),
+            "the child left at the default is not"
+        );
+    }
+
+    /// The element's fields are still readable at their defaults inside a comprehension, the
+    /// same as anywhere else: only the path a rule tests with `has()` loses its key.
+    #[test]
+    fn comprehension_elements_are_still_readable() {
+        let unset = test::ValidationParent {
+            children: vec![test::ValidationChild::default(); 2],
+            ..Default::default()
+        };
+        assert_eq!(
+            eval_rule(&unset, "this.children.all(c, c.count == 0)").unwrap(),
+            ValidationRuleResult::Bool(true)
+        );
+    }
+
+    /// The paths a rule tests, as the prescan reads them off the AST. A comprehension
+    /// variable resolves to the path of its range, nested comprehensions compose, and a
+    /// variable standing for something outside the message - a map key, the accumulator, a
+    /// range that is not itself a field - shadows the binding rather than borrowing its path.
+    #[test]
+    fn presence_paths_follow_comprehension_variables() {
+        use crate::rules::cel::cel_executor::collect_has_paths;
+        let paths = |expr: &str| collect_has_paths(expr, "this");
+        let path = |parts: [&str; 2]| vec![parts[0].to_string(), parts[1].to_string()];
+
+        assert!(
+            paths("this.children.all(c, has(c.nickname))").contains(&path(["children", "nickname"]))
+        );
+        assert!(
+            paths("this.children.all(c, has(c.only.nickname))").contains(&vec![
+                "children".to_string(),
+                "only".to_string(),
+                "nickname".to_string()
+            ])
+        );
+        // A comprehension inside a comprehension: the inner range is reached through the
+        // outer variable.
+        assert!(
+            paths("this.children.all(c, c.children.all(d, has(d.nickname)))")
+                .contains(&vec![
+                    "children".to_string(),
+                    "children".to_string(),
+                    "nickname".to_string()
+                ])
+        );
+        // Both roots in one expression.
+        let both = paths("has(this.only.nickname) && this.children.all(c, has(c.count))");
+        assert!(both.contains(&path(["only", "nickname"])));
+        assert!(both.contains(&path(["children", "count"])));
+        // A range that names nothing under the binding leaves its variable standing for
+        // nothing, even when the name is the binding's own.
+        assert!(paths("[1, 2].all(this, has(this.count))").is_empty());
     }
 
     fn validate_proto(message: &ValidationOrder, fail_fast: bool) -> Vec<ValidationRuleError> {
