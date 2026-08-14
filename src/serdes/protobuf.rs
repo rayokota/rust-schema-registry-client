@@ -1583,6 +1583,7 @@ mod tests {
     use crate::serdes::protobuf::tests::test::author::PiiOneof;
     use crate::serdes::protobuf::tests::test::{ValidationAddress, ValidationOrder};
     use crate::serdes::serde::{SerdeFormat, SerdeHeaders, header_schema_id_serializer};
+    use crate::serdes::validation_rule::ValidationRuleResult;
     use std::collections::BTreeMap;
 
     pub(crate) mod test {
@@ -2621,6 +2622,113 @@ mod tests {
             cel_interpreter::Value::Duration(d) => assert_eq!(d.num_seconds(), 30),
             other => panic!("expected a CEL duration, got {other:?}"),
         }
+    }
+
+    /// Evaluates `expr` against `message` as a message-level rule.
+    fn eval_rule(
+        message: &test::ValidationOrder,
+        expr: &str,
+    ) -> Result<ValidationRuleResult, SerdeError> {
+        let md = message.descriptor();
+        let mut msg = DynamicMessage::new(md.clone());
+        msg.transcode_from(message).unwrap();
+        let rule = crate::serdes::validation_rule::ValidationRule {
+            name: "r".to_string(),
+            doc: String::new(),
+            expr: expr.to_string(),
+            sql: String::new(),
+        };
+        CelValidator::new().execute(
+            &rule,
+            &crate::serdes::serde::SerdeValue::Protobuf(prost_reflect::Value::Message(msg)),
+        )
+    }
+
+    /// `has()` reports protobuf presence. A message is bound to CEL as a map and `has()` on a
+    /// map is a key-presence check, so the key of a field the rule tests has to be dropped
+    /// when the field is unset - which is what the has()-path prescan decides.
+    ///
+    /// Every shape protobuf tracks presence for is covered: an implicit-presence scalar is
+    /// unset at its default, a message when never written, a repeated field when empty.
+    #[test]
+    fn has_reports_protobuf_presence() {
+        let unset = test::ValidationOrder::default();
+        for expr in [
+            "has(this.quantity)", // implicit-presence scalar
+            "has(this.id)",       // implicit-presence string
+            "has(this.address)",  // message: explicit presence
+            "has(this.items)",    // repeated: empty
+        ] {
+            assert_eq!(
+                eval_rule(&unset, expr).unwrap(),
+                ValidationRuleResult::Bool(false),
+                "{expr} on an unset field"
+            );
+        }
+
+        let written = proto_order("ord-1234", 2, &["a"], Some("12345"));
+        for expr in [
+            "has(this.quantity)",
+            "has(this.id)",
+            "has(this.address)",
+            "has(this.items)",
+        ] {
+            assert_eq!(
+                eval_rule(&written, expr).unwrap(),
+                ValidationRuleResult::Bool(true),
+                "{expr} on a written field"
+            );
+        }
+    }
+
+    /// A field is still readable at its default when the rule does not test it, which is why
+    /// the key cannot simply be dropped for every unset field. A nested read works too: an
+    /// absent message reads as an empty one rather than a missing key.
+    #[test]
+    fn unset_fields_are_still_readable() {
+        let unset = test::ValidationOrder::default();
+        for expr in [
+            "this.quantity == 0",
+            "this.id == ''",
+            "this.address.zip == ''",
+            "size(this.items) == 0",
+        ] {
+            assert_eq!(
+                eval_rule(&unset, expr).unwrap(),
+                ValidationRuleResult::Bool(true),
+                "{expr}"
+            );
+        }
+    }
+
+    /// Guarding a read with `has()` - the idiom the macro exists for - works, because CEL
+    /// only evaluates the guarded branch when `has()` held, and the key is present then.
+    #[test]
+    fn has_guards_a_read_of_the_same_field() {
+        let unset = test::ValidationOrder::default();
+        assert_eq!(
+            eval_rule(&unset, "has(this.quantity) ? this.quantity > 0 : true").unwrap(),
+            ValidationRuleResult::Bool(true)
+        );
+        let written = proto_order("ord-1234", 2, &["a"], Some("12345"));
+        assert_eq!(
+            eval_rule(&written, "has(this.quantity) ? this.quantity > 0 : true").unwrap(),
+            ValidationRuleResult::Bool(true)
+        );
+    }
+
+    /// The limit of binding a message as a map: one key cannot be both absent, so `has()`
+    /// answers false, and present, so a direct read resolves. The key is dropped, so a rule
+    /// that reads the field on the branch where `has()` was false fails rather than answering
+    /// - loudly, and only for an expression that contradicts itself.
+    #[test]
+    fn reading_a_field_tested_by_has_fails_when_it_is_unset() {
+        let unset = test::ValidationOrder::default();
+        let err = eval_rule(&unset, "has(this.quantity) || this.quantity == 0").unwrap_err();
+        assert!(
+            format!("{err:?}").contains("No such key"),
+            "expected a missing-key error, got {err:?}"
+        );
     }
 
     fn validate_proto(message: &ValidationOrder, fail_fast: bool) -> Vec<ValidationRuleError> {

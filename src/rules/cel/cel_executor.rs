@@ -6,7 +6,7 @@ use cel_interpreter::{Context, ExecutionError, ParseErrors, Program, Value};
 use dashmap::DashMap;
 use prost::bytes::Bytes;
 use prost_reflect::{MapKey, ReflectMessage};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub struct CelExecutor {
@@ -100,9 +100,20 @@ impl RuleExecutor for CelExecutor {
 }
 
 pub fn from_serde_value(value: &SerdeValue) -> Value {
+    // No paths, so every field keeps its key: the historical behaviour, and the right one
+    // for a caller that has no rule to inspect.
+    from_serde_value_with_presence(value, &PresencePaths::new())
+}
+
+/// As [`from_serde_value`], but omitting the keys of unset fields that the rule tests with
+/// `has()`. See [`collect_has_paths`].
+pub(crate) fn from_serde_value_with_presence(
+    value: &SerdeValue,
+    presence: &PresencePaths,
+) -> Value {
     match value {
         SerdeValue::Avro(v) => from_avro_value(v),
-        SerdeValue::Protobuf(v) => from_protobuf_value(v),
+        SerdeValue::Protobuf(v) => from_protobuf_value_with_presence(v, presence, &[]),
         SerdeValue::Json(v) => from_json_value(v),
     }
 }
@@ -140,13 +151,124 @@ fn from_avro_value(value: &apache_avro::types::Value) -> Value {
     }
 }
 
-/// Test hook for [`from_protobuf_value`], which is otherwise private to this module.
-#[cfg(test)]
-pub(crate) fn from_protobuf_value_for_test(value: &prost_reflect::Value) -> Value {
-    from_protobuf_value(value)
+/// The field paths a rule applies `has()` to, relative to one binding.
+///
+/// A path is the chain of field names under the binding, so `has(this.a.b)` collects
+/// `["a", "b"]` for the binding `this`.
+pub(crate) type PresencePaths = HashSet<Vec<String>>;
+
+/// Collects every path a rule tests with `has()` under `binding`.
+///
+/// A message is bound to CEL as a map, and `has()` on a map is a key-presence check, so an
+/// unset field has to be missing from the map for `has()` to answer `false`. But the key
+/// also has to be there for a plain read like `this.count == 0` to resolve at all. The two
+/// cannot both hold, so the key is omitted only for the paths a rule actually tests - which
+/// is what this finds. prost-protovalidate resolves it the same way, for the same reason.
+///
+/// The expression is parsed a second time here: `Program` keeps its AST private, and
+/// re-parsing once per distinct rule is cheap next to evaluating it per message.
+/// Paths rooted at anything other than `binding` - comprehension variables, other bindings -
+/// are ignored, and those fields keep their key.
+pub(crate) fn collect_has_paths(expr: &str, binding: &str) -> PresencePaths {
+    let mut paths = PresencePaths::new();
+    if let Ok(parsed) = cel_parser::Parser::default().parse(expr) {
+        walk_for_has(&parsed, binding, &mut paths);
+    }
+    paths
 }
 
-fn from_protobuf_value(value: &prost_reflect::Value) -> Value {
+fn walk_for_has(ided: &cel_parser::ast::IdedExpr, binding: &str, paths: &mut PresencePaths) {
+    use cel_parser::ast::Expr;
+    match &ided.expr {
+        Expr::Select(select) => {
+            walk_for_has(&select.operand, binding, paths);
+            // A "test-only" select is how the parser records `has(operand.field)`.
+            if select.test
+                && let Some(path) = select_path(&select.operand, &select.field, binding)
+            {
+                paths.insert(path);
+            }
+        }
+        Expr::Call(call) => {
+            if let Some(target) = &call.target {
+                walk_for_has(target, binding, paths);
+            }
+            for arg in &call.args {
+                walk_for_has(arg, binding, paths);
+            }
+        }
+        Expr::Comprehension(comp) => {
+            for part in [
+                &comp.iter_range,
+                &comp.accu_init,
+                &comp.loop_cond,
+                &comp.loop_step,
+                &comp.result,
+            ] {
+                walk_for_has(part, binding, paths);
+            }
+        }
+        Expr::List(list) => {
+            for element in &list.elements {
+                walk_for_has(element, binding, paths);
+            }
+        }
+        Expr::Struct(structure) => {
+            for entry in &structure.entries {
+                if let cel_parser::ast::EntryExpr::StructField(field) = &entry.expr {
+                    walk_for_has(&field.value, binding, paths);
+                }
+            }
+        }
+        Expr::Map(map) => {
+            for entry in &map.entries {
+                if let cel_parser::ast::EntryExpr::MapEntry(pair) = &entry.expr {
+                    walk_for_has(&pair.key, binding, paths);
+                    walk_for_has(&pair.value, binding, paths);
+                }
+            }
+        }
+        Expr::Ident(_) | Expr::Literal(_) | Expr::Unspecified => {}
+    }
+}
+
+/// The dotted path of `operand.field` when it is rooted at `binding`, else None.
+fn select_path(
+    operand: &cel_parser::ast::IdedExpr,
+    field: &str,
+    binding: &str,
+) -> Option<Vec<String>> {
+    let mut path = path_under_binding(operand, binding)?;
+    path.push(field.to_string());
+    Some(path)
+}
+
+/// The path an expression names under `binding`: empty for the binding itself, one entry per
+/// field selected from it. None when the expression is rooted anywhere else.
+fn path_under_binding(ided: &cel_parser::ast::IdedExpr, binding: &str) -> Option<Vec<String>> {
+    use cel_parser::ast::Expr;
+    match &ided.expr {
+        Expr::Ident(name) if name == binding => Some(Vec::new()),
+        Expr::Select(select) if !select.test => {
+            let mut path = path_under_binding(&select.operand, binding)?;
+            path.push(select.field.clone());
+            Some(path)
+        }
+        _ => None,
+    }
+}
+
+/// Test hook for the protobuf conversion, which is otherwise private to this module.
+#[cfg(test)]
+pub(crate) fn from_protobuf_value_for_test(value: &prost_reflect::Value) -> Value {
+    from_protobuf_value_with_presence(value, &PresencePaths::new(), &[])
+}
+
+fn from_protobuf_value_with_presence(
+    value: &prost_reflect::Value,
+    presence: &PresencePaths,
+    path: &[String],
+) -> Value {
     match value {
         prost_reflect::Value::Bool(v) => Value::Bool(*v),
         prost_reflect::Value::I32(v) => Value::Int(*v as i64),
@@ -169,31 +291,54 @@ fn from_protobuf_value(value: &prost_reflect::Value) -> Value {
             if let Some(unwrapped) = unwrap_well_known(msg) {
                 return unwrapped;
             }
-            // Walk the descriptor rather than only the populated fields: a proto3 scalar
-            // sitting at its default is still set as far as the language is concerned, and
-            // omitting it makes an expression like `msg.count == 0` fail with "no such
-            // key". Fields with explicit presence (optional, oneof members, messages) are
-            // still omitted when unset, so `has(...)` keeps working.
+            // Every field gets a key, so a plain read like `msg.count == 0` resolves even
+            // when the producer never wrote the field - protobuf calls a proto3 scalar at
+            // its default unset, but CEL still has to be able to read it.
+            //
+            // The exception is a field the rule tests with `has()`: `has()` on a map is a
+            // key-presence check, so an unset field has to be missing for it to answer
+            // false. Only those keys are dropped, which is the narrowest way to satisfy both
+            // and is how prost-protovalidate resolves the same conflict.
+            //
+            // has_field() is protobuf's own presence rule - explicit presence when the field
+            // tracks it, difference from the default otherwise, non-empty for a repeated or
+            // map field - so it needs no help per field kind.
             let descriptor = msg.descriptor();
             let mut map: HashMap<Key, Value> = HashMap::with_capacity(descriptor.fields().len());
             for fd in descriptor.fields() {
-                if fd.supports_presence() && !msg.has_field(&fd) {
+                let mut field_path = Vec::with_capacity(path.len() + 1);
+                field_path.extend_from_slice(path);
+                field_path.push(fd.name().to_string());
+
+                if !msg.has_field(&fd) && presence.contains(&field_path) {
                     continue;
                 }
+                // get_field yields the default for an unset field - the zero scalar, or an
+                // empty message so that `msg.sub.field` still resolves.
                 map.insert(
                     Key::String(Arc::new(fd.name().to_string())),
-                    from_protobuf_value(&msg.get_field(&fd)),
+                    from_protobuf_value_with_presence(&msg.get_field(&fd), presence, &field_path),
                 );
             }
             Value::Map(Map { map: Arc::new(map) })
         }
         prost_reflect::Value::List(v) => {
-            Value::List(Arc::new(v.iter().map(from_protobuf_value).collect()))
+            // List elements share the parent's path: `has()` cannot address an index.
+            Value::List(Arc::new(
+                v.iter()
+                    .map(|item| from_protobuf_value_with_presence(item, presence, path))
+                    .collect(),
+            ))
         }
         prost_reflect::Value::Map(v) => {
             let map = v
                 .iter()
-                .map(|(k, v)| (from_protobuf_map_key(k), from_protobuf_value(v)))
+                .map(|(k, v)| {
+                    (
+                        from_protobuf_map_key(k),
+                        from_protobuf_value_with_presence(v, presence, path),
+                    )
+                })
                 .collect();
             Value::Map(Map { map: Arc::new(map) })
         }
