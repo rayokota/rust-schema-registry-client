@@ -86,6 +86,14 @@ message ValidationParent {
   ValidationChild only = 3;
 }
 
+// A schema that refers to itself. An absent message field is expanded from its default,
+// which has a `child` of its own, so expanding one without a bound has no end - and the
+// expansion is what lets `this.child.name` resolve when `child` was never written.
+message ValidationNode {
+  string name = 1;
+  ValidationNode child = 2;
+}
+
 // A well-known type stands for the thing it wraps, not a message with a `value` field: a
 // StringValue is a string and an Int64Value is an int. Without unwrapping, `size(this)` has
 // no overload for a message and a rule would have to read `this.value` in this client alone.

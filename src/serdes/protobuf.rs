@@ -2894,6 +2894,85 @@ mod tests {
         );
     }
 
+    /// A message that refers to itself is bound without the expansion of absent fields
+    /// running away: `child` is unset, so it is expanded from its default, which has a
+    /// `child` of its own. Every rule on such a message used to abort the process with a
+    /// stack overflow - including one that never mentions the recursive field.
+    #[test]
+    fn recursive_message_binds_without_unbounded_expansion() {
+        let leaf = test::ValidationNode {
+            name: "root".to_string(),
+            child: None,
+        };
+        assert_eq!(
+            eval_rule(&leaf, "size(this.name) > 0").unwrap(),
+            ValidationRuleResult::Bool(true)
+        );
+
+        // The written part of the chain is still walked in full; only the absent tail stops.
+        let nested = test::ValidationNode {
+            name: "root".to_string(),
+            child: Some(Box::new(test::ValidationNode {
+                name: "middle".to_string(),
+                child: Some(Box::new(test::ValidationNode {
+                    name: "leaf".to_string(),
+                    child: None,
+                })),
+            })),
+        };
+        assert_eq!(
+            eval_rule(&nested, "this.child.child.name == 'leaf'").unwrap(),
+            ValidationRuleResult::Bool(true)
+        );
+
+        // And presence still reports what protobuf reports.
+        assert_eq!(
+            eval_rule(&leaf, "has(this.child)").unwrap(),
+            ValidationRuleResult::Bool(false)
+        );
+        assert_eq!(
+            eval_rule(&nested, "has(this.child)").unwrap(),
+            ValidationRuleResult::Bool(true)
+        );
+    }
+
+    /// `has()` reaches an element through an index as readily as through a comprehension
+    /// variable, and the element is reached by the path of the collection holding it, so
+    /// both forms name the same field.
+    #[test]
+    fn has_through_an_index_reports_protobuf_presence() {
+        let unset = test::ValidationParent {
+            children: vec![test::ValidationChild::default()],
+            ..Default::default()
+        };
+        for expr in [
+            "!has(this.children[0].nickname)",
+            "!has(this.children[0].count)",
+            "!has(this.by_name['a'].nickname)",
+        ] {
+            assert_eq!(
+                eval_rule(&unset, expr).unwrap(),
+                ValidationRuleResult::Bool(true),
+                "{expr} over an unwritten field"
+            );
+        }
+
+        let written = test::ValidationParent {
+            children: vec![test::ValidationChild {
+                nickname: Some("a".to_string()),
+                count: 1,
+            }],
+            ..Default::default()
+        };
+        for expr in ["has(this.children[0].nickname)", "has(this.children[0].count)"] {
+            assert_eq!(
+                eval_rule(&written, expr).unwrap(),
+                ValidationRuleResult::Bool(true),
+                "{expr} over a written field"
+            );
+        }
+    }
+
     /// The paths a rule tests, as the prescan reads them off the AST. A comprehension
     /// variable resolves to the path of its range, nested comprehensions compose, and a
     /// variable standing for something outside the message - a map key, the accumulator, a

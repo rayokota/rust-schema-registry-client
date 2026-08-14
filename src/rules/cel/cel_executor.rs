@@ -152,7 +152,7 @@ pub(crate) fn from_serde_value_with_presence(
 ) -> Value {
     match value {
         SerdeValue::Avro(v) => from_avro_value(v),
-        SerdeValue::Protobuf(v) => from_protobuf_value_with_presence(v, presence, &[]),
+        SerdeValue::Protobuf(v) => from_protobuf_value_with_presence(v, presence, &[], &[]),
         SerdeValue::Json(v) => from_json_value(v),
     }
 }
@@ -326,6 +326,16 @@ fn path_under_binding(ided: &cel_parser::ast::IdedExpr, roots: &Roots) -> Option
             path.push(select.field.clone());
             Some(path)
         }
+        // An index reads an element of a list or a value of a map, and both are reached by
+        // the path of the collection that holds them - `has()` cannot address an index or a
+        // key, so the conversion gives them their parent's path. `this.children[0]` therefore
+        // names what `this.children` names, the same as a comprehension variable over it.
+        Expr::Call(call)
+            if call.func_name == cel_parser::ast::operators::INDEX
+                || call.func_name == cel_parser::ast::operators::OPT_INDEX =>
+        {
+            path_under_binding(call.args.first()?, roots)
+        }
         _ => None,
     }
 }
@@ -333,13 +343,19 @@ fn path_under_binding(ided: &cel_parser::ast::IdedExpr, roots: &Roots) -> Option
 /// Test hook for the protobuf conversion, which is otherwise private to this module.
 #[cfg(test)]
 pub(crate) fn from_protobuf_value_for_test(value: &prost_reflect::Value) -> Value {
-    from_protobuf_value_with_presence(value, &PresencePaths::new(), &[])
+    from_protobuf_value_with_presence(value, &PresencePaths::new(), &[], &[])
 }
 
+/// Converts a protobuf value for CEL.
+///
+/// `path` is where the value sits under the binding, for matching against `presence`.
+/// `expanding` is the chain of message types enclosing it, which bounds the expansion of
+/// absent messages - see the Message arm.
 fn from_protobuf_value_with_presence(
     value: &prost_reflect::Value,
     presence: &PresencePaths,
     path: &[String],
+    expanding: &[String],
 ) -> Value {
     match value {
         prost_reflect::Value::Bool(v) => Value::Bool(*v),
@@ -376,20 +392,50 @@ fn from_protobuf_value_with_presence(
             // tracks it, difference from the default otherwise, non-empty for a repeated or
             // map field - so it needs no help per field kind.
             let descriptor = msg.descriptor();
+            let mut enclosing = Vec::with_capacity(expanding.len() + 1);
+            enclosing.extend_from_slice(expanding);
+            enclosing.push(descriptor.full_name().to_string());
+
             let mut map: HashMap<Key, Value> = HashMap::with_capacity(descriptor.fields().len());
             for fd in descriptor.fields() {
                 let mut field_path = Vec::with_capacity(path.len() + 1);
                 field_path.extend_from_slice(path);
                 field_path.push(fd.name().to_string());
 
-                if !msg.has_field(&fd) && presence.contains(&field_path) {
-                    continue;
+                let key = Key::String(Arc::new(fd.name().to_string()));
+                if !msg.has_field(&fd) {
+                    if presence.contains(&field_path) {
+                        continue;
+                    }
+                    // An absent message is expanded from its default, which has every field
+                    // of its own - including, in a recursive schema like
+                    // `message Node { Node child = 1; }`, another absent message of the same
+                    // type. Expanding that has no end, so a type already being expanded
+                    // stops here as an empty map. An engine that reads fields on demand,
+                    // which is every other client's, never materializes the chain at all and
+                    // so needs no such bound; only a message built as a map does.
+                    if let prost_reflect::Kind::Message(field_md) = fd.kind()
+                        && enclosing.iter().any(|name| name == field_md.full_name())
+                    {
+                        map.insert(
+                            key,
+                            Value::Map(Map {
+                                map: Arc::new(HashMap::new()),
+                            }),
+                        );
+                        continue;
+                    }
                 }
                 // get_field yields the default for an unset field - the zero scalar, or an
                 // empty message so that `msg.sub.field` still resolves.
                 map.insert(
-                    Key::String(Arc::new(fd.name().to_string())),
-                    from_protobuf_value_with_presence(&msg.get_field(&fd), presence, &field_path),
+                    key,
+                    from_protobuf_value_with_presence(
+                        &msg.get_field(&fd),
+                        presence,
+                        &field_path,
+                        &enclosing,
+                    ),
                 );
             }
             Value::Map(Map { map: Arc::new(map) })
@@ -400,7 +446,9 @@ fn from_protobuf_value_with_presence(
             // [`collect_has_paths`] resolves to this same path.
             Value::List(Arc::new(
                 v.iter()
-                    .map(|item| from_protobuf_value_with_presence(item, presence, path))
+                    .map(|item| {
+                        from_protobuf_value_with_presence(item, presence, path, expanding)
+                    })
                     .collect(),
             ))
         }
@@ -410,7 +458,7 @@ fn from_protobuf_value_with_presence(
                 .map(|(k, v)| {
                     (
                         from_protobuf_map_key(k),
-                        from_protobuf_value_with_presence(v, presence, path),
+                        from_protobuf_value_with_presence(v, presence, path, expanding),
                     )
                 })
                 .collect();
