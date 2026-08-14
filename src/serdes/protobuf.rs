@@ -2976,6 +2976,62 @@ mod tests {
         }
     }
 
+    /// A wrapper field carries null-or-value: unset is how a producer says "no value", as
+    /// distinct from the empty string or zero that an ordinary message's default would give.
+    /// cel-go returns null for one that is unset, and protovalidate-cc asks cel-cpp for the
+    /// same, so a rule reads the distinction the field was declared for.
+    #[test]
+    fn unset_wrapper_fields_read_as_null() {
+        let unset = test::ValidationWellKnown::default();
+        for expr in [
+            "this.name == null",
+            "this.count == null",
+            "this.active == null",
+            "this.big == null",
+        ] {
+            assert_eq!(
+                eval_rule(&unset, expr).unwrap(),
+                ValidationRuleResult::Bool(true),
+                "{expr} on an unset wrapper"
+            );
+        }
+        // Not the zero value the message's default would have unwrapped to.
+        assert_eq!(
+            eval_rule(&unset, "this.name == ''").unwrap(),
+            ValidationRuleResult::Bool(false)
+        );
+
+        // A written wrapper is still the value it wraps, not a message and not null.
+        let written = test::ValidationWellKnown {
+            name: Some("a".to_string()),
+            count: Some(7),
+            active: Some(true),
+            big: Some(u64::MAX),
+        };
+        for expr in [
+            "this.name == 'a'",
+            "this.count == 7",
+            "this.active",
+            "this.big == 18446744073709551615u",
+        ] {
+            assert_eq!(
+                eval_rule(&written, expr).unwrap(),
+                ValidationRuleResult::Bool(true),
+                "{expr} on a written wrapper"
+            );
+        }
+
+        // Presence is unchanged: an unset wrapper is absent either way.
+        assert_eq!(
+            eval_rule(&unset, "has(this.name)").unwrap(),
+            ValidationRuleResult::Bool(false)
+        );
+        assert_eq!(
+            eval_rule(&written, "has(this.name)").unwrap(),
+            ValidationRuleResult::Bool(true)
+        );
+    }
+
     /// The paths a rule tests, as the prescan reads them off the AST. A comprehension
     /// variable resolves to the path of its range, nested comprehensions compose, and a
     /// variable standing for something outside the message - a map key, the accumulator, a

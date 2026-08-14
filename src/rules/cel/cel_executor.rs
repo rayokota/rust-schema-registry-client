@@ -407,6 +407,17 @@ fn from_protobuf_value_with_presence(
                     if presence.contains(&field_path) {
                         continue;
                     }
+                    // A wrapper carries null-or-value rather than the zero value an ordinary
+                    // message carries, which is the whole reason to declare a field as one:
+                    // it is how a producer says "unset" as opposed to "empty". Expanding it
+                    // like any other message would unwrap the default to "" or 0, and the
+                    // distinction the field exists for would be gone.
+                    if let prost_reflect::Kind::Message(field_md) = fd.kind()
+                        && is_wrapper_message(field_md.full_name())
+                    {
+                        map.insert(key, Value::Null);
+                        continue;
+                    }
                     // An absent message is expanded from its default, which has every field
                     // of its own - including, in a recursive schema like
                     // `message Node { Node child = 1; }`, another absent message of the same
@@ -463,6 +474,25 @@ fn from_protobuf_value_with_presence(
             Value::Map(Map { map: Arc::new(map) })
         }
     }
+}
+
+/// Whether `full_name` names one of the wrapper messages, which stand for null when unset
+/// and for the value they hold when set. cel-go singles out the same nine, and
+/// protovalidate-cc asks cel-cpp for the behaviour with
+/// `enable_empty_wrapper_null_unboxing`; our C++ client sets that too.
+fn is_wrapper_message(full_name: &str) -> bool {
+    matches!(
+        full_name,
+        "google.protobuf.BoolValue"
+            | "google.protobuf.BytesValue"
+            | "google.protobuf.DoubleValue"
+            | "google.protobuf.FloatValue"
+            | "google.protobuf.Int32Value"
+            | "google.protobuf.Int64Value"
+            | "google.protobuf.StringValue"
+            | "google.protobuf.UInt32Value"
+            | "google.protobuf.UInt64Value"
+    )
 }
 
 /// The CEL value a well-known message stands for, or None when it is an ordinary message.
