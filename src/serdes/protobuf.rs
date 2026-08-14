@@ -2667,9 +2667,10 @@ mod tests {
         let mut args = HashMap::new();
         args.insert(
             "message".to_string(),
-            executor.message_binding(&ctx, &SerdeValue::Protobuf(prost_reflect::Value::Message(
-                msg.clone(),
-            ))),
+            executor.message_binding(
+                &ctx,
+                &SerdeValue::Protobuf(prost_reflect::Value::Message(msg.clone())),
+            ),
         );
         executor
             .execute(
@@ -2904,7 +2905,8 @@ mod tests {
         let path = |parts: [&str; 2]| vec![parts[0].to_string(), parts[1].to_string()];
 
         assert!(
-            paths("this.children.all(c, has(c.nickname))").contains(&path(["children", "nickname"]))
+            paths("this.children.all(c, has(c.nickname))")
+                .contains(&path(["children", "nickname"]))
         );
         assert!(
             paths("this.children.all(c, has(c.only.nickname))").contains(&vec![
@@ -2916,12 +2918,11 @@ mod tests {
         // A comprehension inside a comprehension: the inner range is reached through the
         // outer variable.
         assert!(
-            paths("this.children.all(c, c.children.all(d, has(d.nickname)))")
-                .contains(&vec![
-                    "children".to_string(),
-                    "children".to_string(),
-                    "nickname".to_string()
-                ])
+            paths("this.children.all(c, c.children.all(d, has(d.nickname)))").contains(&vec![
+                "children".to_string(),
+                "children".to_string(),
+                "nickname".to_string()
+            ])
         );
         // Both roots in one expression.
         let both = paths("has(this.only.nickname) && this.children.all(c, has(c.count))");
