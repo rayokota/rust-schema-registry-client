@@ -2964,7 +2964,10 @@ mod tests {
             }],
             ..Default::default()
         };
-        for expr in ["has(this.children[0].nickname)", "has(this.children[0].count)"] {
+        for expr in [
+            "has(this.children[0].nickname)",
+            "has(this.children[0].count)",
+        ] {
             assert_eq!(
                 eval_rule(&written, expr).unwrap(),
                 ValidationRuleResult::Bool(true),

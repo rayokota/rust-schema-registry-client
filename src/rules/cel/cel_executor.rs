@@ -446,9 +446,7 @@ fn from_protobuf_value_with_presence(
             // [`collect_has_paths`] resolves to this same path.
             Value::List(Arc::new(
                 v.iter()
-                    .map(|item| {
-                        from_protobuf_value_with_presence(item, presence, path, expanding)
-                    })
+                    .map(|item| from_protobuf_value_with_presence(item, presence, path, expanding))
                     .collect(),
             ))
         }
