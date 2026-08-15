@@ -32,6 +32,74 @@ pub struct ValidationOrder {
     #[prost(uint64, tag = "6")]
     pub serial: u64,
 }
+/// A `has()` written inside a comprehension is rooted at the comprehension's own variable
+/// rather than at `this`, so the presence prescan has to follow that variable back to the
+/// path of the collection it iterates. Both shapes an element can be reached through are
+/// here: a repeated field and the values of a map.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(::prost_reflect::ReflectMessage)]
+#[prost_reflect(message_name = "test.ValidationChild")]
+#[prost_reflect(descriptor_pool = "crate::TEST_DESCRIPTOR_POOL")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ValidationChild {
+    /// Explicit presence, which is the case a comprehension used to get wrong: the field was
+    /// omitted whenever unset before the prescan, and always present after it.
+    #[prost(string, optional, tag = "1")]
+    pub nickname: ::core::option::Option<::prost::alloc::string::String>,
+    /// Implicit presence: unset means equal to the default.
+    #[prost(int32, tag = "2")]
+    pub count: i32,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(::prost_reflect::ReflectMessage)]
+#[prost_reflect(message_name = "test.ValidationParent")]
+#[prost_reflect(descriptor_pool = "crate::TEST_DESCRIPTOR_POOL")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ValidationParent {
+    #[prost(message, repeated, tag = "1")]
+    pub children: ::prost::alloc::vec::Vec<ValidationChild>,
+    #[prost(map = "string, message", tag = "2")]
+    pub by_name: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ValidationChild,
+    >,
+    #[prost(message, optional, tag = "3")]
+    pub only: ::core::option::Option<ValidationChild>,
+}
+/// A schema that refers to itself. An absent message field is expanded from its default,
+/// which has a `child` of its own, so expanding one without a bound has no end - and the
+/// expansion is what lets `this.child.name` resolve when `child` was never written.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(::prost_reflect::ReflectMessage)]
+#[prost_reflect(message_name = "test.ValidationNode")]
+#[prost_reflect(descriptor_pool = "crate::TEST_DESCRIPTOR_POOL")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ValidationNode {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(message, optional, boxed, tag = "2")]
+    pub child: ::core::option::Option<::prost::alloc::boxed::Box<ValidationNode>>,
+}
+/// A well-known type stands for the thing it wraps, not a message with a `value` field: a
+/// StringValue is a string and an Int64Value is an int. Without unwrapping, `size(this)` has
+/// no overload for a message and a rule would have to read `this.value` in this client alone.
+/// Timestamp and Duration are covered by a unit test instead: prost maps them to
+/// prost_types, which does not implement the serde derives applied to generated code here.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(::prost_reflect::ReflectMessage)]
+#[prost_reflect(message_name = "test.ValidationWellKnown")]
+#[prost_reflect(descriptor_pool = "crate::TEST_DESCRIPTOR_POOL")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ValidationWellKnown {
+    #[prost(message, optional, tag = "1")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "2")]
+    pub count: ::core::option::Option<i64>,
+    #[prost(message, optional, tag = "3")]
+    pub active: ::core::option::Option<bool>,
+    #[prost(message, optional, tag = "4")]
+    pub big: ::core::option::Option<u64>,
+}
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(::prost_reflect::ReflectMessage)]
 #[prost_reflect(message_name = "test.TestMessage")]

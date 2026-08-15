@@ -3,6 +3,9 @@ syntax = "proto3";
 package test;
 
 import "confluent/meta.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/wrappers.proto";
 
 message ValidationAddress {
   // A message-level rule on a nested type: `this` is the address, so the message handed to
@@ -61,6 +64,60 @@ message ValidationOrder {
   uint64 serial = 6 [(confluent.field_meta) = {
     rules: [
       { name: "serial_positive", expr: "this > 0" }
+    ]
+  }];
+}
+
+// A `has()` written inside a comprehension is rooted at the comprehension's own variable
+// rather than at `this`, so the presence prescan has to follow that variable back to the
+// path of the collection it iterates. Both shapes an element can be reached through are
+// here: a repeated field and the values of a map.
+message ValidationChild {
+  // Explicit presence, which is the case a comprehension used to get wrong: the field was
+  // omitted whenever unset before the prescan, and always present after it.
+  optional string nickname = 1;
+  // Implicit presence: unset means equal to the default.
+  int32 count = 2;
+}
+
+message ValidationParent {
+  repeated ValidationChild children = 1;
+  map<string, ValidationChild> by_name = 2;
+  ValidationChild only = 3;
+}
+
+// A schema that refers to itself. An absent message field is expanded from its default,
+// which has a `child` of its own, so expanding one without a bound has no end - and the
+// expansion is what lets `this.child.name` resolve when `child` was never written.
+message ValidationNode {
+  string name = 1;
+  ValidationNode child = 2;
+}
+
+// A well-known type stands for the thing it wraps, not a message with a `value` field: a
+// StringValue is a string and an Int64Value is an int. Without unwrapping, `size(this)` has
+// no overload for a message and a rule would have to read `this.value` in this client alone.
+// Timestamp and Duration are covered by a unit test instead: prost maps them to
+// prost_types, which does not implement the serde derives applied to generated code here.
+message ValidationWellKnown {
+  google.protobuf.StringValue name = 1 [(confluent.field_meta) = {
+    rules: [
+      { name: "name_not_empty", expr: "size(this) > 0" }
+    ]
+  }];
+  google.protobuf.Int64Value count = 2 [(confluent.field_meta) = {
+    rules: [
+      { name: "count_positive", expr: "this > 0" }
+    ]
+  }];
+  google.protobuf.BoolValue active = 3 [(confluent.field_meta) = {
+    rules: [
+      { name: "must_be_active", expr: "this" }
+    ]
+  }];
+  google.protobuf.UInt64Value big = 4 [(confluent.field_meta) = {
+    rules: [
+      { name: "big_positive", expr: "this > 0u" }
     ]
   }];
 }

@@ -72,9 +72,12 @@ impl FieldRuleExecutor for CelFieldExecutor {
                     .collect(),
             )),
         );
+        // `value` is a scalar - a field with anything else in it returned above - so only the
+        // containing message can be tested with `has()`.
+        let containing_message = field_ctx.containing_message.clone();
         args.insert(
             "message".to_string(),
-            from_serde_value(&field_ctx.containing_message),
+            self.executor.message_binding(ctx, &containing_message),
         );
         self.executor.execute(ctx, field_value, &args)
     }

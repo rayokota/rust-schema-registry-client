@@ -1583,6 +1583,7 @@ mod tests {
     use crate::serdes::protobuf::tests::test::author::PiiOneof;
     use crate::serdes::protobuf::tests::test::{ValidationAddress, ValidationOrder};
     use crate::serdes::serde::{SerdeFormat, SerdeHeaders, header_schema_id_serializer};
+    use crate::serdes::validation_rule::ValidationRuleResult;
     use std::collections::BTreeMap;
 
     pub(crate) mod test {
@@ -2541,6 +2542,533 @@ mod tests {
         assert_eq!(result.items, vec!["a-suffix", "b-suffix"]);
         // Reached only by descending with the nested message's own descriptor.
         assert_eq!(result.address.unwrap().zip, "12345-suffix");
+    }
+
+    /// A well-known type stands for what it wraps: a StringValue is a string, an
+    /// Int64Value is an int. Without unwrapping, every rule here fails - `size(this)` has no
+    /// overload for a message - and a rule would have to be written against `this.value` in
+    /// this client alone.
+    #[test]
+    fn well_known_types_bind_as_the_value_they_wrap() {
+        let message = test::ValidationWellKnown {
+            name: Some("widget".to_string()),
+            count: Some(7),
+            active: Some(true),
+            big: Some(9_000_000_000_000_000_000),
+        };
+        let md = message.descriptor();
+        let mut msg = DynamicMessage::new(md.clone());
+        msg.transcode_from(&message).unwrap();
+        let violations = validate_message(&CelValidator::new(), &md, &msg, None, false);
+        assert!(
+            violations.is_empty(),
+            "expected no violations, got {violations:?}"
+        );
+    }
+
+    /// And the rules still fire when the wrapped value fails them, so the test above is not
+    /// passing merely because nothing was evaluated.
+    #[test]
+    fn well_known_type_rules_still_fire() {
+        let message = test::ValidationWellKnown {
+            name: Some(String::new()),
+            count: Some(-1),
+            active: Some(false),
+            big: Some(0),
+        };
+        let md = message.descriptor();
+        let mut msg = DynamicMessage::new(md.clone());
+        msg.transcode_from(&message).unwrap();
+        let violations = validate_message(&CelValidator::new(), &md, &msg, None, false);
+        let mut names: Vec<&str> = violations.iter().map(|v| v.rule.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "big_positive",
+                "count_positive",
+                "must_be_active",
+                "name_not_empty"
+            ]
+        );
+    }
+
+    /// Timestamp and Duration cannot appear in a generated type here - prost maps them to
+    /// prost_types, which does not implement the serde derives applied to generated code - so
+    /// the conversion is exercised directly on a dynamic message.
+    #[test]
+    fn timestamp_and_duration_bind_as_cel_values() {
+        use crate::rules::cel::cel_executor::from_protobuf_value_for_test;
+
+        let pool = &crate::TEST_DESCRIPTOR_POOL;
+        let ts_desc = pool
+            .get_message_by_name("google.protobuf.Timestamp")
+            .expect("timestamp.proto is imported by validation.proto");
+        let mut ts = DynamicMessage::new(ts_desc);
+        ts.set_field_by_name("seconds", prost_reflect::Value::I64(1_600_000_000));
+        ts.set_field_by_name("nanos", prost_reflect::Value::I32(0));
+        match from_protobuf_value_for_test(&prost_reflect::Value::Message(ts)) {
+            cel_interpreter::Value::Timestamp(t) => assert_eq!(t.timestamp(), 1_600_000_000),
+            other => panic!("expected a CEL timestamp, got {other:?}"),
+        }
+
+        let dur_desc = pool
+            .get_message_by_name("google.protobuf.Duration")
+            .expect("duration.proto is imported by validation.proto");
+        let mut dur = DynamicMessage::new(dur_desc);
+        dur.set_field_by_name("seconds", prost_reflect::Value::I64(30));
+        dur.set_field_by_name("nanos", prost_reflect::Value::I32(0));
+        match from_protobuf_value_for_test(&prost_reflect::Value::Message(dur)) {
+            cel_interpreter::Value::Duration(d) => assert_eq!(d.num_seconds(), 30),
+            other => panic!("expected a CEL duration, got {other:?}"),
+        }
+    }
+
+    /// Evaluates `expr` as a CEL rule - the kind that binds the message to `message` rather
+    /// than to `this` - through the executor a serializer would use.
+    fn eval_cel_rule<M: ReflectMessage>(message: &M, expr: &str) -> SerdeValue {
+        let md = message.descriptor();
+        let mut msg = DynamicMessage::new(md.clone());
+        msg.transcode_from(message).unwrap();
+
+        let rule = Rule {
+            name: "r".to_string(),
+            doc: None,
+            kind: Some(Kind::Transform),
+            mode: Some(Mode::Write),
+            r#type: "CEL".to_string(),
+            tags: None,
+            params: None,
+            expr: Some(expr.to_string()),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let mut ctx = RuleContext::new(
+            None,
+            SerializationContext {
+                topic: "test".to_string(),
+                serde_type: SerdeType::Value,
+                serde_format: SerdeFormat::Protobuf,
+                headers: None,
+            },
+            None,
+            None,
+            None,
+            "test-value".to_string(),
+            Mode::Write,
+            rule.clone(),
+            0,
+            vec![rule],
+            None,
+            None,
+        );
+        let executor = CelExecutor::new();
+        let mut args = HashMap::new();
+        args.insert(
+            "message".to_string(),
+            executor.message_binding(
+                &ctx,
+                &SerdeValue::Protobuf(prost_reflect::Value::Message(msg.clone())),
+            ),
+        );
+        executor
+            .execute(
+                &mut ctx,
+                &SerdeValue::Protobuf(prost_reflect::Value::Message(msg)),
+                &args,
+            )
+            .unwrap()
+    }
+
+    /// True when a CEL rule answered with that boolean, rather than returning the message
+    /// untouched - which is what a rule whose guard did not hold does.
+    fn answered(result: &SerdeValue, expected: bool) -> bool {
+        matches!(result, SerdeValue::Protobuf(prost_reflect::Value::Bool(b)) if *b == expected)
+    }
+
+    /// A CEL rule reads `has(message.field)` the same way a validation rule reads
+    /// `has(this.field)`, and the same way the JVM client does - it hands the message to its
+    /// engine, which answers from protobuf presence. Binding the message as a map with every
+    /// key present would answer true for a field the producer never wrote.
+    #[test]
+    fn has_on_the_message_binding_reports_protobuf_presence() {
+        let unset = test::ValidationOrder::default();
+        let written = proto_order("ord-1234", 2, &["a"], Some("12345"));
+        for expr in [
+            "has(message.quantity)", // implicit-presence scalar
+            "has(message.address)",  // message: explicit presence
+            "has(message.items)",    // repeated: empty
+        ] {
+            assert!(
+                answered(&eval_cel_rule(&unset, expr), false),
+                "{expr} on an unset field"
+            );
+            assert!(
+                answered(&eval_cel_rule(&written, expr), true),
+                "{expr} on a written field"
+            );
+        }
+
+        // A guarded rule is a `guard ; body` pair, which is not itself a CEL expression, so
+        // both halves have to be scanned: a has() in the guard is answered from the same
+        // bindings the body sees. A guard that does not hold leaves the message untouched.
+        assert!(matches!(
+            eval_cel_rule(&unset, "has(message.address) ; true"),
+            SerdeValue::Protobuf(prost_reflect::Value::Message(_))
+        ));
+        assert!(answered(
+            &eval_cel_rule(&written, "has(message.address) ; true"),
+            true
+        ));
+
+        // A field the rule does not test is still readable at its default.
+        assert!(answered(
+            &eval_cel_rule(&unset, "message.quantity == 0"),
+            true
+        ));
+    }
+
+    /// Evaluates `expr` against `message` as a message-level rule.
+    fn eval_rule<M: ReflectMessage>(
+        message: &M,
+        expr: &str,
+    ) -> Result<ValidationRuleResult, SerdeError> {
+        let md = message.descriptor();
+        let mut msg = DynamicMessage::new(md.clone());
+        msg.transcode_from(message).unwrap();
+        let rule = crate::serdes::validation_rule::ValidationRule {
+            name: "r".to_string(),
+            doc: String::new(),
+            expr: expr.to_string(),
+            sql: String::new(),
+        };
+        CelValidator::new().execute(
+            &rule,
+            &crate::serdes::serde::SerdeValue::Protobuf(prost_reflect::Value::Message(msg)),
+        )
+    }
+
+    /// `has()` reports protobuf presence. A message is bound to CEL as a map and `has()` on a
+    /// map is a key-presence check, so the key of a field the rule tests has to be dropped
+    /// when the field is unset - which is what the has()-path prescan decides.
+    ///
+    /// Every shape protobuf tracks presence for is covered: an implicit-presence scalar is
+    /// unset at its default, a message when never written, a repeated field when empty.
+    #[test]
+    fn has_reports_protobuf_presence() {
+        let unset = test::ValidationOrder::default();
+        for expr in [
+            "has(this.quantity)", // implicit-presence scalar
+            "has(this.id)",       // implicit-presence string
+            "has(this.address)",  // message: explicit presence
+            "has(this.items)",    // repeated: empty
+        ] {
+            assert_eq!(
+                eval_rule(&unset, expr).unwrap(),
+                ValidationRuleResult::Bool(false),
+                "{expr} on an unset field"
+            );
+        }
+
+        let written = proto_order("ord-1234", 2, &["a"], Some("12345"));
+        for expr in [
+            "has(this.quantity)",
+            "has(this.id)",
+            "has(this.address)",
+            "has(this.items)",
+        ] {
+            assert_eq!(
+                eval_rule(&written, expr).unwrap(),
+                ValidationRuleResult::Bool(true),
+                "{expr} on a written field"
+            );
+        }
+    }
+
+    /// A field is still readable at its default when the rule does not test it, which is why
+    /// the key cannot simply be dropped for every unset field. A nested read works too: an
+    /// absent message reads as an empty one rather than a missing key.
+    #[test]
+    fn unset_fields_are_still_readable() {
+        let unset = test::ValidationOrder::default();
+        for expr in [
+            "this.quantity == 0",
+            "this.id == ''",
+            "this.address.zip == ''",
+            "size(this.items) == 0",
+        ] {
+            assert_eq!(
+                eval_rule(&unset, expr).unwrap(),
+                ValidationRuleResult::Bool(true),
+                "{expr}"
+            );
+        }
+    }
+
+    /// Guarding a read with `has()` - the idiom the macro exists for - works, because CEL
+    /// only evaluates the guarded branch when `has()` held, and the key is present then.
+    #[test]
+    fn has_guards_a_read_of_the_same_field() {
+        let unset = test::ValidationOrder::default();
+        assert_eq!(
+            eval_rule(&unset, "has(this.quantity) ? this.quantity > 0 : true").unwrap(),
+            ValidationRuleResult::Bool(true)
+        );
+        let written = proto_order("ord-1234", 2, &["a"], Some("12345"));
+        assert_eq!(
+            eval_rule(&written, "has(this.quantity) ? this.quantity > 0 : true").unwrap(),
+            ValidationRuleResult::Bool(true)
+        );
+    }
+
+    /// The limit of binding a message as a map: one key cannot be both absent, so `has()`
+    /// answers false, and present, so a direct read resolves. The key is dropped, so a rule
+    /// that reads the field on the branch where `has()` was false fails rather than answering
+    /// - loudly, and only for an expression that contradicts itself.
+    #[test]
+    fn reading_a_field_tested_by_has_fails_when_it_is_unset() {
+        let unset = test::ValidationOrder::default();
+        let err = eval_rule(&unset, "has(this.quantity) || this.quantity == 0").unwrap_err();
+        assert!(
+            format!("{err:?}").contains("No such key"),
+            "expected a missing-key error, got {err:?}"
+        );
+    }
+
+    /// A `has()` inside a comprehension is rooted at the comprehension's variable, so the
+    /// prescan has to follow that variable back to the collection it iterates. Without
+    /// that, no path is recorded for the element's field, its key is always present, and
+    /// `has()` answers true for every element whether or not the field was written.
+    #[test]
+    fn has_inside_a_comprehension_reports_presence() {
+        let unset = test::ValidationParent {
+            children: vec![test::ValidationChild::default(); 2],
+            ..Default::default()
+        };
+        for expr in [
+            "this.children.all(c, !has(c.nickname))", // explicit presence
+            "this.children.all(c, !has(c.count))",    // implicit presence
+            "!this.children.exists(c, has(c.nickname))",
+        ] {
+            assert_eq!(
+                eval_rule(&unset, expr).unwrap(),
+                ValidationRuleResult::Bool(true),
+                "{expr} over unwritten children"
+            );
+        }
+
+        let written = test::ValidationParent {
+            children: vec![
+                test::ValidationChild {
+                    nickname: Some("a".to_string()),
+                    count: 1,
+                },
+                test::ValidationChild::default(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            eval_rule(&written, "this.children.exists(c, has(c.nickname))").unwrap(),
+            ValidationRuleResult::Bool(true),
+            "the written child is found"
+        );
+        assert_eq!(
+            eval_rule(&written, "this.children.all(c, has(c.count))").unwrap(),
+            ValidationRuleResult::Bool(false),
+            "the child left at the default is not"
+        );
+    }
+
+    /// The element's fields are still readable at their defaults inside a comprehension, the
+    /// same as anywhere else: only the path a rule tests with `has()` loses its key.
+    #[test]
+    fn comprehension_elements_are_still_readable() {
+        let unset = test::ValidationParent {
+            children: vec![test::ValidationChild::default(); 2],
+            ..Default::default()
+        };
+        assert_eq!(
+            eval_rule(&unset, "this.children.all(c, c.count == 0)").unwrap(),
+            ValidationRuleResult::Bool(true)
+        );
+    }
+
+    /// A message that refers to itself is bound without the expansion of absent fields
+    /// running away: `child` is unset, so it is expanded from its default, which has a
+    /// `child` of its own. Every rule on such a message used to abort the process with a
+    /// stack overflow - including one that never mentions the recursive field.
+    #[test]
+    fn recursive_message_binds_without_unbounded_expansion() {
+        let leaf = test::ValidationNode {
+            name: "root".to_string(),
+            child: None,
+        };
+        assert_eq!(
+            eval_rule(&leaf, "size(this.name) > 0").unwrap(),
+            ValidationRuleResult::Bool(true)
+        );
+
+        // The written part of the chain is still walked in full; only the absent tail stops.
+        let nested = test::ValidationNode {
+            name: "root".to_string(),
+            child: Some(Box::new(test::ValidationNode {
+                name: "middle".to_string(),
+                child: Some(Box::new(test::ValidationNode {
+                    name: "leaf".to_string(),
+                    child: None,
+                })),
+            })),
+        };
+        assert_eq!(
+            eval_rule(&nested, "this.child.child.name == 'leaf'").unwrap(),
+            ValidationRuleResult::Bool(true)
+        );
+
+        // And presence still reports what protobuf reports.
+        assert_eq!(
+            eval_rule(&leaf, "has(this.child)").unwrap(),
+            ValidationRuleResult::Bool(false)
+        );
+        assert_eq!(
+            eval_rule(&nested, "has(this.child)").unwrap(),
+            ValidationRuleResult::Bool(true)
+        );
+    }
+
+    /// `has()` reaches an element through an index as readily as through a comprehension
+    /// variable, and the element is reached by the path of the collection holding it, so
+    /// both forms name the same field.
+    #[test]
+    fn has_through_an_index_reports_protobuf_presence() {
+        let unset = test::ValidationParent {
+            children: vec![test::ValidationChild::default()],
+            ..Default::default()
+        };
+        for expr in [
+            "!has(this.children[0].nickname)",
+            "!has(this.children[0].count)",
+            "!has(this.by_name['a'].nickname)",
+        ] {
+            assert_eq!(
+                eval_rule(&unset, expr).unwrap(),
+                ValidationRuleResult::Bool(true),
+                "{expr} over an unwritten field"
+            );
+        }
+
+        let written = test::ValidationParent {
+            children: vec![test::ValidationChild {
+                nickname: Some("a".to_string()),
+                count: 1,
+            }],
+            ..Default::default()
+        };
+        for expr in [
+            "has(this.children[0].nickname)",
+            "has(this.children[0].count)",
+        ] {
+            assert_eq!(
+                eval_rule(&written, expr).unwrap(),
+                ValidationRuleResult::Bool(true),
+                "{expr} over a written field"
+            );
+        }
+    }
+
+    /// A wrapper field carries null-or-value: unset is how a producer says "no value", as
+    /// distinct from the empty string or zero that an ordinary message's default would give.
+    /// cel-go returns null for one that is unset, and protovalidate-cc asks cel-cpp for the
+    /// same, so a rule reads the distinction the field was declared for.
+    #[test]
+    fn unset_wrapper_fields_read_as_null() {
+        let unset = test::ValidationWellKnown::default();
+        for expr in [
+            "this.name == null",
+            "this.count == null",
+            "this.active == null",
+            "this.big == null",
+        ] {
+            assert_eq!(
+                eval_rule(&unset, expr).unwrap(),
+                ValidationRuleResult::Bool(true),
+                "{expr} on an unset wrapper"
+            );
+        }
+        // Not the zero value the message's default would have unwrapped to.
+        assert_eq!(
+            eval_rule(&unset, "this.name == ''").unwrap(),
+            ValidationRuleResult::Bool(false)
+        );
+
+        // A written wrapper is still the value it wraps, not a message and not null.
+        let written = test::ValidationWellKnown {
+            name: Some("a".to_string()),
+            count: Some(7),
+            active: Some(true),
+            big: Some(u64::MAX),
+        };
+        for expr in [
+            "this.name == 'a'",
+            "this.count == 7",
+            "this.active",
+            "this.big == 18446744073709551615u",
+        ] {
+            assert_eq!(
+                eval_rule(&written, expr).unwrap(),
+                ValidationRuleResult::Bool(true),
+                "{expr} on a written wrapper"
+            );
+        }
+
+        // Presence is unchanged: an unset wrapper is absent either way.
+        assert_eq!(
+            eval_rule(&unset, "has(this.name)").unwrap(),
+            ValidationRuleResult::Bool(false)
+        );
+        assert_eq!(
+            eval_rule(&written, "has(this.name)").unwrap(),
+            ValidationRuleResult::Bool(true)
+        );
+    }
+
+    /// The paths a rule tests, as the prescan reads them off the AST. A comprehension
+    /// variable resolves to the path of its range, nested comprehensions compose, and a
+    /// variable standing for something outside the message - a map key, the accumulator, a
+    /// range that is not itself a field - shadows the binding rather than borrowing its path.
+    #[test]
+    fn presence_paths_follow_comprehension_variables() {
+        use crate::rules::cel::cel_executor::collect_has_paths;
+        let paths = |expr: &str| collect_has_paths(expr, "this");
+        let path = |parts: [&str; 2]| vec![parts[0].to_string(), parts[1].to_string()];
+
+        assert!(
+            paths("this.children.all(c, has(c.nickname))")
+                .contains(&path(["children", "nickname"]))
+        );
+        assert!(
+            paths("this.children.all(c, has(c.only.nickname))").contains(&vec![
+                "children".to_string(),
+                "only".to_string(),
+                "nickname".to_string()
+            ])
+        );
+        // A comprehension inside a comprehension: the inner range is reached through the
+        // outer variable.
+        assert!(
+            paths("this.children.all(c, c.children.all(d, has(d.nickname)))").contains(&vec![
+                "children".to_string(),
+                "children".to_string(),
+                "nickname".to_string()
+            ])
+        );
+        // Both roots in one expression.
+        let both = paths("has(this.only.nickname) && this.children.all(c, has(c.count))");
+        assert!(both.contains(&path(["only", "nickname"])));
+        assert!(both.contains(&path(["children", "count"])));
+        // A range that names nothing under the binding leaves its variable standing for
+        // nothing, even when the name is the binding's own.
+        assert!(paths("[1, 2].all(this, has(this.count))").is_empty());
     }
 
     fn validate_proto(message: &ValidationOrder, fail_fast: bool) -> Vec<ValidationRuleError> {
