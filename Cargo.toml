@@ -37,10 +37,7 @@ base64 = "0.22.1"
 bumpalo = { version = "3.19.0", optional = true }
 byteorder = "1.5.0"
 bytes = "1"
-# The `cel` crate (formerly `cel-interpreter`) bundles the parser; its AST is read to find
-# which fields `has()` is applied to (see collect_has_paths), and it provides opaque types
-# used by the logical-type extensions.
-cel = { path = "/Users/robertyokota/code/personal/cel-rust/cel", optional = true }
+cel = { version = "0.14.3", optional = true }
 chrono = { version = "0.4", optional = true }
 dashmap = "6.1.0"
 email_address = { version = "0.2.9", optional = true }
