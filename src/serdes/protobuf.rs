@@ -2941,8 +2941,14 @@ mod tests {
     /// both forms name the same field.
     #[test]
     fn has_through_an_index_reports_protobuf_presence() {
+        // The indexed element must be present for `has()` to reach through it: indexing an
+        // absent map key is a no-such-key error, so `by_name` carries a present-but-unwritten
+        // child under 'a', mirroring the present `children[0]`.
         let unset = test::ValidationParent {
             children: vec![test::ValidationChild::default()],
+            by_name: [("a".to_string(), test::ValidationChild::default())]
+                .into_iter()
+                .collect(),
             ..Default::default()
         };
         for expr in [
@@ -2962,11 +2968,21 @@ mod tests {
                 nickname: Some("a".to_string()),
                 count: 1,
             }],
+            by_name: [(
+                "a".to_string(),
+                test::ValidationChild {
+                    nickname: Some("a".to_string()),
+                    count: 1,
+                },
+            )]
+            .into_iter()
+            .collect(),
             ..Default::default()
         };
         for expr in [
             "has(this.children[0].nickname)",
             "has(this.children[0].count)",
+            "has(this.by_name['a'].nickname)",
         ] {
             assert_eq!(
                 eval_rule(&written, expr).unwrap(),
