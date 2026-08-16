@@ -2624,6 +2624,29 @@ mod tests {
         }
     }
 
+    /// A `confluent.type.Decimal` message binds as a CEL Decimal, with the scale from its own
+    /// field applied to the unscaled bytes (unscaled 1234, scale 2 == 12.34).
+    #[test]
+    fn decimal_message_binds_as_cel_decimal() {
+        use crate::rules::cel::cel_executor::from_protobuf_value_for_test;
+        use crate::rules::cel::decimal_funcs::to_decimal;
+        use bigdecimal::BigDecimal;
+        use std::str::FromStr;
+
+        let pool = &crate::DESCRIPTOR_POOL;
+        let dec_desc = pool
+            .get_message_by_name("confluent.type.Decimal")
+            .expect("decimal.proto is compiled into the descriptor pool");
+        let mut dec = DynamicMessage::new(dec_desc);
+        dec.set_field_by_name("value", prost_reflect::Value::Bytes(vec![0x04u8, 0xd2].into()));
+        dec.set_field_by_name("scale", prost_reflect::Value::I32(2));
+        let value = from_protobuf_value_for_test(&prost_reflect::Value::Message(dec));
+        assert_eq!(
+            to_decimal(&value).expect("binds as a Decimal"),
+            BigDecimal::from_str("12.34").unwrap()
+        );
+    }
+
     /// Evaluates `expr` as a CEL rule - the kind that binds the message to `message` rather
     /// than to `this` - through the executor a serializer would use.
     fn eval_cel_rule<M: ReflectMessage>(message: &M, expr: &str) -> SerdeValue {

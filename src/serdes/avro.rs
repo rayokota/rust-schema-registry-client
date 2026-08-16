@@ -1658,6 +1658,197 @@ mod tests {
         }
     }
 
+    /// Registers `schema_str` with a single message-level CEL condition and serializes `fields`,
+    /// returning the serialize result (a failed condition surfaces as `SerdeError::RuleCondition`).
+    async fn serialize_with_cel_condition(
+        schema_str: &str,
+        expr: &str,
+        fields: Vec<(String, Value)>,
+    ) -> Result<Vec<u8>, SerdeError> {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            true,
+            false,
+            HashMap::new(),
+        );
+        let rule = Rule {
+            name: "test-cel".to_string(),
+            doc: None,
+            kind: Some(Kind::Condition),
+            mode: Some(Mode::Write),
+            r#type: "CEL".to_string(),
+            tags: None,
+            params: None,
+            expr: Some(expr.to_string()),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let rule_set = RuleSet {
+            migration_rules: None,
+            domain_rules: Some(vec![rule]),
+            encoding_rules: None,
+            enable_at: None,
+        };
+        let schema = Schema {
+            schema_type: Some("AVRO".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(rule_set)),
+            schema: schema_str.to_string(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(CelExecutor::new());
+        let ser = AvroSerializer::new(&client, None, Some(rule_registry), ser_conf).unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Avro,
+            headers: None,
+        };
+        ser.serialize(&ser_ctx, Record(fields)).await
+    }
+
+    const DECIMAL_SCHEMA: &str = r#"
+    {
+        "type": "record",
+        "name": "test",
+        "fields": [
+            {"name": "decField", "type": {"type": "bytes", "logicalType": "decimal", "precision": 4, "scale": 2}}
+        ]
+    }
+    "#;
+
+    // Unscaled 1234 with scale 2 == 12.34.
+    fn decimal_field_12_34() -> Vec<(String, Value)> {
+        vec![(
+            "decField".to_string(),
+            Value::Decimal(apache_avro::Decimal::from(vec![0x04u8, 0xd2])),
+        )]
+    }
+
+    #[tokio::test]
+    async fn test_cel_decimal_condition_passes() {
+        let r = serialize_with_cel_condition(
+            DECIMAL_SCHEMA,
+            "decimals.gt(message.decField, decimal(\"10.00\"))",
+            decimal_field_12_34(),
+        )
+        .await;
+        assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cel_decimal_condition_fails() {
+        let r = serialize_with_cel_condition(
+            DECIMAL_SCHEMA,
+            "decimals.lt(message.decField, decimal(\"10.00\"))",
+            decimal_field_12_34(),
+        )
+        .await;
+        assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_cel_decimal_arithmetic() {
+        // Only holds if the schema scale is applied (12.34 + 1.66 == 14.00).
+        let r = serialize_with_cel_condition(
+            DECIMAL_SCHEMA,
+            "decimals.eq(decimals.add(message.decField, decimal(\"1.66\")), decimal(\"14.00\"))",
+            decimal_field_12_34(),
+        )
+        .await;
+        assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cel_decimal_nullable() {
+        // A nullable decimal ([null, decimal]) resolves through the union branch and still gets
+        // its scale.
+        let schema_str = r#"
+        {
+            "type": "record",
+            "name": "test",
+            "fields": [
+                {"name": "decField", "type": ["null", {"type": "bytes", "logicalType": "decimal", "precision": 4, "scale": 2}]}
+            ]
+        }
+        "#;
+        let r = serialize_with_cel_condition(
+            schema_str,
+            "decimals.eq(message.decField, decimal(\"12.34\"))",
+            vec![(
+                "decField".to_string(),
+                Value::Union(
+                    1,
+                    Box::new(Value::Decimal(apache_avro::Decimal::from(vec![0x04u8, 0xd2]))),
+                ),
+            )],
+        )
+        .await;
+        assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cel_decimal_string() {
+        // "12.34" (scaled), not "1234" (unscaled).
+        let r = serialize_with_cel_condition(
+            DECIMAL_SCHEMA,
+            "string(message.decField) == \"12.34\"",
+            decimal_field_12_34(),
+        )
+        .await;
+        assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cel_timestamp_millis_passes() {
+        let schema_str = r#"
+        {
+            "type": "record",
+            "name": "test",
+            "fields": [
+                {"name": "tsField", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+            ]
+        }
+        "#;
+        // A 1970 timestamp is before now.
+        let r = serialize_with_cel_condition(
+            schema_str,
+            "timestamp.of(message.tsField) < now",
+            vec![("tsField".to_string(), Value::TimestampMillis(1000))],
+        )
+        .await;
+        assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cel_timestamp_millis_fails() {
+        let schema_str = r#"
+        {
+            "type": "record",
+            "name": "test",
+            "fields": [
+                {"name": "tsField", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+            ]
+        }
+        "#;
+        let r = serialize_with_cel_condition(
+            schema_str,
+            "timestamp.of(message.tsField) > now",
+            vec![("tsField".to_string(), Value::TimestampMillis(1000))],
+        )
+        .await;
+        assert!(r.is_err());
+    }
+
     #[tokio::test]
     async fn test_cel_field() {
         let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
