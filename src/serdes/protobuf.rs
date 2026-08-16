@@ -2608,7 +2608,7 @@ mod tests {
         ts.set_field_by_name("seconds", prost_reflect::Value::I64(1_600_000_000));
         ts.set_field_by_name("nanos", prost_reflect::Value::I32(0));
         match from_protobuf_value_for_test(&prost_reflect::Value::Message(ts)) {
-            cel_interpreter::Value::Timestamp(t) => assert_eq!(t.timestamp(), 1_600_000_000),
+            cel::Value::Timestamp(t) => assert_eq!(t.timestamp(), 1_600_000_000),
             other => panic!("expected a CEL timestamp, got {other:?}"),
         }
 
@@ -2619,7 +2619,7 @@ mod tests {
         dur.set_field_by_name("seconds", prost_reflect::Value::I64(30));
         dur.set_field_by_name("nanos", prost_reflect::Value::I32(0));
         match from_protobuf_value_for_test(&prost_reflect::Value::Message(dur)) {
-            cel_interpreter::Value::Duration(d) => assert_eq!(d.num_seconds(), 30),
+            cel::Value::Duration(d) => assert_eq!(d.num_seconds(), 30),
             other => panic!("expected a CEL duration, got {other:?}"),
         }
     }

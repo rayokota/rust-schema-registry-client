@@ -1,7 +1,7 @@
 use crate::rules::cel::cel_executor::{CelExecutor, from_serde_value};
 use crate::serdes::serde::{FieldRuleExecutor, RuleBase, RuleContext, SerdeError, SerdeValue};
 use async_trait::async_trait;
-use cel_interpreter::Value;
+use cel::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
