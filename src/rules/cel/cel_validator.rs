@@ -6,7 +6,7 @@ use crate::serdes::serde::{SerdeError, SerdeValue};
 use crate::serdes::validation_rule::{
     ValidationRule, ValidationRuleExecutor, ValidationRuleResult,
 };
-use cel_interpreter::{Program, Value};
+use cel::{Program, Value};
 use chrono::Utc;
 use dashmap::DashMap;
 

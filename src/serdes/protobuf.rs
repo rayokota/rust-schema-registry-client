@@ -2608,7 +2608,7 @@ mod tests {
         ts.set_field_by_name("seconds", prost_reflect::Value::I64(1_600_000_000));
         ts.set_field_by_name("nanos", prost_reflect::Value::I32(0));
         match from_protobuf_value_for_test(&prost_reflect::Value::Message(ts)) {
-            cel_interpreter::Value::Timestamp(t) => assert_eq!(t.timestamp(), 1_600_000_000),
+            cel::Value::Timestamp(t) => assert_eq!(t.timestamp(), 1_600_000_000),
             other => panic!("expected a CEL timestamp, got {other:?}"),
         }
 
@@ -2619,7 +2619,7 @@ mod tests {
         dur.set_field_by_name("seconds", prost_reflect::Value::I64(30));
         dur.set_field_by_name("nanos", prost_reflect::Value::I32(0));
         match from_protobuf_value_for_test(&prost_reflect::Value::Message(dur)) {
-            cel_interpreter::Value::Duration(d) => assert_eq!(d.num_seconds(), 30),
+            cel::Value::Duration(d) => assert_eq!(d.num_seconds(), 30),
             other => panic!("expected a CEL duration, got {other:?}"),
         }
     }
@@ -2941,8 +2941,14 @@ mod tests {
     /// both forms name the same field.
     #[test]
     fn has_through_an_index_reports_protobuf_presence() {
+        // The indexed element must be present for `has()` to reach through it: indexing an
+        // absent map key is a no-such-key error, so `by_name` carries a present-but-unwritten
+        // child under 'a', mirroring the present `children[0]`.
         let unset = test::ValidationParent {
             children: vec![test::ValidationChild::default()],
+            by_name: [("a".to_string(), test::ValidationChild::default())]
+                .into_iter()
+                .collect(),
             ..Default::default()
         };
         for expr in [
@@ -2962,11 +2968,21 @@ mod tests {
                 nickname: Some("a".to_string()),
                 count: 1,
             }],
+            by_name: [(
+                "a".to_string(),
+                test::ValidationChild {
+                    nickname: Some("a".to_string()),
+                    count: 1,
+                },
+            )]
+            .into_iter()
+            .collect(),
             ..Default::default()
         };
         for expr in [
             "has(this.children[0].nickname)",
             "has(this.children[0].count)",
+            "has(this.by_name['a'].nickname)",
         ] {
             assert_eq!(
                 eval_rule(&written, expr).unwrap(),

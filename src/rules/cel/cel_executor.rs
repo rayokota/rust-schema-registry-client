@@ -1,8 +1,8 @@
 use crate::rules::cel::cel_lib::default_context;
 use crate::serdes::serde::{RuleBase, RuleContext, RuleExecutor, SerdeError, SerdeValue};
 use async_trait::async_trait;
-use cel_interpreter::objects::{Key, Map};
-use cel_interpreter::{Context, ExecutionError, ParseErrors, Program, Value};
+use cel::objects::{Key, Map};
+use cel::{ExecutionError, ParseErrors, Program, Value};
 use dashmap::DashMap;
 use prost::bytes::Bytes;
 use prost_reflect::{MapKey, ReflectMessage};
@@ -215,7 +215,7 @@ pub(crate) type PresencePaths = HashSet<Vec<String>>;
 /// `has()` over-reports rather than a plain read failing.
 pub(crate) fn collect_has_paths(expr: &str, binding: &str) -> PresencePaths {
     let mut paths = PresencePaths::new();
-    if let Ok(parsed) = cel_parser::Parser::default().parse(expr) {
+    if let Ok(parsed) = cel::parser::Parser::default().parse(expr) {
         let roots = Roots::from([(binding.to_string(), Vec::new())]);
         walk_for_has(&parsed, &roots, &mut paths);
     }
@@ -230,8 +230,8 @@ pub(crate) fn collect_has_paths(expr: &str, binding: &str) -> PresencePaths {
 /// or a key and the conversion gives elements their parent's path to match.
 type Roots = HashMap<String, Vec<String>>;
 
-fn walk_for_has(ided: &cel_parser::ast::IdedExpr, roots: &Roots, paths: &mut PresencePaths) {
-    use cel_parser::ast::Expr;
+fn walk_for_has(ided: &cel::common::ast::IdedExpr, roots: &Roots, paths: &mut PresencePaths) {
+    use cel::common::ast::Expr;
     match &ided.expr {
         Expr::Select(select) => {
             walk_for_has(&select.operand, roots, paths);
@@ -286,14 +286,14 @@ fn walk_for_has(ided: &cel_parser::ast::IdedExpr, roots: &Roots, paths: &mut Pre
         }
         Expr::Struct(structure) => {
             for entry in &structure.entries {
-                if let cel_parser::ast::EntryExpr::StructField(field) = &entry.expr {
+                if let cel::common::ast::EntryExpr::StructField(field) = &entry.expr {
                     walk_for_has(&field.value, roots, paths);
                 }
             }
         }
         Expr::Map(map) => {
             for entry in &map.entries {
-                if let cel_parser::ast::EntryExpr::MapEntry(pair) = &entry.expr {
+                if let cel::common::ast::EntryExpr::MapEntry(pair) = &entry.expr {
                     walk_for_has(&pair.key, roots, paths);
                     walk_for_has(&pair.value, roots, paths);
                 }
@@ -305,7 +305,7 @@ fn walk_for_has(ided: &cel_parser::ast::IdedExpr, roots: &Roots, paths: &mut Pre
 
 /// The dotted path of `operand.field` when its root is one of `roots`, else None.
 fn select_path(
-    operand: &cel_parser::ast::IdedExpr,
+    operand: &cel::common::ast::IdedExpr,
     field: &str,
     roots: &Roots,
 ) -> Option<Vec<String>> {
@@ -317,8 +317,8 @@ fn select_path(
 /// The path an expression names: the path its root identifier stands for, plus one entry per
 /// field selected from it. None when the expression is rooted at an identifier not in scope,
 /// or at anything that is not a chain of selects.
-fn path_under_binding(ided: &cel_parser::ast::IdedExpr, roots: &Roots) -> Option<Vec<String>> {
-    use cel_parser::ast::Expr;
+fn path_under_binding(ided: &cel::common::ast::IdedExpr, roots: &Roots) -> Option<Vec<String>> {
+    use cel::common::ast::Expr;
     match &ided.expr {
         Expr::Ident(name) => roots.get(name).cloned(),
         Expr::Select(select) if !select.test => {
@@ -331,8 +331,8 @@ fn path_under_binding(ided: &cel_parser::ast::IdedExpr, roots: &Roots) -> Option
         // key, so the conversion gives them their parent's path. `this.children[0]` therefore
         // names what `this.children` names, the same as a comprehension variable over it.
         Expr::Call(call)
-            if call.func_name == cel_parser::ast::operators::INDEX
-                || call.func_name == cel_parser::ast::operators::OPT_INDEX =>
+            if call.func_name == cel::common::ast::operators::INDEX
+                || call.func_name == cel::common::ast::operators::OPT_INDEX =>
         {
             path_under_binding(call.args.first()?, roots)
         }
