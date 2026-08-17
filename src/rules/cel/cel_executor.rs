@@ -1,8 +1,20 @@
 use crate::rules::cel::cel_lib::default_context;
-use crate::serdes::serde::{RuleBase, RuleContext, RuleExecutor, SerdeError, SerdeValue};
+use crate::rules::cel::decimal_funcs::{
+    DECIMAL_TYPE_NAME, decimal_value, from_bytes_scale, to_decimal,
+};
+use crate::serdes::avro::collect_named_schemas;
+use crate::serdes::serde::{
+    RuleBase, RuleContext, RuleExecutor, SerdeError, SerdeSchema, SerdeValue,
+};
+use apache_avro::Schema as AvroSchema;
+use apache_avro::schema::Name as AvroName;
 use async_trait::async_trait;
+use bigdecimal::BigDecimal;
+use bigdecimal::RoundingMode;
+use bigdecimal::num_bigint::BigInt;
 use cel::objects::{Key, Map};
 use cel::{ExecutionError, ParseErrors, Program, Value};
+use chrono::Utc;
 use dashmap::DashMap;
 use prost::bytes::Bytes;
 use prost_reflect::{MapKey, ReflectMessage};
@@ -47,6 +59,18 @@ impl CelExecutor {
     /// the same resolution [`crate::rules::cel::cel_validator::CelValidator`] applies to
     /// `this`, and applied here so that a rule reads the same either way.
     pub(crate) fn message_binding(&self, ctx: &RuleContext, msg: &SerdeValue) -> Value {
+        // Avro decimal values are unscaled on their own (the scale lives in the schema) and
+        // logical timestamps need their unit, so the Avro conversion is walked against the
+        // schema the message conforms to. `has()`-presence dropping is a protobuf concern, so
+        // Avro never needed it.
+        if let SerdeValue::Avro(v) = msg {
+            return match ctx.parsed_target.as_ref() {
+                Some(SerdeSchema::Avro((schema, named))) => {
+                    from_avro_value_with_schema(v, schema, &avro_definitions(schema, named))
+                }
+                _ => from_avro_value(v),
+            };
+        }
         match ctx.rule.expr.as_deref() {
             Some(expr) => {
                 from_serde_value_with_presence(msg, &self.presence_paths(expr, "message"))
@@ -112,11 +136,31 @@ impl CelExecutor {
         prog = self.cache.get(expr);
         let prog = prog.ok_or(SerdeError::Rule("failed to compile program".to_string()))?;
         let mut context = default_context();
+        // `now` is available to every rule, so a condition like `timestamp.of(this.ts) < now`
+        // resolves. It is read fresh per evaluation, matching the other clients.
+        context.add_variable_from_value("now", Value::Timestamp(Utc::now().into()));
         for (k, v) in args {
             context.add_variable_from_value(k.clone(), v.clone());
         }
         let result = prog.value().execute(&context)?;
-        Ok(to_serde_value(msg, &result))
+        // Write the result back against the schema `msg` conforms to, so a Decimal is
+        // re-quantized to the field's scale and a timestamp keeps the field's unit (a bare
+        // `to_avro_value` has no scale/unit to target). In a field rule `msg` is the field value,
+        // so its own schema (from the field context) applies; otherwise it is the whole message
+        // and the target schema applies. Non-Avro, or Avro without a schema, converts schemaless.
+        let schema = ctx
+            .current_field()
+            .and_then(|f| f.field_schema.as_ref())
+            .or(ctx.parsed_target.as_ref());
+        match (msg, schema) {
+            (SerdeValue::Avro(input), Some(SerdeSchema::Avro((schema, named)))) => {
+                let defs = avro_definitions(schema, named);
+                Ok(SerdeValue::Avro(to_avro_value_with_schema(
+                    input, &result, schema, &defs,
+                )?))
+            }
+            _ => Ok(to_serde_value(msg, &result)),
+        }
     }
 
     pub fn register() {
@@ -185,9 +229,124 @@ fn from_avro_value(value: &apache_avro::types::Value) -> Value {
             }
             Value::Map(Map { map: Arc::new(map) })
         }
+        // A logical timestamp carries its unit in the variant, so no schema is needed to
+        // convert it; local (timezone-naive) timestamps are left as their raw epoch value.
+        apache_avro::types::Value::TimestampMillis(v) => avro_timestamp(*v, "millis"),
+        apache_avro::types::Value::TimestampMicros(v) => avro_timestamp(*v, "micros"),
+        apache_avro::types::Value::TimestampNanos(v) => avro_timestamp(*v, "nanos"),
+        // Already-scaled (the non-standard `big-decimal` type) - use it directly.
+        apache_avro::types::Value::BigDecimal(d) => decimal_value(d.clone()),
+        // A bare decimal is unscaled without its schema, and this path has none. The message
+        // binding uses [`from_avro_value_with_schema`], which applies the scale; a CEL_FIELD
+        // rule's `value` binding reaches a decimal here and sees it unscaled, so such a rule
+        // should read the field through the (scaled) `message` binding instead.
+        apache_avro::types::Value::Decimal(d) => {
+            decimal_value(BigDecimal::new(BigInt::from(d.clone()), 0))
+        }
+        apache_avro::types::Value::Union(_, inner) => from_avro_value(inner),
         apache_avro::types::Value::Null => Value::Null,
         _ => Value::Null,
     }
+}
+
+/// Converts an Avro logical timestamp (`millis`/`micros`/`nanos` since the epoch, UTC) to a CEL
+/// timestamp, falling back to the raw epoch integer if it is out of range.
+fn avro_timestamp(value: i64, unit: &str) -> Value {
+    match crate::rules::cel::timestamp_funcs::from_epoch(value, unit) {
+        Ok(ts) => Value::Timestamp(ts),
+        Err(_) => Value::Int(value),
+    }
+}
+
+/// Indexes every named definition reachable from the root schema and its referenced schemas, so
+/// a [`AvroSchema::Ref`] - whether to an inline definition or an imported one - resolves.
+fn avro_definitions<'a>(
+    schema: &'a AvroSchema,
+    named: &'a [AvroSchema],
+) -> HashMap<AvroName, &'a AvroSchema> {
+    let mut defs = HashMap::new();
+    collect_named_schemas(schema, &mut defs);
+    for n in named {
+        collect_named_schemas(n, &mut defs);
+    }
+    defs
+}
+
+/// Converts an Avro value for CEL, walking it against its schema so that decimal fields get
+/// their scale and logical types are recognised. Anything the schema does not add information to
+/// falls back to the schemaless [`from_avro_value`].
+fn from_avro_value_with_schema(
+    value: &apache_avro::types::Value,
+    schema: &AvroSchema,
+    defs: &HashMap<AvroName, &AvroSchema>,
+) -> Value {
+    use apache_avro::types::Value as AV;
+    let schema = resolve_avro_ref(schema, defs);
+    match (value, schema) {
+        (AV::Record(fields), AvroSchema::Record(rs)) => {
+            let mut map: HashMap<Key, Value> = HashMap::with_capacity(fields.len());
+            for (k, v) in fields {
+                let cv = match rs.fields.iter().find(|f| &f.name == k) {
+                    Some(field) => from_avro_value_with_schema(v, &field.schema, defs),
+                    None => from_avro_value(v),
+                };
+                map.insert(Key::String(Arc::new(k.clone())), cv);
+            }
+            Value::Map(Map { map: Arc::new(map) })
+        }
+        (AV::Array(items), AvroSchema::Array(a)) => Value::List(Arc::new(
+            items
+                .iter()
+                .map(|it| from_avro_value_with_schema(it, &a.items, defs))
+                .collect(),
+        )),
+        (AV::Map(entries), AvroSchema::Map(m)) => Value::Map(Map {
+            map: Arc::new(
+                entries
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            Key::String(Arc::new(k.clone())),
+                            from_avro_value_with_schema(v, &m.types, defs),
+                        )
+                    })
+                    .collect(),
+            ),
+        }),
+        // A union value names the variant it took; recurse into that branch's schema.
+        (AV::Union(idx, inner), AvroSchema::Union(u)) => match u.variants().get(*idx as usize) {
+            Some(variant) => from_avro_value_with_schema(inner, variant, defs),
+            None => from_avro_value(inner),
+        },
+        // The only place the schema is load-bearing: the scale that a bare decimal lacks.
+        (AV::Decimal(d), AvroSchema::Decimal(ds)) => {
+            decimal_value(BigDecimal::new(BigInt::from(d.clone()), ds.scale as i64))
+        }
+        _ => from_avro_value(value),
+    }
+}
+
+/// Resolves a named `Schema::Ref` to its definition in `defs`; any other schema is returned as-is.
+fn resolve_avro_ref<'a>(
+    schema: &'a AvroSchema,
+    defs: &HashMap<AvroName, &'a AvroSchema>,
+) -> &'a AvroSchema {
+    if let AvroSchema::Ref { name } = schema
+        && let Some(def) = defs.get(name)
+    {
+        return def;
+    }
+    schema
+}
+
+/// Converts one Avro field value for CEL against the field's own schema, so a field rule's
+/// `value` binding sees a decimal at its scale and a timestamp in its unit rather than raw bytes.
+pub(crate) fn from_avro_field_value(
+    value: &apache_avro::types::Value,
+    schema: &AvroSchema,
+    named: &[AvroSchema],
+) -> Value {
+    from_avro_value_with_schema(value, schema, &avro_definitions(schema, named))
 }
 
 /// The field paths a rule applies `has()` to, relative to one binding.
@@ -548,6 +707,15 @@ fn unwrap_well_known(msg: &prost_reflect::DynamicMessage) -> Option<Value> {
             let offset = chrono::FixedOffset::east_opt(0)?;
             Some(Value::Timestamp(utc.with_timezone(&offset)))
         }
+        // A Decimal message carries the scale the Avro bytes lack, so it converts to a CEL
+        // Decimal directly rather than being read field-by-field.
+        "confluent.type.Decimal" => {
+            let bytes = field("value")
+                .and_then(|v| v.as_bytes().map(|b| b.to_vec()))
+                .unwrap_or_default();
+            let scale = field("scale").and_then(|v| v.as_i32()).unwrap_or(0);
+            Some(decimal_value(from_bytes_scale(&bytes, i64::from(scale))))
+        }
         _ => None,
     }
 }
@@ -658,9 +826,166 @@ fn to_avro_value(input: &apache_avro::types::Value, value: &Value) -> apache_avr
                 apache_avro::types::Value::Map(iter.collect())
             }
         }
+        // A Decimal carries its own scale, so writing it back at that scale round-trips a value
+        // that was read at the schema's scale. (A decimal *computed* by a rule keeps its computed
+        // scale; the reverse path has no schema to re-quantize against.)
+        Value::Opaque(o) if o.runtime_type_name() == DECIMAL_TYPE_NAME => match to_decimal(value) {
+            Ok(d) => {
+                let (unscaled, _scale) = d.into_bigint_and_exponent();
+                apache_avro::types::Value::Decimal(apache_avro::Decimal::from(
+                    unscaled.to_signed_bytes_be(),
+                ))
+            }
+            Err(_) => apache_avro::types::Value::Null,
+        },
+        // Write a timestamp back in whatever unit the field held.
+        Value::Timestamp(ts) => match input {
+            apache_avro::types::Value::TimestampMicros(_) => {
+                apache_avro::types::Value::TimestampMicros(ts.timestamp_micros())
+            }
+            apache_avro::types::Value::TimestampNanos(_) => {
+                apache_avro::types::Value::TimestampNanos(ts.timestamp_nanos_opt().unwrap_or(0))
+            }
+            _ => apache_avro::types::Value::TimestampMillis(ts.timestamp_millis()),
+        },
         Value::Null => apache_avro::types::Value::Null,
         _ => apache_avro::types::Value::Null,
     }
+}
+
+/// Writes a CEL result back to Avro against `schema`, so a Decimal is re-quantized to the field's
+/// scale and a timestamp is emitted in the field's unit. Recurses through records/arrays/maps/
+/// unions, pairing each result child with its input child and field schema; leaves the schema
+/// does not inform fall back to the schemaless [`to_avro_value`]. Fallible because a Decimal that
+/// does not fit the schema scale, or a timestamp past the nanosecond range, is a rule error rather
+/// than a silently-wrong value.
+fn to_avro_value_with_schema(
+    input: &apache_avro::types::Value,
+    value: &Value,
+    schema: &AvroSchema,
+    defs: &HashMap<AvroName, &AvroSchema>,
+) -> Result<apache_avro::types::Value, SerdeError> {
+    use apache_avro::types::Value as AV;
+    let schema = resolve_avro_ref(schema, defs);
+    match (schema, value) {
+        // Re-quantize to the field's scale before encoding the unscaled bytes; without this a
+        // result whose scale differs from the schema (e.g. after a multiply) would be mis-scaled.
+        (AvroSchema::Decimal(ds), Value::Opaque(o))
+            if o.runtime_type_name() == DECIMAL_TYPE_NAME =>
+        {
+            let d = to_decimal(value)?.with_scale_round(ds.scale as i64, RoundingMode::HalfUp);
+            let (unscaled, _) = d.into_bigint_and_exponent();
+            Ok(AV::Decimal(apache_avro::Decimal::from(
+                unscaled.to_signed_bytes_be(),
+            )))
+        }
+        (AvroSchema::TimestampMillis, Value::Timestamp(ts)) => {
+            Ok(AV::TimestampMillis(ts.timestamp_millis()))
+        }
+        (AvroSchema::TimestampMicros, Value::Timestamp(ts)) => {
+            Ok(AV::TimestampMicros(ts.timestamp_micros()))
+        }
+        (AvroSchema::TimestampNanos, Value::Timestamp(ts)) => ts
+            .timestamp_nanos_opt()
+            .map(AV::TimestampNanos)
+            .ok_or_else(|| {
+                SerdeError::Rule("CEL result timestamp is outside the nanosecond range".to_string())
+            }),
+        (AvroSchema::Record(rs), Value::Map(m)) => {
+            let mut out = Vec::with_capacity(rs.fields.len());
+            for field in &rs.fields {
+                let Some(cel_v) = m.map.get(&Key::String(Arc::new(field.name.clone()))) else {
+                    continue;
+                };
+                let child_input = match input {
+                    AV::Record(fields) => fields
+                        .iter()
+                        .find(|(n, _)| n == &field.name)
+                        .map(|(_, v)| v),
+                    _ => None,
+                }
+                .unwrap_or(input);
+                out.push((
+                    field.name.clone(),
+                    to_avro_value_with_schema(child_input, cel_v, &field.schema, defs)?,
+                ));
+            }
+            Ok(AV::Record(out))
+        }
+        (AvroSchema::Array(a), Value::List(items)) => {
+            let child_input = match input {
+                AV::Array(xs) => xs.first(),
+                _ => None,
+            }
+            .unwrap_or(input);
+            let mut out = Vec::with_capacity(items.len());
+            for it in items.iter() {
+                out.push(to_avro_value_with_schema(child_input, it, &a.items, defs)?);
+            }
+            Ok(AV::Array(out))
+        }
+        (AvroSchema::Map(mp), Value::Map(m)) => {
+            let child_input = match input {
+                AV::Map(xs) => xs.values().next(),
+                _ => None,
+            }
+            .unwrap_or(input);
+            let mut out = HashMap::with_capacity(m.map.len());
+            for (k, v) in m.map.iter() {
+                let key = match k {
+                    Key::String(s) => s.to_string(),
+                    other => other.to_string(),
+                };
+                out.insert(
+                    key,
+                    to_avro_value_with_schema(child_input, v, &mp.types, defs)?,
+                );
+            }
+            Ok(AV::Map(out))
+        }
+        // Unions are transparent in CEL, so pick the variant matching the result's kind and
+        // recurse into it (handles the common `[null, T]` nullable field).
+        (AvroSchema::Union(u), _) => {
+            let variants = u.variants();
+            match union_variant_index(variants, value, defs) {
+                Some(i) => {
+                    let inner_input = match input {
+                        AV::Union(_, boxed) => boxed.as_ref(),
+                        other => other,
+                    };
+                    Ok(AV::Union(
+                        i as u32,
+                        Box::new(to_avro_value_with_schema(
+                            inner_input,
+                            value,
+                            &variants[i],
+                            defs,
+                        )?),
+                    ))
+                }
+                None => Ok(to_avro_value(input, value)),
+            }
+        }
+        // Primitives (and anything the schema does not inform) use the loose conversion.
+        _ => Ok(to_avro_value(input, value)),
+    }
+}
+
+/// Picks the union variant a CEL result belongs to: the `null` branch for null, otherwise the
+/// first non-null branch (the `[null, T]` nullable-field shape).
+fn union_variant_index(
+    variants: &[AvroSchema],
+    value: &Value,
+    defs: &HashMap<AvroName, &AvroSchema>,
+) -> Option<usize> {
+    if matches!(value, Value::Null) {
+        return variants
+            .iter()
+            .position(|v| matches!(resolve_avro_ref(v, defs), AvroSchema::Null));
+    }
+    variants
+        .iter()
+        .position(|v| !matches!(resolve_avro_ref(v, defs), AvroSchema::Null))
 }
 
 fn to_protobuf_value(input: &prost_reflect::Value, value: &Value) -> prost_reflect::Value {

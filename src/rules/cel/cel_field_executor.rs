@@ -1,5 +1,7 @@
-use crate::rules::cel::cel_executor::{CelExecutor, from_serde_value};
-use crate::serdes::serde::{FieldRuleExecutor, RuleBase, RuleContext, SerdeError, SerdeValue};
+use crate::rules::cel::cel_executor::{CelExecutor, from_avro_field_value, from_serde_value};
+use crate::serdes::serde::{
+    FieldRuleExecutor, RuleBase, RuleContext, SerdeError, SerdeSchema, SerdeValue,
+};
 use async_trait::async_trait;
 use cel::Value;
 use std::collections::HashMap;
@@ -49,7 +51,16 @@ impl FieldRuleExecutor for CelFieldExecutor {
             return Ok(field_value.clone());
         }
         let mut args = HashMap::new();
-        args.insert("value".to_string(), from_serde_value(field_value));
+        // Bind `value` schema-aware so an Avro decimal/timestamp field is a self-describing
+        // Decimal/Timestamp (scale/unit from the schema), matching how `message.field` and the
+        // other clients present it. Other formats/values are already self-describing.
+        let value = match (field_value, field_ctx.field_schema.as_ref()) {
+            (SerdeValue::Avro(v), Some(SerdeSchema::Avro((schema, named)))) => {
+                from_avro_field_value(v, schema, named)
+            }
+            _ => from_serde_value(field_value),
+        };
+        args.insert("value".to_string(), value);
         args.insert(
             "fullName".to_string(),
             Value::String(Arc::new(field_ctx.full_name.clone())),

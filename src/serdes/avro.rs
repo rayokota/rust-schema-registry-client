@@ -853,6 +853,13 @@ async fn transform_field_with_ctx(
         name,
         field_type,
         get_inline_tags(field_schema),
+        // A field rule only runs on a primitive value, which never references a named type, so
+        // the field's leaf schema is enough (no `named` list needed) to resolve a decimal's scale
+        // or a timestamp's unit for the `value` binding and the result write-back.
+        Some(SerdeSchema::Avro((
+            avro_leaf_schema(&field_schema.schema).clone(),
+            Vec::new(),
+        ))),
     );
     let new_value = transform(ctx, &field_schema.schema, named_schemas, &field.1).await?;
     if let Some(Kind::Condition) = ctx.rule.kind
@@ -863,6 +870,26 @@ async fn transform_field_with_ctx(
     }
     ctx.exit_field();
     Ok((field.0.clone(), new_value))
+}
+
+/// The leaf schema a primitive field value carries: the walk descends unions/arrays/maps and
+/// hands a field rule the already-unwrapped element (then re-wraps its result), so the field
+/// context stores this leaf - not the container - to reconstruct a decimal's scale or timestamp's
+/// unit without the conversion re-wrapping what the walk will wrap again.
+fn avro_leaf_schema(schema: &apache_avro::Schema) -> &apache_avro::Schema {
+    match schema {
+        apache_avro::Schema::Union(u) => {
+            for variant in u.variants() {
+                if !matches!(variant, apache_avro::Schema::Null) {
+                    return avro_leaf_schema(variant);
+                }
+            }
+            schema
+        }
+        apache_avro::Schema::Array(a) => avro_leaf_schema(&a.items),
+        apache_avro::Schema::Map(m) => avro_leaf_schema(&m.types),
+        _ => schema,
+    }
 }
 
 fn get_type(schema: &apache_avro::Schema) -> FieldType {
@@ -952,7 +979,7 @@ fn validate_message(
 /// [`apache_avro::Schema::Ref`] can be resolved back to the definition carrying the inline
 /// rules. Recursion terminates because a recursive type reaches itself through a `Ref`,
 /// which has no children.
-fn collect_named_schemas<'a>(
+pub(crate) fn collect_named_schemas<'a>(
     schema: &'a apache_avro::Schema,
     out: &mut HashMap<Name, &'a apache_avro::Schema>,
 ) {
@@ -1656,6 +1683,526 @@ mod tests {
         } else {
             unreachable!();
         }
+    }
+
+    /// Registers `schema_str` with a single message-level CEL condition and serializes `fields`,
+    /// returning the serialize result (a failed condition surfaces as `SerdeError::RuleCondition`).
+    async fn serialize_with_cel_condition(
+        schema_str: &str,
+        expr: &str,
+        fields: Vec<(String, Value)>,
+    ) -> Result<Vec<u8>, SerdeError> {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            true,
+            false,
+            HashMap::new(),
+        );
+        let rule = Rule {
+            name: "test-cel".to_string(),
+            doc: None,
+            kind: Some(Kind::Condition),
+            mode: Some(Mode::Write),
+            r#type: "CEL".to_string(),
+            tags: None,
+            params: None,
+            expr: Some(expr.to_string()),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let rule_set = RuleSet {
+            migration_rules: None,
+            domain_rules: Some(vec![rule]),
+            encoding_rules: None,
+            enable_at: None,
+        };
+        let schema = Schema {
+            schema_type: Some("AVRO".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(rule_set)),
+            schema: schema_str.to_string(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(CelExecutor::new());
+        let ser = AvroSerializer::new(&client, None, Some(rule_registry), ser_conf).unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Avro,
+            headers: None,
+        };
+        ser.serialize(&ser_ctx, Record(fields)).await
+    }
+
+    const DECIMAL_SCHEMA: &str = r#"
+    {
+        "type": "record",
+        "name": "test",
+        "fields": [
+            {"name": "decField", "type": {"type": "bytes", "logicalType": "decimal", "precision": 4, "scale": 2}}
+        ]
+    }
+    "#;
+
+    // Unscaled 1234 with scale 2 == 12.34.
+    fn decimal_field_12_34() -> Vec<(String, Value)> {
+        vec![(
+            "decField".to_string(),
+            Value::Decimal(apache_avro::Decimal::from(vec![0x04u8, 0xd2])),
+        )]
+    }
+
+    /// As [`serialize_with_cel_condition`], but a `CEL_FIELD` rule (its `value` binding is the
+    /// field itself). `expr` is a `guard ; body` selecting the field by name.
+    async fn serialize_with_cel_field_condition(
+        schema_str: &str,
+        expr: &str,
+        fields: Vec<(String, Value)>,
+    ) -> Result<Vec<u8>, SerdeError> {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            true,
+            false,
+            HashMap::new(),
+        );
+        let rule = Rule {
+            name: "test-cel-field".to_string(),
+            doc: None,
+            kind: Some(Kind::Condition),
+            mode: Some(Mode::Write),
+            r#type: "CEL_FIELD".to_string(),
+            tags: None,
+            params: None,
+            expr: Some(expr.to_string()),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let rule_set = RuleSet {
+            migration_rules: None,
+            domain_rules: Some(vec![rule]),
+            encoding_rules: None,
+            enable_at: None,
+        };
+        let schema = Schema {
+            schema_type: Some("AVRO".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(rule_set)),
+            schema: schema_str.to_string(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(CelFieldExecutor::new());
+        let ser = AvroSerializer::new(&client, None, Some(rule_registry), ser_conf).unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Avro,
+            headers: None,
+        };
+        ser.serialize(&ser_ctx, Record(fields)).await
+    }
+
+    #[tokio::test]
+    async fn test_cel_field_decimal_transform_requantizes() {
+        // 12.34 * 2.0 = 24.680 (scale 3); the schema is scale 2, so the field rule's result must
+        // be re-quantized and written back as 24.68 (unscaled 2468 = 0x09A4), not 246.80.
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            true,
+            false,
+            HashMap::new(),
+        );
+        let rule = Rule {
+            name: "test-cel-field".to_string(),
+            doc: None,
+            kind: Some(Kind::Transform),
+            mode: Some(Mode::Write),
+            r#type: "CEL_FIELD".to_string(),
+            tags: None,
+            params: None,
+            expr: Some(
+                "name == 'decField' ; decimals.mul(decimal(value), decimal(\"2.0\"))".to_string(),
+            ),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let rule_set = RuleSet {
+            migration_rules: None,
+            domain_rules: Some(vec![rule]),
+            encoding_rules: None,
+            enable_at: None,
+        };
+        let schema = Schema {
+            schema_type: Some("AVRO".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(rule_set)),
+            schema: DECIMAL_SCHEMA.to_string(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(CelFieldExecutor::new());
+        let ser =
+            AvroSerializer::new(&client, None, Some(rule_registry.clone()), ser_conf).unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Avro,
+            headers: None,
+        };
+        let bytes = ser
+            .serialize(&ser_ctx, Record(decimal_field_12_34()))
+            .await
+            .unwrap();
+        let deser =
+            AvroDeserializer::new(&client, Some(rule_registry), DeserializerConfig::default())
+                .unwrap();
+        let out = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        if let Record(fields) = out.value {
+            let (_, v) = fields.iter().find(|(n, _)| n == "decField").unwrap();
+            match v {
+                Value::Decimal(d) => {
+                    let unscaled = Vec::<u8>::try_from(d.clone()).unwrap();
+                    assert_eq!(unscaled, vec![0x09u8, 0xa4]);
+                }
+                other => panic!("expected a decimal, got {other:?}"),
+            }
+        } else {
+            unreachable!();
+        }
+    }
+
+    const TS_SCHEMA: &str = r#"
+    {
+        "type": "record",
+        "name": "test",
+        "fields": [
+            {"name": "tsField", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+        ]
+    }
+    "#;
+
+    #[tokio::test]
+    async fn test_cel_field_timestamp_value() {
+        // The field rule's `value` binding must be a self-describing timestamp, so the 1-arg
+        // `timestamp.of(value)` works (no unit literal).
+        let r = serialize_with_cel_field_condition(
+            TS_SCHEMA,
+            "name == 'tsField' ; timestamp.of(value) < now",
+            vec![("tsField".to_string(), Value::TimestampMillis(1000))],
+        )
+        .await;
+        assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cel_field_timestamp_transform() {
+        // A field rule returning a Timestamp must re-encode to the field's epoch unit (millis).
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            true,
+            false,
+            HashMap::new(),
+        );
+        let rule = Rule {
+            name: "test-cel-field".to_string(),
+            doc: None,
+            kind: Some(Kind::Transform),
+            mode: Some(Mode::Write),
+            r#type: "CEL_FIELD".to_string(),
+            tags: None,
+            params: None,
+            expr: Some("name == 'tsField' ; timestamp.of(value)".to_string()),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let rule_set = RuleSet {
+            migration_rules: None,
+            domain_rules: Some(vec![rule]),
+            encoding_rules: None,
+            enable_at: None,
+        };
+        let schema = Schema {
+            schema_type: Some("AVRO".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(rule_set)),
+            schema: TS_SCHEMA.to_string(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(CelFieldExecutor::new());
+        let ser =
+            AvroSerializer::new(&client, None, Some(rule_registry.clone()), ser_conf).unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Avro,
+            headers: None,
+        };
+        let bytes = ser
+            .serialize(
+                &ser_ctx,
+                Record(vec![(
+                    "tsField".to_string(),
+                    Value::TimestampMillis(1_577_836_800_000),
+                )]),
+            )
+            .await
+            .unwrap();
+        let deser =
+            AvroDeserializer::new(&client, Some(rule_registry), DeserializerConfig::default())
+                .unwrap();
+        let out = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        if let Record(fields) = out.value {
+            let (_, v) = fields.iter().find(|(n, _)| n == "tsField").unwrap();
+            assert_eq!(*v, Value::TimestampMillis(1_577_836_800_000));
+        } else {
+            unreachable!();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cel_field_decimal_value_is_scaled() {
+        // The field rule's `value` binding must be the decimal at its schema scale (12.34), not
+        // the unscaled integer (1234); `string(decimal(value))` distinguishes them.
+        let r = serialize_with_cel_field_condition(
+            DECIMAL_SCHEMA,
+            "name == 'decField' ; string(decimal(value)) == \"12.34\"",
+            decimal_field_12_34(),
+        )
+        .await;
+        assert!(r.is_ok());
+    }
+
+    /// A message-level CEL transform that changes a decimal's scale must be re-quantized to the
+    /// schema scale on write-back: `12.34 * 2.0 = 24.680` (scale 3) has to round-trip as `24.68`
+    /// under a scale-2 schema, not as `246.80` (what encoding the scale-3 unscaled integer under
+    /// the scale-2 schema would produce).
+    #[tokio::test]
+    async fn test_cel_decimal_transform_requantizes_to_schema_scale() {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            true,
+            false,
+            HashMap::new(),
+        );
+        let rule = Rule {
+            name: "test-cel".to_string(),
+            doc: None,
+            kind: Some(Kind::Transform),
+            mode: Some(Mode::Write),
+            r#type: "CEL".to_string(),
+            tags: None,
+            params: None,
+            expr: Some(
+                "{'decField': decimals.mul(message.decField, decimal(\"2.0\"))}".to_string(),
+            ),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let rule_set = RuleSet {
+            migration_rules: None,
+            domain_rules: Some(vec![rule]),
+            encoding_rules: None,
+            enable_at: None,
+        };
+        let schema = Schema {
+            schema_type: Some("AVRO".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(rule_set)),
+            schema: DECIMAL_SCHEMA.to_string(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(CelExecutor::new());
+        let ser =
+            AvroSerializer::new(&client, None, Some(rule_registry.clone()), ser_conf).unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Avro,
+            headers: None,
+        };
+        let bytes = ser
+            .serialize(&ser_ctx, Record(decimal_field_12_34()))
+            .await
+            .unwrap();
+
+        let deser =
+            AvroDeserializer::new(&client, Some(rule_registry), DeserializerConfig::default())
+                .unwrap();
+        let out = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        // The unscaled integer under the scale-2 schema must be 2468 (24.68), not 24680.
+        if let Record(fields) = out.value {
+            let (_, v) = fields.iter().find(|(n, _)| n == "decField").unwrap();
+            match v {
+                Value::Decimal(d) => {
+                    // Unscaled 2468 (24.68) is 0x09A4 big-endian, not 24680 (0x6068).
+                    let unscaled = Vec::<u8>::try_from(d.clone()).unwrap();
+                    assert_eq!(unscaled, vec![0x09u8, 0xa4]);
+                }
+                other => panic!("expected a decimal, got {other:?}"),
+            }
+        } else {
+            unreachable!();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cel_decimal_condition_passes() {
+        let r = serialize_with_cel_condition(
+            DECIMAL_SCHEMA,
+            "decimals.gt(message.decField, decimal(\"10.00\"))",
+            decimal_field_12_34(),
+        )
+        .await;
+        assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cel_decimal_condition_fails() {
+        let r = serialize_with_cel_condition(
+            DECIMAL_SCHEMA,
+            "decimals.lt(message.decField, decimal(\"10.00\"))",
+            decimal_field_12_34(),
+        )
+        .await;
+        assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_cel_decimal_arithmetic() {
+        // Only holds if the schema scale is applied (12.34 + 1.66 == 14.00).
+        let r = serialize_with_cel_condition(
+            DECIMAL_SCHEMA,
+            "decimals.eq(decimals.add(message.decField, decimal(\"1.66\")), decimal(\"14.00\"))",
+            decimal_field_12_34(),
+        )
+        .await;
+        assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cel_decimal_nullable() {
+        // A nullable decimal ([null, decimal]) resolves through the union branch and still gets
+        // its scale.
+        let schema_str = r#"
+        {
+            "type": "record",
+            "name": "test",
+            "fields": [
+                {"name": "decField", "type": ["null", {"type": "bytes", "logicalType": "decimal", "precision": 4, "scale": 2}]}
+            ]
+        }
+        "#;
+        let r = serialize_with_cel_condition(
+            schema_str,
+            "decimals.eq(message.decField, decimal(\"12.34\"))",
+            vec![(
+                "decField".to_string(),
+                Value::Union(
+                    1,
+                    Box::new(Value::Decimal(apache_avro::Decimal::from(vec![
+                        0x04u8, 0xd2,
+                    ]))),
+                ),
+            )],
+        )
+        .await;
+        assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cel_decimal_string() {
+        // "12.34" (scaled), not "1234" (unscaled).
+        let r = serialize_with_cel_condition(
+            DECIMAL_SCHEMA,
+            "string(message.decField) == \"12.34\"",
+            decimal_field_12_34(),
+        )
+        .await;
+        assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cel_timestamp_millis_passes() {
+        let schema_str = r#"
+        {
+            "type": "record",
+            "name": "test",
+            "fields": [
+                {"name": "tsField", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+            ]
+        }
+        "#;
+        // A 1970 timestamp is before now.
+        let r = serialize_with_cel_condition(
+            schema_str,
+            "timestamp.of(message.tsField) < now",
+            vec![("tsField".to_string(), Value::TimestampMillis(1000))],
+        )
+        .await;
+        assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cel_timestamp_millis_fails() {
+        let schema_str = r#"
+        {
+            "type": "record",
+            "name": "test",
+            "fields": [
+                {"name": "tsField", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+            ]
+        }
+        "#;
+        let r = serialize_with_cel_condition(
+            schema_str,
+            "timestamp.of(message.tsField) > now",
+            vec![("tsField".to_string(), Value::TimestampMillis(1000))],
+        )
+        .await;
+        assert!(r.is_err());
     }
 
     #[tokio::test]
