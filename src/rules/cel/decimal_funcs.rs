@@ -132,9 +132,23 @@ fn decimals_div(a: Value, b: Value) -> Result<Value, ExecutionError> {
         return Err(err("decimals.div: division by zero"));
     }
     let prec = NonZeroU64::new(DIV_PRECISION).unwrap();
-    Ok(decimal_value(
-        (a / b).with_precision_round(prec, RoundingMode::HalfUp),
-    ))
+    let quotient = (&a / &b).with_precision_round(prec, RoundingMode::HalfUp);
+    Ok(decimal_value(strip_if_exact(quotient, |q| {
+        (q * &b).cmp(&a)
+    })))
+}
+
+/// `with_precision_round` pads an exact/short result out to 38 significant digits, but Java's
+/// `divide`/`sqrt` with a `MathContext` (and Python/JS) return the natural value (`1/8` -> `0.125`,
+/// `sqrt(144)` -> `12`). Strip that padding only when the result is exact: an *inexact* 38-digit
+/// result can legitimately end in a significant `0` (e.g. `1/99`) that must be kept. `is_exact`
+/// reconstructs the input from the rounded result and reports whether it matches numerically.
+fn strip_if_exact(value: BigDecimal, is_exact: impl Fn(&BigDecimal) -> Ordering) -> BigDecimal {
+    if is_exact(&value) == Ordering::Equal {
+        value.normalized()
+    } else {
+        value
+    }
 }
 fn decimals_mod(a: Value, b: Value) -> Result<Value, ExecutionError> {
     // Java BigDecimal.remainder / SQL MOD: a - trunc(a / b) * b.
@@ -175,8 +189,12 @@ fn decimals_sqrt(a: Value) -> Result<Value, ExecutionError> {
     // Same 38-digit HALF_UP context as division; bigdecimal's bare `sqrt` would otherwise use a
     // 100-digit default and diverge from Python/JS on `string(sqrt(x))`.
     let prec = NonZeroU64::new(DIV_PRECISION).unwrap();
+    // As in `div`, strip padding only for a perfect square (`sqrt(144)` -> `12`, not `12.000...`).
     d.sqrt()
-        .map(|r| decimal_value(r.with_precision_round(prec, RoundingMode::HalfUp)))
+        .map(|r| {
+            let rounded = r.with_precision_round(prec, RoundingMode::HalfUp);
+            decimal_value(strip_if_exact(rounded, |root| (root * root).cmp(&d)))
+        })
         .ok_or_else(|| err("decimals.sqrt: square root of negative number"))
 }
 
@@ -232,9 +250,27 @@ fn decimals_ceil(a: Value) -> Result<Value, ExecutionError> {
 // type (mirroring the `string(Decimal)` / `double(Decimal)` extensions in the other clients).
 fn decimal_to_string(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
     match args.as_slice() {
-        [v] if is_decimal(v) => Ok(Value::String(Arc::new(to_decimal(v)?.to_string()))),
+        [v] if is_decimal(v) => Ok(Value::String(Arc::new(plain_decimal_string(&to_decimal(
+            v,
+        )?)?))),
         _ => Err(err("string: no matching overload")),
     }
+}
+
+/// Formats a Decimal in plain notation (Java `toPlainString`, Python `format(d, 'f')`,
+/// JS `toFixed`) rather than the scientific form bigdecimal's `Display` would use for extreme
+/// magnitudes. `to_plain_string` expands the full scale into digits, so a pathological scale -
+/// `decimal(b"\x01", 1_000_000_000)` or `decimal("1e-1000000000")` - would allocate gigabytes;
+/// bound the length first and error instead. (Java's `toPlainString` has the same blow-up.)
+fn plain_decimal_string(d: &BigDecimal) -> Result<String, ExecutionError> {
+    const MAX_LEN: u64 = 1 << 20; // 1 MiB of digits is already absurd for a rule value
+    let length = d
+        .digits()
+        .saturating_add(d.fractional_digit_count().unsigned_abs());
+    if length > MAX_LEN {
+        return Err(err("string: decimal is too large to format"));
+    }
+    Ok(d.to_plain_string())
 }
 fn decimal_to_double(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
     match args.as_slice() {
@@ -373,6 +409,39 @@ mod tests {
         assert_eq!(
             eval_str("string(decimals.div(decimal(\"10\"), decimal(\"3\")))"),
             "3.3333333333333333333333333333333333333"
+        );
+        // An exact div/sqrt is the natural value, not padded to 38 digits (Java `divide`/`sqrt`
+        // with a MathContext, and Python/JS, all leave `1/8` as `0.125` and `sqrt(144)` as `12`).
+        assert_eq!(
+            eval_str("string(decimals.div(decimal(\"1\"), decimal(\"8\")))"),
+            "0.125"
+        );
+        assert_eq!(
+            eval_str("string(decimals.div(decimal(\"100\"), decimal(\"1\")))"),
+            "100"
+        );
+        assert_eq!(eval_str("string(decimals.sqrt(decimal(\"144\")))"), "12");
+        // An *inexact* result keeps a significant trailing zero at the 38th digit (only exact
+        // results are stripped): `1/99` is `0.0101...010`, a full 38 digits, like Python/Java.
+        assert_eq!(
+            eval_str("string(decimals.div(decimal(\"1\"), decimal(\"99\")))"),
+            "0.010101010101010101010101010101010101010"
+        );
+        // string() is plain notation (Java `toPlainString`), never scientific.
+        assert_eq!(
+            eval_str("string(decimals.div(decimal(\"1\"), decimal(\"100000000000\")))"),
+            "0.00000000001"
+        );
+    }
+
+    #[test]
+    fn oversized_decimal_string_errors_instead_of_allocating() {
+        // A pathological scale would expand to gigabytes under plain formatting; it must error.
+        assert!(
+            Program::compile("string(decimal(b\"\\x01\", 1000000000))")
+                .unwrap()
+                .execute(&default_context())
+                .is_err()
         );
     }
 
