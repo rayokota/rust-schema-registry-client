@@ -1035,6 +1035,9 @@ async fn transform_field_with_ctx(
         fd.name().to_string(),
         get_type(fd),
         get_inline_tags(fd),
+        // Protobuf decimals/timestamps are already self-describing messages, so no field schema
+        // is needed to scale the `value` binding.
+        None,
     );
     // Skip-on-null, exactly as the validation walk does it: a field with explicit
     // presence that is unset has no value to transform, and writing one back would

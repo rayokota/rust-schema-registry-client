@@ -1313,6 +1313,11 @@ pub struct FieldContext {
     pub name: String,
     pub field_type: Mutex<FieldType>,
     pub tags: HashSet<String>,
+    /// The field's own schema, when the format carries logical-type detail the field value does
+    /// not (Avro: a decimal's scale, a timestamp's unit). Lets a field rule see `value` as a
+    /// self-describing Decimal/Timestamp rather than raw bytes. `None` for formats whose values
+    /// are already self-describing (Protobuf, JSON).
+    pub field_schema: Option<SerdeSchema>,
 }
 
 impl FieldContext {
@@ -1322,6 +1327,7 @@ impl FieldContext {
         name: String,
         field_type: FieldType,
         tags: HashSet<String>,
+        field_schema: Option<SerdeSchema>,
     ) -> FieldContext {
         FieldContext {
             containing_message,
@@ -1329,6 +1335,7 @@ impl FieldContext {
             name,
             field_type: Mutex::new(field_type),
             tags,
+            field_schema,
         }
     }
 
@@ -1433,12 +1440,19 @@ impl RuleContext {
         name: String,
         field_type: FieldType,
         tags: HashSet<String>,
+        field_schema: Option<SerdeSchema>,
     ) {
         let mut all_tags = HashSet::new();
         all_tags.extend(tags);
         all_tags.extend(self.get_tags(&full_name));
-        let field_context =
-            FieldContext::new(containing_message, full_name, name, field_type, all_tags);
+        let field_context = FieldContext::new(
+            containing_message,
+            full_name,
+            name,
+            field_type,
+            all_tags,
+            field_schema,
+        );
         self.field_contexts.push(field_context);
     }
 

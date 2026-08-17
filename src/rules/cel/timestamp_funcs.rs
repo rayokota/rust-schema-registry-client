@@ -89,3 +89,62 @@ fn timestamp_of_dyn(v: &Value) -> Result<Value, ExecutionError> {
 pub fn add_timestamp_functions(ctx: &mut Context) {
     ctx.add_function("timestamp.of", timestamp_of);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rules::cel::cel_lib::default_context;
+    use cel::{Program, Value};
+
+    #[test]
+    fn from_epoch_units() {
+        // 1_500_000_000 seconds since the epoch, expressed in each unit, is the same instant.
+        assert_eq!(from_epoch(1_500_000_000, "seconds").unwrap().timestamp(), 1_500_000_000);
+        assert_eq!(
+            from_epoch(1_500_000_000_000, "millis").unwrap().timestamp(),
+            1_500_000_000
+        );
+        assert_eq!(
+            from_epoch(1_500_000_000_000_000, "micros").unwrap().timestamp(),
+            1_500_000_000
+        );
+        let nanos = from_epoch(1_500_000_000_123_456_789, "nanos").unwrap();
+        assert_eq!(nanos.timestamp(), 1_500_000_000);
+        assert_eq!(nanos.timestamp_subsec_nanos(), 123_456_789);
+    }
+
+    #[test]
+    fn from_epoch_unknown_unit_errors() {
+        assert!(from_epoch(0, "weeks").is_err());
+    }
+
+    #[test]
+    fn from_epoch_out_of_range_errors() {
+        // i64::MAX seconds is far past chrono's supported range.
+        assert!(from_epoch(i64::MAX, "seconds").is_err());
+    }
+
+    fn eval(expr: &str) -> Value {
+        Program::compile(expr)
+            .expect("compile")
+            .execute(&default_context())
+            .expect("execute")
+    }
+
+    #[test]
+    fn two_arg_dispatch_through_cel() {
+        // timestamp.of(value, unit) constructs, and the result compares as a timestamp.
+        assert!(matches!(
+            eval("timestamp.of(1500000000000, \"millis\") == timestamp.of(1500000000, \"seconds\")"),
+            Value::Bool(true)
+        ));
+    }
+
+    #[test]
+    fn raw_int_without_unit_errors() {
+        assert!(Program::compile("timestamp.of(1500000000)")
+            .unwrap()
+            .execute(&default_context())
+            .is_err());
+    }
+}

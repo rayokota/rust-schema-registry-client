@@ -180,10 +180,11 @@ fn decimals_sqrt(a: Value) -> Result<Value, ExecutionError> {
 
 // ---- rounding (round/trunc take an optional scale; floor/ceil are scale 0) ----
 fn scale_arg(args: &[Value]) -> Result<i64, ExecutionError> {
-    match args.get(1) {
-        None => Ok(0),
-        Some(Value::Int(s)) => Ok(*s),
-        Some(_) => Err(err("expected an int scale")),
+    match args {
+        [_] => Ok(0),
+        [_, Value::Int(s)] => Ok(*s),
+        [_, _] => Err(err("expected an int scale")),
+        _ => Err(err("expected 1 or 2 arguments")),
     }
 }
 fn decimals_round(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
