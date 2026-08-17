@@ -1899,6 +1899,106 @@ mod tests {
         }
     }
 
+    const TS_SCHEMA: &str = r#"
+    {
+        "type": "record",
+        "name": "test",
+        "fields": [
+            {"name": "tsField", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+        ]
+    }
+    "#;
+
+    #[tokio::test]
+    async fn test_cel_field_timestamp_value() {
+        // The field rule's `value` binding must be a self-describing timestamp, so the 1-arg
+        // `timestamp.of(value)` works (no unit literal).
+        let r = serialize_with_cel_field_condition(
+            TS_SCHEMA,
+            "name == 'tsField' ; timestamp.of(value) < now",
+            vec![("tsField".to_string(), Value::TimestampMillis(1000))],
+        )
+        .await;
+        assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cel_field_timestamp_transform() {
+        // A field rule returning a Timestamp must re-encode to the field's epoch unit (millis).
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            true,
+            false,
+            HashMap::new(),
+        );
+        let rule = Rule {
+            name: "test-cel-field".to_string(),
+            doc: None,
+            kind: Some(Kind::Transform),
+            mode: Some(Mode::Write),
+            r#type: "CEL_FIELD".to_string(),
+            tags: None,
+            params: None,
+            expr: Some("name == 'tsField' ; timestamp.of(value)".to_string()),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let rule_set = RuleSet {
+            migration_rules: None,
+            domain_rules: Some(vec![rule]),
+            encoding_rules: None,
+            enable_at: None,
+        };
+        let schema = Schema {
+            schema_type: Some("AVRO".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(rule_set)),
+            schema: TS_SCHEMA.to_string(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(CelFieldExecutor::new());
+        let ser =
+            AvroSerializer::new(&client, None, Some(rule_registry.clone()), ser_conf).unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Avro,
+            headers: None,
+        };
+        let bytes = ser
+            .serialize(
+                &ser_ctx,
+                Record(vec![(
+                    "tsField".to_string(),
+                    Value::TimestampMillis(1_577_836_800_000),
+                )]),
+            )
+            .await
+            .unwrap();
+        let deser = AvroDeserializer::new(
+            &client,
+            Some(rule_registry),
+            DeserializerConfig::default(),
+        )
+        .unwrap();
+        let out = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        if let Record(fields) = out.value {
+            let (_, v) = fields.iter().find(|(n, _)| n == "tsField").unwrap();
+            assert_eq!(*v, Value::TimestampMillis(1_577_836_800_000));
+        } else {
+            unreachable!();
+        }
+    }
+
     #[tokio::test]
     async fn test_cel_field_decimal_value_is_scaled() {
         // The field rule's `value` binding must be the decimal at its schema scale (12.34), not
