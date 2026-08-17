@@ -1,7 +1,11 @@
 use crate::rules::cel::cel_lib::default_context;
-use crate::rules::cel::decimal_funcs::{DECIMAL_TYPE_NAME, decimal_value, from_bytes_scale, to_decimal};
+use crate::rules::cel::decimal_funcs::{
+    DECIMAL_TYPE_NAME, decimal_value, from_bytes_scale, to_decimal,
+};
 use crate::serdes::avro::collect_named_schemas;
-use crate::serdes::serde::{RuleBase, RuleContext, RuleExecutor, SerdeError, SerdeValue, SerdeSchema};
+use crate::serdes::serde::{
+    RuleBase, RuleContext, RuleExecutor, SerdeError, SerdeSchema, SerdeValue,
+};
 use apache_avro::Schema as AvroSchema;
 use apache_avro::schema::Name as AvroName;
 use async_trait::async_trait;
@@ -932,7 +936,10 @@ fn to_avro_value_with_schema(
                     Key::String(s) => s.to_string(),
                     other => other.to_string(),
                 };
-                out.insert(key, to_avro_value_with_schema(child_input, v, &mp.types, defs)?);
+                out.insert(
+                    key,
+                    to_avro_value_with_schema(child_input, v, &mp.types, defs)?,
+                );
             }
             Ok(AV::Map(out))
         }
@@ -948,7 +955,12 @@ fn to_avro_value_with_schema(
                     };
                     Ok(AV::Union(
                         i as u32,
-                        Box::new(to_avro_value_with_schema(inner_input, value, &variants[i], defs)?),
+                        Box::new(to_avro_value_with_schema(
+                            inner_input,
+                            value,
+                            &variants[i],
+                            defs,
+                        )?),
                     ))
                 }
                 None => Ok(to_avro_value(input, value)),

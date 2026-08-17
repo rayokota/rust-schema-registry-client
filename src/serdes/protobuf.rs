@@ -2641,7 +2641,10 @@ mod tests {
             .get_message_by_name("confluent.type.Decimal")
             .expect("decimal.proto is compiled into the descriptor pool");
         let mut dec = DynamicMessage::new(dec_desc);
-        dec.set_field_by_name("value", prost_reflect::Value::Bytes(vec![0x04u8, 0xd2].into()));
+        dec.set_field_by_name(
+            "value",
+            prost_reflect::Value::Bytes(vec![0x04u8, 0xd2].into()),
+        );
         dec.set_field_by_name("scale", prost_reflect::Value::I32(2));
         let value = from_protobuf_value_for_test(&prost_reflect::Value::Message(dec));
         assert_eq!(

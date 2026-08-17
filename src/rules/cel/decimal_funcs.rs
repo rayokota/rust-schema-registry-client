@@ -132,7 +132,9 @@ fn decimals_div(a: Value, b: Value) -> Result<Value, ExecutionError> {
         return Err(err("decimals.div: division by zero"));
     }
     let prec = NonZeroU64::new(DIV_PRECISION).unwrap();
-    Ok(decimal_value((a / b).with_precision_round(prec, RoundingMode::HalfUp)))
+    Ok(decimal_value(
+        (a / b).with_precision_round(prec, RoundingMode::HalfUp),
+    ))
 }
 fn decimals_mod(a: Value, b: Value) -> Result<Value, ExecutionError> {
     // Java BigDecimal.remainder / SQL MOD: a - trunc(a / b) * b.
@@ -188,11 +190,19 @@ fn scale_arg(args: &[Value]) -> Result<i64, ExecutionError> {
     }
 }
 fn decimals_round(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
-    let d = to_decimal(args.first().ok_or_else(|| err("decimals.round: missing argument"))?)?;
-    Ok(decimal_value(d.with_scale_round(scale_arg(&args)?, RoundingMode::HalfUp)))
+    let d = to_decimal(
+        args.first()
+            .ok_or_else(|| err("decimals.round: missing argument"))?,
+    )?;
+    Ok(decimal_value(
+        d.with_scale_round(scale_arg(&args)?, RoundingMode::HalfUp),
+    ))
 }
 fn decimals_trunc(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
-    let d = to_decimal(args.first().ok_or_else(|| err("decimals.trunc: missing argument"))?)?;
+    let d = to_decimal(
+        args.first()
+            .ok_or_else(|| err("decimals.trunc: missing argument"))?,
+    )?;
     let scale = scale_arg(&args)?;
     // Flink's TRUNCATE early-returns when the target scale is at-or-finer than the current one:
     // there is nothing to drop, so the input is returned unchanged. Without this guard
@@ -204,10 +214,14 @@ fn decimals_trunc(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
     Ok(decimal_value(d.with_scale_round(scale, RoundingMode::Down)))
 }
 fn decimals_floor(a: Value) -> Result<Value, ExecutionError> {
-    Ok(decimal_value(to_decimal(&a)?.with_scale_round(0, RoundingMode::Floor)))
+    Ok(decimal_value(
+        to_decimal(&a)?.with_scale_round(0, RoundingMode::Floor),
+    ))
 }
 fn decimals_ceil(a: Value) -> Result<Value, ExecutionError> {
-    Ok(decimal_value(to_decimal(&a)?.with_scale_round(0, RoundingMode::Ceiling)))
+    Ok(decimal_value(
+        to_decimal(&a)?.with_scale_round(0, RoundingMode::Ceiling),
+    ))
 }
 
 // ---- stdlib conversions extended to Decimal ----
@@ -281,9 +295,15 @@ mod tests {
 
     #[test]
     fn namespaced_comparison_dispatches() {
-        assert!(eval_bool("decimals.gt(decimal(\"12.34\"), decimal(\"10.00\"))"));
-        assert!(eval_bool("decimals.lt(decimal(\"9.99\"), decimal(\"10.00\"))"));
-        assert!(!eval_bool("decimals.ge(decimal(\"9.99\"), decimal(\"10.00\"))"));
+        assert!(eval_bool(
+            "decimals.gt(decimal(\"12.34\"), decimal(\"10.00\"))"
+        ));
+        assert!(eval_bool(
+            "decimals.lt(decimal(\"9.99\"), decimal(\"10.00\"))"
+        ));
+        assert!(!eval_bool(
+            "decimals.ge(decimal(\"9.99\"), decimal(\"10.00\"))"
+        ));
     }
 
     #[test]
@@ -322,7 +342,9 @@ mod tests {
     #[test]
     fn sign_and_abs() {
         assert!(eval_bool("decimals.sign(decimal(\"-5\")) == -1"));
-        assert!(eval_bool("decimals.eq(decimals.abs(decimal(\"-5\")), decimal(\"5\"))"));
+        assert!(eval_bool(
+            "decimals.eq(decimals.abs(decimal(\"-5\")), decimal(\"5\"))"
+        ));
     }
 
     /// String output has to match the Python and JS clients (and Flink) exactly, since a rule
@@ -338,8 +360,14 @@ mod tests {
         );
         // trunc early-returns (no zero-padding) when the target scale is at-or-finer than
         // the current scale.
-        assert_eq!(eval_str("string(decimals.trunc(decimal(\"12.34\"), 5))"), "12.34");
-        assert_eq!(eval_str("string(decimals.trunc(decimal(\"12.349\"), 2))"), "12.34");
+        assert_eq!(
+            eval_str("string(decimals.trunc(decimal(\"12.34\"), 5))"),
+            "12.34"
+        );
+        assert_eq!(
+            eval_str("string(decimals.trunc(decimal(\"12.349\"), 2))"),
+            "12.34"
+        );
         assert_eq!(eval_str("string(decimals.trunc(decimal(\"12\")))"), "12");
         // div is 38-digit HALF_UP.
         assert_eq!(

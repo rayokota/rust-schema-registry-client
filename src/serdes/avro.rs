@@ -1878,12 +1878,9 @@ mod tests {
             .serialize(&ser_ctx, Record(decimal_field_12_34()))
             .await
             .unwrap();
-        let deser = AvroDeserializer::new(
-            &client,
-            Some(rule_registry),
-            DeserializerConfig::default(),
-        )
-        .unwrap();
+        let deser =
+            AvroDeserializer::new(&client, Some(rule_registry), DeserializerConfig::default())
+                .unwrap();
         let out = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
         if let Record(fields) = out.value {
             let (_, v) = fields.iter().find(|(n, _)| n == "decField").unwrap();
@@ -1984,12 +1981,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let deser = AvroDeserializer::new(
-            &client,
-            Some(rule_registry),
-            DeserializerConfig::default(),
-        )
-        .unwrap();
+        let deser =
+            AvroDeserializer::new(&client, Some(rule_registry), DeserializerConfig::default())
+                .unwrap();
         let out = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
         if let Record(fields) = out.value {
             let (_, v) = fields.iter().find(|(n, _)| n == "tsField").unwrap();
@@ -2074,12 +2068,9 @@ mod tests {
             .await
             .unwrap();
 
-        let deser = AvroDeserializer::new(
-            &client,
-            Some(rule_registry),
-            DeserializerConfig::default(),
-        )
-        .unwrap();
+        let deser =
+            AvroDeserializer::new(&client, Some(rule_registry), DeserializerConfig::default())
+                .unwrap();
         let out = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
         // The unscaled integer under the scale-2 schema must be 2468 (24.68), not 24680.
         if let Record(fields) = out.value {
@@ -2151,7 +2142,9 @@ mod tests {
                 "decField".to_string(),
                 Value::Union(
                     1,
-                    Box::new(Value::Decimal(apache_avro::Decimal::from(vec![0x04u8, 0xd2]))),
+                    Box::new(Value::Decimal(apache_avro::Decimal::from(vec![
+                        0x04u8, 0xd2,
+                    ]))),
                 ),
             )],
         )

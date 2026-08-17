@@ -13,9 +13,9 @@
 //! overload) because `(dyn)` and `(string)` would overlap per the CEL signature-overlap rule on
 //! conformant impls (cel-java/go/cpp); the namespaced form keeps cross-client parity.
 
-use chrono::{DateTime, FixedOffset, Utc};
 use cel::extractors::Arguments;
 use cel::{Context, ExecutionError, Value};
+use chrono::{DateTime, FixedOffset, Utc};
 
 const UNIT_SECONDS: &str = "seconds";
 const UNIT_MILLIS: &str = "millis";
@@ -43,7 +43,7 @@ pub fn from_epoch(value: i64, unit: &str) -> Result<DateTime<FixedOffset>, Execu
         _ => {
             return Err(err(format!(
                 "timestamp.of: unknown unit '{unit}'; expected one of seconds, millis, micros, nanos"
-            )))
+            )));
         }
     };
     Ok(utc.fixed_offset())
@@ -52,14 +52,14 @@ pub fn from_epoch(value: i64, unit: &str) -> Result<DateTime<FixedOffset>, Execu
 /// Runtime dispatch backing `timestamp.of(...)`: `(dyn)` or `(int, string)`.
 fn timestamp_of(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
     match args.as_slice() {
-        [Value::Int(value), Value::String(unit)] => {
-            Ok(Value::Timestamp(from_epoch(*value, unit)?))
-        }
+        [Value::Int(value), Value::String(unit)] => Ok(Value::Timestamp(from_epoch(*value, unit)?)),
         [Value::UInt(value), Value::String(unit)] => Ok(Value::Timestamp(from_epoch(
             i64::try_from(*value).map_err(|_| err("timestamp.of: epoch value out of range"))?,
             unit,
         )?)),
-        [_, _] => Err(err("timestamp.of: expected (int, string) for the 2-arg form")),
+        [_, _] => Err(err(
+            "timestamp.of: expected (int, string) for the 2-arg form",
+        )),
         [v] => timestamp_of_dyn(v),
         _ => Err(err("timestamp.of: expected 1 or 2 args")),
     }
@@ -99,13 +99,18 @@ mod tests {
     #[test]
     fn from_epoch_units() {
         // 1_500_000_000 seconds since the epoch, expressed in each unit, is the same instant.
-        assert_eq!(from_epoch(1_500_000_000, "seconds").unwrap().timestamp(), 1_500_000_000);
+        assert_eq!(
+            from_epoch(1_500_000_000, "seconds").unwrap().timestamp(),
+            1_500_000_000
+        );
         assert_eq!(
             from_epoch(1_500_000_000_000, "millis").unwrap().timestamp(),
             1_500_000_000
         );
         assert_eq!(
-            from_epoch(1_500_000_000_000_000, "micros").unwrap().timestamp(),
+            from_epoch(1_500_000_000_000_000, "micros")
+                .unwrap()
+                .timestamp(),
             1_500_000_000
         );
         let nanos = from_epoch(1_500_000_000_123_456_789, "nanos").unwrap();
@@ -135,16 +140,20 @@ mod tests {
     fn two_arg_dispatch_through_cel() {
         // timestamp.of(value, unit) constructs, and the result compares as a timestamp.
         assert!(matches!(
-            eval("timestamp.of(1500000000000, \"millis\") == timestamp.of(1500000000, \"seconds\")"),
+            eval(
+                "timestamp.of(1500000000000, \"millis\") == timestamp.of(1500000000, \"seconds\")"
+            ),
             Value::Bool(true)
         ));
     }
 
     #[test]
     fn raw_int_without_unit_errors() {
-        assert!(Program::compile("timestamp.of(1500000000)")
-            .unwrap()
-            .execute(&default_context())
-            .is_err());
+        assert!(
+            Program::compile("timestamp.of(1500000000)")
+                .unwrap()
+                .execute(&default_context())
+                .is_err()
+        );
     }
 }
