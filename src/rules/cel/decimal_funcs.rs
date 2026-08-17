@@ -132,9 +132,11 @@ fn decimals_div(a: Value, b: Value) -> Result<Value, ExecutionError> {
         return Err(err("decimals.div: division by zero"));
     }
     let prec = NonZeroU64::new(DIV_PRECISION).unwrap();
-    Ok(decimal_value(
-        (a / b).with_precision_round(prec, RoundingMode::HalfUp),
-    ))
+    // `with_precision_round` pads an exact/short quotient out to 38 significant digits, but
+    // Python (`Context.divide`) and JS (decimal.js) return the natural value (`1/8` -> `0.125`,
+    // not `0.125000...`), so strip the padding trailing zeros to match `string(div(...))`.
+    let quotient = (a / b).with_precision_round(prec, RoundingMode::HalfUp);
+    Ok(decimal_value(quotient.normalized()))
 }
 fn decimals_mod(a: Value, b: Value) -> Result<Value, ExecutionError> {
     // Java BigDecimal.remainder / SQL MOD: a - trunc(a / b) * b.
@@ -175,8 +177,9 @@ fn decimals_sqrt(a: Value) -> Result<Value, ExecutionError> {
     // Same 38-digit HALF_UP context as division; bigdecimal's bare `sqrt` would otherwise use a
     // 100-digit default and diverge from Python/JS on `string(sqrt(x))`.
     let prec = NonZeroU64::new(DIV_PRECISION).unwrap();
+    // As in `div`, strip padding so a perfect square is `12`, not `12.000...` (matches Python/JS).
     d.sqrt()
-        .map(|r| decimal_value(r.with_precision_round(prec, RoundingMode::HalfUp)))
+        .map(|r| decimal_value(r.with_precision_round(prec, RoundingMode::HalfUp).normalized()))
         .ok_or_else(|| err("decimals.sqrt: square root of negative number"))
 }
 
@@ -232,7 +235,10 @@ fn decimals_ceil(a: Value) -> Result<Value, ExecutionError> {
 // type (mirroring the `string(Decimal)` / `double(Decimal)` extensions in the other clients).
 fn decimal_to_string(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
     match args.as_slice() {
-        [v] if is_decimal(v) => Ok(Value::String(Arc::new(to_decimal(v)?.to_string()))),
+        // `to_plain_string`, not `to_string`: bigdecimal's `Display` switches to scientific
+        // notation for extreme magnitudes, but Java's `BigDecimal.toPlainString` (and Python
+        // `format(d, 'f')` / JS `.toFixed()`) never do.
+        [v] if is_decimal(v) => Ok(Value::String(Arc::new(to_decimal(v)?.to_plain_string()))),
         _ => Err(err("string: no matching overload")),
     }
 }
@@ -374,6 +380,16 @@ mod tests {
             eval_str("string(decimals.div(decimal(\"10\"), decimal(\"3\")))"),
             "3.3333333333333333333333333333333333333"
         );
+        // An exact div/sqrt is the natural value, not padded to 38 digits (Java `divide`/`sqrt`
+        // with a MathContext, and Python/JS, all leave `1/8` as `0.125` and `sqrt(144)` as `12`).
+        assert_eq!(eval_str("string(decimals.div(decimal(\"1\"), decimal(\"8\")))"), "0.125");
+        assert_eq!(eval_str("string(decimals.div(decimal(\"100\"), decimal(\"1\")))"), "100");
+        assert_eq!(eval_str("string(decimals.sqrt(decimal(\"144\")))"), "12");
+        // string() is plain notation (Java `toPlainString`), never scientific.
+        assert_eq!(
+            eval_str("string(decimals.div(decimal(\"1\"), decimal(\"100000000000\")))"),
+            "0.00000000001"
+        );
     }
 
     fn eval_str(expr: &str) -> String {
@@ -383,3 +399,4 @@ mod tests {
         }
     }
 }
+
