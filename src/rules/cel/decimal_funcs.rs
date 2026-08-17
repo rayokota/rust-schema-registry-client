@@ -179,7 +179,12 @@ fn decimals_sqrt(a: Value) -> Result<Value, ExecutionError> {
     let prec = NonZeroU64::new(DIV_PRECISION).unwrap();
     // As in `div`, strip padding so a perfect square is `12`, not `12.000...` (matches Python/JS).
     d.sqrt()
-        .map(|r| decimal_value(r.with_precision_round(prec, RoundingMode::HalfUp).normalized()))
+        .map(|r| {
+            decimal_value(
+                r.with_precision_round(prec, RoundingMode::HalfUp)
+                    .normalized(),
+            )
+        })
         .ok_or_else(|| err("decimals.sqrt: square root of negative number"))
 }
 
@@ -382,8 +387,14 @@ mod tests {
         );
         // An exact div/sqrt is the natural value, not padded to 38 digits (Java `divide`/`sqrt`
         // with a MathContext, and Python/JS, all leave `1/8` as `0.125` and `sqrt(144)` as `12`).
-        assert_eq!(eval_str("string(decimals.div(decimal(\"1\"), decimal(\"8\")))"), "0.125");
-        assert_eq!(eval_str("string(decimals.div(decimal(\"100\"), decimal(\"1\")))"), "100");
+        assert_eq!(
+            eval_str("string(decimals.div(decimal(\"1\"), decimal(\"8\")))"),
+            "0.125"
+        );
+        assert_eq!(
+            eval_str("string(decimals.div(decimal(\"100\"), decimal(\"1\")))"),
+            "100"
+        );
         assert_eq!(eval_str("string(decimals.sqrt(decimal(\"144\")))"), "12");
         // string() is plain notation (Java `toPlainString`), never scientific.
         assert_eq!(
@@ -399,4 +410,3 @@ mod tests {
         }
     }
 }
-
