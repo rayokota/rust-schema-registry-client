@@ -346,7 +346,6 @@ mod tests {
     use super::*;
     use crate::rules::cel::cel_lib::default_context;
     use cel::Program;
-    use std::collections::HashMap;
 
     // A JSON document exercising objects, arrays, an explicit null, and nesting.
     const DOC: &str = r#"{"name":"alice","age":30,"explicit":null,"nested":{"x":1},"scores":[10,20,30]}"#;
@@ -387,23 +386,52 @@ mod tests {
         }
     }
 
-    // An Avro variant record and a Protobuf confluent.type.Variant message both reach CEL as a
-    // map with metadata/value byte entries; variant(this) accepts that shape.
+    // An Avro variant record, converted through the real Avro→CEL path (from_serde_value →
+    // from_avro_value → Value::Map), then consumed by variant(this).
     #[test]
-    fn variant_map_into_cel() {
+    fn avro_variant_into_cel() {
+        use crate::rules::cel::cel_executor::from_serde_value;
+        use crate::serdes::serde::SerdeValue;
+        use apache_avro::types::Value as AvroValue;
+
         let pv = Variant::parse_json(DOC).expect("parse");
-        let mut map: HashMap<Key, Value> = HashMap::new();
-        map.insert(
-            Key::String(Arc::new("metadata".to_string())),
-            Value::Bytes(Arc::new(pv.metadata_bytes().to_vec())),
-        );
-        map.insert(
-            Key::String(Arc::new("value".to_string())),
-            Value::Bytes(Arc::new(pv.value_bytes().to_vec())),
-        );
-        let this = Value::Map(Map { map: Arc::new(map) });
+        let record = AvroValue::Record(vec![
+            (
+                "metadata".to_string(),
+                AvroValue::Bytes(pv.metadata_bytes().to_vec()),
+            ),
+            (
+                "value".to_string(),
+                AvroValue::Bytes(pv.value_bytes().to_vec()),
+            ),
+        ]);
+        let this = from_serde_value(&SerdeValue::Avro(record));
         assert!(eval_bool(
             "variants.as(variants.field(variant(this), 'name'), 'string') == 'alice'",
+            this,
+        ));
+    }
+
+    // A confluent.type.Variant proto message, converted through the real Protobuf→CEL path,
+    // then consumed by variant(this).
+    #[test]
+    fn proto_variant_into_cel() {
+        use crate::rules::cel::cel_executor::from_protobuf_value_for_test;
+        use prost_reflect::{DynamicMessage, Value as ProtoValue};
+
+        let pv = Variant::parse_json(DOC).expect("parse");
+        let desc = crate::DESCRIPTOR_POOL
+            .get_message_by_name("confluent.type.Variant")
+            .expect("variant.proto is compiled into the descriptor pool");
+        let mut msg = DynamicMessage::new(desc);
+        msg.set_field_by_name(
+            "metadata",
+            ProtoValue::Bytes(pv.metadata_bytes().to_vec().into()),
+        );
+        msg.set_field_by_name("value", ProtoValue::Bytes(pv.value_bytes().to_vec().into()));
+        let this = from_protobuf_value_for_test(&ProtoValue::Message(msg));
+        assert!(eval_bool(
+            "variants.as(variants.field(variant(this), 'age'), 'int') == 30",
             this,
         ));
     }
