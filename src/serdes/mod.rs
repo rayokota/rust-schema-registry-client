@@ -1,5 +1,6 @@
 pub mod avro;
 pub mod config;
+pub mod decimal_utils;
 pub mod json;
 pub mod protobuf;
 pub mod rule_registry;
