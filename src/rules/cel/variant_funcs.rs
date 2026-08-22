@@ -259,8 +259,11 @@ fn variant_as(a: &Value, b: &Value, null_on_error: bool) -> Result<Value, Execut
             .then(|| vv.get_string().map(|s| Value::String(Arc::new(s))).map_err(conv)),
         "int" => matches!(vt, Type::Byte | Type::Short | Type::Int | Type::Long)
             .then(|| vv.get_long().map(Value::Int).map_err(conv)),
-        "double" => matches!(vt, Type::Float | Type::Double)
-            .then(|| vv.get_double().map(Value::Float).map_err(conv)),
+        "double" => match vt {
+            Type::Float => Some(vv.get_float().map(|f| Value::Float(f as f64)).map_err(conv)),
+            Type::Double => Some(vv.get_double().map(Value::Float).map_err(conv)),
+            _ => None,
+        },
         "boolean" => (vt == Type::Boolean)
             .then(|| vv.get_boolean().map(Value::Bool).map_err(conv)),
         "decimal" => matches!(vt, Type::Decimal4 | Type::Decimal8 | Type::Decimal16).then(|| {

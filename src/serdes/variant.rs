@@ -240,6 +240,39 @@ impl Variant {
         Ok(ti == T_TRUE)
     }
 
+    /// The value of an INT8-backed variant. This does not widen: only a byte (INT8) value is
+    /// accepted.
+    pub fn get_byte(&self) -> Result<i8, VariantError> {
+        let ti = self.primitive_info()?;
+        if ti != T_INT1 {
+            return Err(VariantError::TypeMismatch("variant is not a byte".to_string()));
+        }
+        Ok(read_signed_long(&self.value, self.pos + 1, 1)? as i8)
+    }
+
+    /// The value of an integer-backed variant no wider than INT16 (byte/short), widening narrower
+    /// widths.
+    pub fn get_short(&self) -> Result<i16, VariantError> {
+        let ti = self.primitive_info()?;
+        match ti {
+            T_INT1 => Ok(read_signed_long(&self.value, self.pos + 1, 1)? as i16),
+            T_INT2 => Ok(read_signed_long(&self.value, self.pos + 1, 2)? as i16),
+            _ => Err(VariantError::TypeMismatch("variant is not a short".to_string())),
+        }
+    }
+
+    /// The value of an integer-backed variant no wider than INT32 (byte/short/int), widening
+    /// narrower widths.
+    pub fn get_int(&self) -> Result<i32, VariantError> {
+        let ti = self.primitive_info()?;
+        match ti {
+            T_INT1 => Ok(read_signed_long(&self.value, self.pos + 1, 1)? as i32),
+            T_INT2 => Ok(read_signed_long(&self.value, self.pos + 1, 2)? as i32),
+            T_INT4 => Ok(read_signed_long(&self.value, self.pos + 1, 4)? as i32),
+            _ => Err(VariantError::TypeMismatch("variant is not an int".to_string())),
+        }
+    }
+
     /// The raw integer for any integer-backed type (byte/short/int/long, date days, timestamp
     /// micros, time micros, timestamp-nanos) - mirrors Java `getLong`.
     pub fn get_long(&self) -> Result<i64, VariantError> {
@@ -256,16 +289,23 @@ impl Variant {
         }
     }
 
-    /// The float/double value.
+    /// The FLOAT value. Exact-typed: only a FLOAT value is accepted (a DOUBLE is not narrowed).
+    pub fn get_float(&self) -> Result<f32, VariantError> {
+        let ti = self.primitive_info()?;
+        if ti != T_FLOAT {
+            return Err(VariantError::TypeMismatch("variant is not a float".to_string()));
+        }
+        read_float_le(&self.value, self.pos + 1)
+    }
+
+    /// The DOUBLE value. Exact-typed: only a DOUBLE value is accepted (a FLOAT is not widened; use
+    /// [`Variant::get_float`] for that).
     pub fn get_double(&self) -> Result<f64, VariantError> {
         let ti = self.primitive_info()?;
-        if ti == T_FLOAT {
-            return read_float_le(&self.value, self.pos + 1);
+        if ti != T_DOUBLE {
+            return Err(VariantError::TypeMismatch("variant is not a double".to_string()));
         }
-        if ti == T_DOUBLE {
-            return read_double_le(&self.value, self.pos + 1);
-        }
-        Err(VariantError::TypeMismatch("variant is not a float/double".to_string()))
+        read_double_le(&self.value, self.pos + 1)
     }
 
     /// The unscaled integer (as big-endian two's-complement bytes) and scale of a decimal value
@@ -312,7 +352,7 @@ impl Variant {
     }
 
     /// The UUID as its canonical big-endian hex string (e.g. "00112233-4455-6677-8899-aabbccddeeff").
-    pub fn get_uuid_string(&self) -> Result<String, VariantError> {
+    pub fn get_uuid(&self) -> Result<String, VariantError> {
         let ti = self.primitive_info()?;
         if ti != T_UUID {
             return Err(VariantError::TypeMismatch("variant is not a uuid".to_string()));
@@ -395,7 +435,7 @@ impl Variant {
     }
 
     /// The number of fields in an object (0 on error).
-    pub fn num_object_elements(&self) -> usize {
+    pub fn num_object_fields(&self) -> usize {
         self.object_info().map(|o| o.num_fields).unwrap_or(0)
     }
 
@@ -546,7 +586,8 @@ impl Variant {
             Type::Byte | Type::Short | Type::Int | Type::Long => {
                 out.push_str(&self.get_long()?.to_string());
             }
-            Type::Float | Type::Double => out.push_str(&format_double(self.get_double()?)?),
+            Type::Float => out.push_str(&format_double(self.get_float()? as f64)?),
+            Type::Double => out.push_str(&format_double(self.get_double()?)?),
             Type::Decimal4 | Type::Decimal8 | Type::Decimal16 => {
                 out.push_str(&self.get_decimal_string()?);
             }
@@ -588,7 +629,7 @@ impl Variant {
             }
             Type::Uuid => {
                 out.push('"');
-                out.push_str(&self.get_uuid_string()?);
+                out.push_str(&self.get_uuid()?);
                 out.push('"');
             }
         }
@@ -662,10 +703,10 @@ fn read_signed_long(data: &[u8], pos: usize, num_bytes: usize) -> Result<i64, Va
     Ok(result as i64)
 }
 
-fn read_float_le(data: &[u8], pos: usize) -> Result<f64, VariantError> {
+fn read_float_le(data: &[u8], pos: usize) -> Result<f32, VariantError> {
     check_index(pos + 3, data.len())?;
     let bits = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-    Ok(f32::from_bits(bits) as f64)
+    Ok(f32::from_bits(bits))
 }
 
 fn read_double_le(data: &[u8], pos: usize) -> Result<f64, VariantError> {
@@ -926,6 +967,52 @@ impl Builder {
         self.value.extend_from_slice(&d.to_bits().to_le_bytes());
     }
 
+    // Fixed-width scalar appends (used by the public VariantBuilder). These write a
+    // specific primitive width (symmetric with the reader's granular getters), unlike
+    // `append_int`, which auto-selects the smallest int width for `parse_json`. The byte
+    // layout matches what `parse_json` produces for a value of the same width.
+
+    fn append_byte(&mut self, v: i8) {
+        self.value.push(primitive_header(T_INT1));
+        append_long_le(&mut self.value, v as i64, 1);
+    }
+
+    fn append_short(&mut self, v: i16) {
+        self.value.push(primitive_header(T_INT2));
+        append_long_le(&mut self.value, v as i64, 2);
+    }
+
+    fn append_int32(&mut self, v: i32) {
+        self.value.push(primitive_header(T_INT4));
+        append_long_le(&mut self.value, v as i64, 4);
+    }
+
+    fn append_long(&mut self, v: i64) {
+        self.value.push(primitive_header(T_INT8));
+        append_long_le(&mut self.value, v, 8);
+    }
+
+    fn append_float(&mut self, v: f32) {
+        self.value.push(primitive_header(T_FLOAT));
+        self.value.extend_from_slice(&v.to_bits().to_le_bytes());
+    }
+
+    fn append_binary(&mut self, data: &[u8]) {
+        self.value.push(primitive_header(T_BINARY));
+        append_uint_le(&mut self.value, data.len(), U32_SIZE);
+        self.value.extend_from_slice(data);
+    }
+
+    fn append_uuid(&mut self, u: &[u8; 16]) {
+        self.value.push(primitive_header(T_UUID));
+        self.value.extend_from_slice(u);
+    }
+
+    fn append_temporal(&mut self, code: u8, width: usize, v: i64) {
+        self.value.push(primitive_header(code));
+        append_long_le(&mut self.value, v, width);
+    }
+
     fn finish_writing_array(&mut self, start: usize, offsets: &[usize]) {
         let data_size = self.value.len() - start;
         let num_offsets = offsets.len();
@@ -998,6 +1085,328 @@ impl Builder {
 
 fn primitive_header(type_code: u8) -> u8 {
     (type_code << BASIC_TYPE_BITS) | PRIMITIVE
+}
+
+// --- public flat streaming VariantBuilder ---
+
+/// A single frame of the builder's nesting stack.
+enum BuilderFrame {
+    Object {
+        start: usize,
+        fields: Vec<FieldEntry>,
+        /// The key (and its dictionary id) set by `append_key`, awaiting its value.
+        pending: Option<(String, usize)>,
+    },
+    Array {
+        start: usize,
+        offsets: Vec<usize>,
+    },
+}
+
+/// Programmatically constructs a [`Variant`] using a flat streaming-writer model with an internal
+/// nesting stack (the arrow-dotnet `VariantValueWriter` shape). A single builder emits scalars and
+/// opens/closes containers; appends target the current slot (the root, the next array element, or
+/// the current object field once its key has been set via [`VariantBuilder::append_key`]). Object
+/// fields are sorted by key at [`VariantBuilder::end_object`] (canonical form) and the metadata
+/// dictionary accumulates keys in append order.
+///
+/// The output is byte-identical to [`Variant::parse_json`] of the equivalent JSON document.
+///
+/// ```
+/// # use schema_registry_client::serdes::variant::VariantBuilder;
+/// let mut b = VariantBuilder::new();
+/// b.start_object().unwrap();
+/// b.append_key("id").unwrap();
+/// b.append_long(42).unwrap();
+/// b.append_key("tags").unwrap();
+/// b.start_array().unwrap();
+/// b.append_string("x").unwrap();
+/// b.append_string("y").unwrap();
+/// b.end_array().unwrap();
+/// b.end_object().unwrap();
+/// let v = b.build().unwrap();
+/// assert_eq!(v.to_json().unwrap(), r#"{"id":42,"tags":["x","y"]}"#);
+/// ```
+pub struct VariantBuilder {
+    builder: Builder,
+    stack: Vec<BuilderFrame>,
+    root_written: bool,
+}
+
+impl Default for VariantBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VariantBuilder {
+    /// Create a new, empty builder.
+    pub fn new() -> Self {
+        VariantBuilder {
+            builder: Builder::default(),
+            stack: Vec::new(),
+            root_written: false,
+        }
+    }
+
+    /// Records the current write position in the enclosing container (if any) so the value about to
+    /// be written is addressable, and enforces the slot rules (a lone root value; a preceding
+    /// `append_key` inside an object). Must be called immediately before any value bytes are written.
+    fn prepare_slot(&mut self) -> Result<(), VariantError> {
+        let len = self.builder.value.len();
+        if self.stack.is_empty() {
+            if self.root_written {
+                return Err(VariantError::Json("builder already has a root value".to_string()));
+            }
+            self.root_written = true;
+            return Ok(());
+        }
+        match self.stack.last_mut().unwrap() {
+            BuilderFrame::Array { start, offsets } => offsets.push(len - *start),
+            BuilderFrame::Object { start, fields, pending } => {
+                let (key, id) = pending.take().ok_or_else(|| {
+                    VariantError::Json(
+                        "value appended to object without a preceding append_key".to_string(),
+                    )
+                })?;
+                fields.push(FieldEntry {
+                    key,
+                    id,
+                    offset: len - *start,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Append a null value to the current slot.
+    pub fn append_null(&mut self) -> Result<(), VariantError> {
+        self.prepare_slot()?;
+        self.builder.append_null();
+        Ok(())
+    }
+
+    /// Append a boolean value.
+    pub fn append_boolean(&mut self, v: bool) -> Result<(), VariantError> {
+        self.prepare_slot()?;
+        self.builder.append_boolean(v);
+        Ok(())
+    }
+
+    /// Append an INT8 value.
+    pub fn append_byte(&mut self, v: i8) -> Result<(), VariantError> {
+        self.prepare_slot()?;
+        self.builder.append_byte(v);
+        Ok(())
+    }
+
+    /// Append an INT16 value.
+    pub fn append_short(&mut self, v: i16) -> Result<(), VariantError> {
+        self.prepare_slot()?;
+        self.builder.append_short(v);
+        Ok(())
+    }
+
+    /// Append an INT32 value.
+    pub fn append_int(&mut self, v: i32) -> Result<(), VariantError> {
+        self.prepare_slot()?;
+        self.builder.append_int32(v);
+        Ok(())
+    }
+
+    /// Append an INT64 value.
+    pub fn append_long(&mut self, v: i64) -> Result<(), VariantError> {
+        self.prepare_slot()?;
+        self.builder.append_long(v);
+        Ok(())
+    }
+
+    /// Append a FLOAT (32-bit) value.
+    pub fn append_float(&mut self, v: f32) -> Result<(), VariantError> {
+        self.prepare_slot()?;
+        self.builder.append_float(v);
+        Ok(())
+    }
+
+    /// Append a DOUBLE (64-bit) value.
+    pub fn append_double(&mut self, v: f64) -> Result<(), VariantError> {
+        self.prepare_slot()?;
+        self.builder.append_double(v);
+        Ok(())
+    }
+
+    /// Append a decimal value from its unscaled integer (big-endian two's-complement bytes) and
+    /// scale. The width (Decimal4/8/16) is selected from the digit count and scale, matching
+    /// `parse_json`.
+    pub fn append_decimal(
+        &mut self,
+        unscaled_big_endian: &[u8],
+        scale: i32,
+    ) -> Result<(), VariantError> {
+        self.prepare_slot()?;
+        let n = BigInt::from_signed_bytes_be(unscaled_big_endian);
+        self.builder.append_decimal(&n, scale)
+    }
+
+    /// Append a string, auto-selecting the short-string (<=63 bytes) or long-string encoding.
+    pub fn append_string(&mut self, s: &str) -> Result<(), VariantError> {
+        self.prepare_slot()?;
+        self.builder.append_string(s);
+        Ok(())
+    }
+
+    /// Append a binary (byte-string) value.
+    pub fn append_binary(&mut self, data: &[u8]) -> Result<(), VariantError> {
+        self.prepare_slot()?;
+        self.builder.append_binary(data);
+        Ok(())
+    }
+
+    /// Append a UUID value (16 raw big-endian bytes).
+    pub fn append_uuid(&mut self, uuid: &[u8; 16]) -> Result<(), VariantError> {
+        self.prepare_slot()?;
+        self.builder.append_uuid(uuid);
+        Ok(())
+    }
+
+    /// Append a DATE value (days since the Unix epoch).
+    pub fn append_date(&mut self, days_since_epoch: i32) -> Result<(), VariantError> {
+        self.prepare_slot()?;
+        self.builder.append_temporal(T_DATE, 4, days_since_epoch as i64);
+        Ok(())
+    }
+
+    /// Append a TIME_NTZ value (microseconds since midnight).
+    pub fn append_time(&mut self, micros_since_midnight: i64) -> Result<(), VariantError> {
+        self.prepare_slot()?;
+        self.builder.append_temporal(T_TIME, 8, micros_since_midnight);
+        Ok(())
+    }
+
+    /// Append a TIMESTAMP (with time zone) value in microseconds.
+    pub fn append_timestamp_tz(&mut self, micros: i64) -> Result<(), VariantError> {
+        self.prepare_slot()?;
+        self.builder.append_temporal(T_TIMESTAMP, 8, micros);
+        Ok(())
+    }
+
+    /// Append a TIMESTAMP_NTZ value in microseconds.
+    pub fn append_timestamp_ntz(&mut self, micros: i64) -> Result<(), VariantError> {
+        self.prepare_slot()?;
+        self.builder.append_temporal(T_TIMESTAMP_NTZ, 8, micros);
+        Ok(())
+    }
+
+    /// Append a TIMESTAMP_NANOS (with time zone) value in nanoseconds.
+    pub fn append_timestamp_nanos_tz(&mut self, nanos: i64) -> Result<(), VariantError> {
+        self.prepare_slot()?;
+        self.builder.append_temporal(T_TIMESTAMP_NANOS, 8, nanos);
+        Ok(())
+    }
+
+    /// Append a TIMESTAMP_NANOS_NTZ value in nanoseconds.
+    pub fn append_timestamp_nanos_ntz(&mut self, nanos: i64) -> Result<(), VariantError> {
+        self.prepare_slot()?;
+        self.builder.append_temporal(T_TIMESTAMP_NANOS_NTZ, 8, nanos);
+        Ok(())
+    }
+
+    /// Open a new object. Subsequent `append_key`/value pairs populate it until the matching
+    /// `end_object`.
+    pub fn start_object(&mut self) -> Result<(), VariantError> {
+        self.prepare_slot()?;
+        let start = self.builder.value.len();
+        self.stack.push(BuilderFrame::Object {
+            start,
+            fields: Vec::new(),
+            pending: None,
+        });
+        Ok(())
+    }
+
+    /// Set the key for the next appended value. Valid only directly inside an object and only once
+    /// per value.
+    pub fn append_key(&mut self, key: &str) -> Result<(), VariantError> {
+        match self.stack.last() {
+            Some(BuilderFrame::Object { pending, .. }) => {
+                if pending.is_some() {
+                    return Err(VariantError::Json(
+                        "append_key called twice without an intervening value".to_string(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(VariantError::Json("append_key called outside an object".to_string()));
+            }
+        }
+        let id = self.builder.add_key(key);
+        if let Some(BuilderFrame::Object { pending, .. }) = self.stack.last_mut() {
+            *pending = Some((key.to_string(), id));
+        }
+        Ok(())
+    }
+
+    /// Close the current object, sorting its fields by key.
+    pub fn end_object(&mut self) -> Result<(), VariantError> {
+        match self.stack.last() {
+            Some(BuilderFrame::Object { pending, .. }) => {
+                if pending.is_some() {
+                    return Err(VariantError::Json(
+                        "end_object called with a pending key and no value".to_string(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(VariantError::Json(
+                    "end_object called without a matching start_object".to_string(),
+                ));
+            }
+        }
+        if let Some(BuilderFrame::Object { start, fields, .. }) = self.stack.pop() {
+            self.builder.finish_writing_object(start, fields);
+        }
+        Ok(())
+    }
+
+    /// Open a new array. Subsequent value appends become its elements until the matching `end_array`.
+    pub fn start_array(&mut self) -> Result<(), VariantError> {
+        self.prepare_slot()?;
+        let start = self.builder.value.len();
+        self.stack.push(BuilderFrame::Array {
+            start,
+            offsets: Vec::new(),
+        });
+        Ok(())
+    }
+
+    /// Close the current array.
+    pub fn end_array(&mut self) -> Result<(), VariantError> {
+        match self.stack.last() {
+            Some(BuilderFrame::Array { .. }) => {}
+            _ => {
+                return Err(VariantError::Json(
+                    "end_array called without a matching start_array".to_string(),
+                ));
+            }
+        }
+        if let Some(BuilderFrame::Array { start, offsets }) = self.stack.pop() {
+            self.builder.finish_writing_array(start, &offsets);
+        }
+        Ok(())
+    }
+
+    /// Finalize the builder and return the constructed [`Variant`]. Errors if a container is still
+    /// open or no value has been appended.
+    pub fn build(self) -> Result<Variant, VariantError> {
+        if !self.stack.is_empty() {
+            return Err(VariantError::Json("build called with an open container".to_string()));
+        }
+        if !self.root_written {
+            return Err(VariantError::Json("build called with no value appended".to_string()));
+        }
+        let (value, metadata) = self.builder.finish();
+        Ok(Variant::new(value, metadata))
+    }
 }
 
 fn integer_size(v: usize) -> usize {
@@ -1419,6 +1828,75 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     #[test]
+    fn builder_nested_matches_parse_json() {
+        // Build a nested document with the flat streaming API. The int widths are chosen so each
+        // value's encoding matches parse_json of the equivalent JSON.
+        let mut b = VariantBuilder::new();
+        b.start_object().unwrap();
+        b.append_key("id").unwrap();
+        b.append_long(10_000_000_000).unwrap(); // INT64 == "10000000000"
+        b.append_key("count").unwrap();
+        b.append_int(100_000).unwrap(); // INT32 == "100000"
+        b.append_key("tags").unwrap();
+        b.start_array().unwrap();
+        b.append_string("x").unwrap();
+        b.append_string("y").unwrap();
+        b.end_array().unwrap();
+        b.append_key("nested").unwrap();
+        b.start_object().unwrap();
+        b.append_key("flag").unwrap();
+        b.append_boolean(true).unwrap();
+        b.append_key("pi").unwrap();
+        b.append_double(3.14).unwrap();
+        b.end_object().unwrap();
+        b.end_object().unwrap();
+        let built = b.build().unwrap();
+
+        // Key order is chosen so both the builder (append order) and parse_json (document order)
+        // assign the same metadata dictionary IDs.
+        let equivalent =
+            r#"{"id":10000000000,"count":100000,"tags":["x","y"],"nested":{"flag":true,"pi":3.14}}"#;
+        let parsed = Variant::parse_json(equivalent).unwrap();
+
+        assert_eq!(built.to_json().unwrap(), parsed.to_json().unwrap());
+        assert_eq!(built.value_bytes(), parsed.value_bytes(), "value bytes differ");
+        assert_eq!(
+            built.metadata_bytes(),
+            parsed.metadata_bytes(),
+            "metadata bytes differ"
+        );
+    }
+
+    #[test]
+    fn builder_root_scalar() {
+        let mut b = VariantBuilder::new();
+        b.append_byte(42).unwrap();
+        let built = b.build().unwrap();
+        let parsed = Variant::parse_json("42").unwrap();
+        assert_eq!(built.value_bytes(), parsed.value_bytes());
+        assert_eq!(built.get_byte().unwrap(), 42);
+    }
+
+    #[test]
+    fn builder_errors() {
+        // append_key outside an object.
+        assert!(VariantBuilder::new().append_key("k").is_err());
+
+        // Value appended to an object without a preceding append_key.
+        let mut b = VariantBuilder::new();
+        b.start_object().unwrap();
+        assert!(b.append_long(1).is_err());
+
+        // build with an open container.
+        let mut b2 = VariantBuilder::new();
+        b2.start_array().unwrap();
+        assert!(b2.build().is_err());
+
+        // build with nothing appended.
+        assert!(VariantBuilder::new().build().is_err());
+    }
+
+    #[test]
     fn parse_json_round_trip_object_array_scalars_null() {
         for json in [
             "{\"x\":1}",
@@ -1524,7 +2002,7 @@ mod tests {
     #[test]
     fn navigation_field_and_element() {
         let v = Variant::parse_json("{\"a\":10,\"b\":[100,200,300]}").unwrap();
-        assert_eq!(v.num_object_elements(), 2);
+        assert_eq!(v.num_object_fields(), 2);
         let a = v.get_field_by_key("a").unwrap();
         assert_eq!(a.get_long().unwrap(), 10);
         let b = v.get_field_by_key("b").unwrap();
@@ -1612,9 +2090,57 @@ mod tests {
         let u = Variant::new(uv, metadata);
         assert_eq!(u.get_type(), Type::Uuid);
         assert_eq!(
-            u.get_uuid_string().unwrap(),
+            u.get_uuid().unwrap(),
             "00112233-4455-6677-8899-aabbccddeeff"
         );
+    }
+
+    fn float_variant(f: f32) -> Variant {
+        let mut value = vec![primitive_header(T_FLOAT)];
+        value.extend_from_slice(&f.to_le_bytes());
+        Variant::new(value, vec![VERSION, 0x00, 0x00])
+    }
+
+    fn double_variant(d: f64) -> Variant {
+        let mut value = vec![primitive_header(T_DOUBLE)];
+        value.extend_from_slice(&d.to_le_bytes());
+        Variant::new(value, vec![VERSION, 0x00, 0x00])
+    }
+
+    #[test]
+    fn int_getters_width_and_widening() {
+        // get_byte: INT8 only.
+        assert_eq!(Variant::parse_json("1").unwrap().get_byte().unwrap(), 1);
+        assert!(Variant::parse_json("300").unwrap().get_byte().is_err());
+        // get_short: <=INT16, widens.
+        assert_eq!(Variant::parse_json("1").unwrap().get_short().unwrap(), 1);
+        assert_eq!(Variant::parse_json("300").unwrap().get_short().unwrap(), 300);
+        assert!(Variant::parse_json("100000").unwrap().get_short().is_err());
+        // get_int: <=INT32, widens.
+        assert_eq!(Variant::parse_json("1").unwrap().get_int().unwrap(), 1);
+        assert_eq!(Variant::parse_json("300").unwrap().get_int().unwrap(), 300);
+        assert_eq!(Variant::parse_json("100000").unwrap().get_int().unwrap(), 100000);
+        assert!(Variant::parse_json("10000000000").unwrap().get_int().is_err());
+        // get_long: widens any int width.
+        assert_eq!(
+            Variant::parse_json("10000000000").unwrap().get_long().unwrap(),
+            10_000_000_000
+        );
+    }
+
+    #[test]
+    fn float_and_double_are_exact() {
+        // get_float accepts FLOAT exactly.
+        assert_eq!(float_variant(1.5).get_float().unwrap(), 1.5f32);
+        // get_float rejects DOUBLE.
+        assert!(double_variant(1.5).get_float().is_err());
+        // get_double accepts DOUBLE exactly.
+        assert_eq!(double_variant(3.5).get_double().unwrap(), 3.5f64);
+        // get_double rejects FLOAT (no longer widens).
+        assert!(float_variant(1.5).get_double().is_err());
+        // A FLOAT renders through get_float in to_json.
+        assert_eq!(float_variant(1.5).get_type(), Type::Float);
+        assert_eq!(float_variant(1.5).to_json().unwrap(), "1.5");
     }
 
     fn variant_avro_schema() -> apache_avro::Schema {
