@@ -1414,8 +1414,10 @@ fn integer_size(v: usize) -> usize {
         1
     } else if v <= 0xFFFF {
         2
-    } else {
+    } else if v <= 0xFFFFFF {
         3
+    } else {
+        4
     }
 }
 
@@ -1894,6 +1896,28 @@ mod tests {
 
         // build with nothing appended.
         assert!(VariantBuilder::new().build().is_err());
+    }
+
+    #[test]
+    fn large_data_region_uses_4_byte_offsets() {
+        // Regression test for Bug #1: `integer_size` capped at 3 bytes and never returned 4, so a
+        // container whose data/offset region exceeds 0xFFFFFF (16777215) bytes produced a corrupt
+        // Variant. Build an array holding a single string of 16777216 bytes so the data region
+        // exceeds 16 MiB, forcing the 4-byte offset-size path, then verify it round-trips.
+        const SIZE: usize = 16_777_216; // 0x1000000, one byte past the 3-byte offset limit
+        let big = "a".repeat(SIZE);
+
+        let mut b = VariantBuilder::new();
+        b.start_array().unwrap();
+        b.append_string(&big).unwrap();
+        b.end_array().unwrap();
+        let built = b.build().unwrap();
+
+        assert_eq!(built.get_type(), Type::Array);
+        assert_eq!(built.num_array_elements(), 1);
+        let el = built.get_element_at_index(0).unwrap();
+        assert_eq!(el.get_type(), Type::String);
+        assert_eq!(el.get_string().unwrap().len(), SIZE);
     }
 
     #[test]
