@@ -586,7 +586,7 @@ impl Variant {
             Type::Byte | Type::Short | Type::Int | Type::Long => {
                 out.push_str(&self.get_long()?.to_string());
             }
-            Type::Float => out.push_str(&format_double(self.get_float()? as f64)?),
+            Type::Float => out.push_str(&format_float(self.get_float()?)?),
             Type::Double => out.push_str(&format_double(self.get_double()?)?),
             Type::Decimal4 | Type::Decimal8 | Type::Decimal16 => {
                 out.push_str(&self.get_decimal_string()?);
@@ -840,6 +840,21 @@ fn format_double(d: f64) -> Result<String, VariantError> {
     Ok(format!("{d}"))
 }
 
+/// Mirrors `format_double` but formats an `f32` directly so that 32-bit floats render with their
+/// shortest round-tripping decimal (matching Java's `Float.toString` and Apache Arrow) rather than
+/// the f64-widened form. Rust's `Display` on an `f32` yields the shortest float32 decimal.
+fn format_float(f: f32) -> Result<String, VariantError> {
+    if !f.is_finite() {
+        return Err(VariantError::Malformed(
+            "cannot render non-finite float as JSON".to_string(),
+        ));
+    }
+    if f == f.floor() && f.abs() < 1e16 {
+        return Ok(format!("{}.0", f as i64));
+    }
+    Ok(format!("{f}"))
+}
+
 fn format_uuid(data: &[u8], start: usize) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(36);
@@ -882,6 +897,7 @@ fn decimal_plain_string(unscaled: &BigInt, scale: i32) -> String {
 
 // --- builder (JSON -> value + metadata bytes) ---
 
+#[derive(Clone)]
 struct FieldEntry {
     key: String,
     id: usize,
@@ -1033,11 +1049,69 @@ impl Builder {
         self.value.splice(start..start, header);
     }
 
+    /// Remove duplicate keys with last-wins semantics. Must be called AFTER `fields` is sorted by
+    /// key (so duplicate keys are adjacent) and BEFORE data_size/max_id/header are computed. Values
+    /// are laid out contiguously in `self.value` in insertion order; each `FieldEntry.offset` is the
+    /// byte position (relative to `start`) where that field's value begins. A field's value length is
+    /// `next-inserted-offset - this-offset` (the last one runs to the end of the data region). When
+    /// duplicates are found, the retained values are compacted leftward, offsets recomputed, the
+    /// value buffer truncated, and key order restored. Ported from the Go sibling client.
+    fn dedup_object_fields(&mut self, start: usize, mut fields: Vec<FieldEntry>) -> Vec<FieldEntry> {
+        let n = fields.len();
+        if n <= 1 {
+            return fields;
+        }
+        let data_size = self.value.len() - start;
+        // Length of each value keyed by its (unique) offset: gap to the next-inserted offset.
+        let mut offsets: Vec<usize> = fields.iter().map(|f| f.offset).collect();
+        offsets.sort_unstable();
+        let mut len_at: HashMap<usize, usize> = HashMap::with_capacity(n);
+        for i in 0..n {
+            let end = if i + 1 < n { offsets[i + 1] } else { data_size };
+            len_at.insert(offsets[i], end - offsets[i]);
+        }
+        // Collapse adjacent equal ids, keeping the entry with the greater offset (the last write).
+        let mut distinct_pos = 0usize;
+        for i in 1..n {
+            if fields[i].id == fields[distinct_pos].id {
+                if fields[distinct_pos].offset < fields[i].offset {
+                    fields[distinct_pos] = fields[i].clone();
+                }
+            } else {
+                distinct_pos += 1;
+                fields[distinct_pos] = fields[i].clone();
+            }
+        }
+        if distinct_pos + 1 == n {
+            return fields; // no duplicates
+        }
+        fields.truncate(distinct_pos + 1);
+        // Compact retained values leftward in insertion order, recompute offsets, truncate buffer.
+        fields.sort_by_key(|f| f.offset);
+        let mut curr = 0usize;
+        for f in &mut fields {
+            let o = f.offset;
+            let l = len_at[&o];
+            if curr != o {
+                // copy_within is memmove-safe for overlapping ranges.
+                self.value.copy_within(start + o..start + o + l, start + curr);
+            }
+            f.offset = curr;
+            curr += l;
+        }
+        self.value.truncate(start + curr);
+        // Restore key order (UTF-8 byte order; String::cmp is byte-wise).
+        fields.sort_by(|a, b| a.key.cmp(&b.key));
+        fields
+    }
+
     fn finish_writing_object(&mut self, start: usize, mut fields: Vec<FieldEntry>) {
-        let num_fields = fields.len();
         // Sort by key using ordinal byte order (Rust `str` Ord compares by bytes = code-point
         // order), matching Go/C++.
         fields.sort_by(|a, b| a.key.cmp(&b.key));
+        // Last-wins deduplication of duplicate keys (must run after the key sort, before sizing).
+        let mut fields = self.dedup_object_fields(start, fields);
+        let num_fields = fields.len();
         let max_id = fields.iter().map(|f| f.id).max().unwrap_or(0);
         let data_size = self.value.len() - start;
         let large_size = num_fields > 0xFF;
@@ -1958,6 +2032,26 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_keys_last_wins() {
+        // Regression: parse_json must deduplicate duplicate object keys with last-wins semantics
+        // (a spec violation otherwise). Here "a" appears twice with different-sized values, which
+        // exercises the leftward value repacking path.
+        let v = Variant::parse_json(r#"{"b":1,"a":"x","a":"second-longer-value","c":3}"#).unwrap();
+        assert_eq!(v.num_object_fields(), 3);
+        assert_eq!(
+            v.get_field_by_key("a").unwrap().get_string().unwrap(),
+            "second-longer-value"
+        );
+        assert_eq!(v.get_field_by_key("b").unwrap().get_long().unwrap(), 1);
+        assert_eq!(v.get_field_by_key("c").unwrap().get_long().unwrap(), 3);
+
+        // Same-size duplicate: last value still wins.
+        let v2 = Variant::parse_json(r#"{"a":1,"a":2}"#).unwrap();
+        assert_eq!(v2.num_object_fields(), 1);
+        assert_eq!(v2.get_field_by_key("a").unwrap().get_long().unwrap(), 2);
+    }
+
+    #[test]
     fn get_type_per_type() {
         assert_eq!(Variant::parse_json("{}").unwrap().get_type(), Type::Object);
         assert_eq!(Variant::parse_json("[]").unwrap().get_type(), Type::Array);
@@ -2165,6 +2259,17 @@ mod tests {
         // A FLOAT renders through get_float in to_json.
         assert_eq!(float_variant(1.5).get_type(), Type::Float);
         assert_eq!(float_variant(1.5).to_json().unwrap(), "1.5");
+    }
+
+    #[test]
+    fn float_to_json_uses_shortest_float32() {
+        // FLOAT values must render with the shortest float32 decimal (matching Java
+        // Float.toString / Apache Arrow), not the f64-widened form: 0.1f must not
+        // become "0.10000000149011612".
+        assert_eq!(float_variant(0.1).to_json().unwrap(), "0.1");
+        assert_eq!(float_variant(0.3).to_json().unwrap(), "0.3");
+        // Integer-valued floats keep the ".0" suffix.
+        assert_eq!(float_variant(2.0).to_json().unwrap(), "2.0");
     }
 
     fn variant_avro_schema() -> apache_avro::Schema {
