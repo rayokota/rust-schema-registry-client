@@ -58,54 +58,57 @@ pub fn walk(root: &Variant, path: &str) -> Result<Option<Variant>, String> {
 }
 
 fn parse(path: &str) -> Result<Vec<Segment>, String> {
-    let bytes = path.as_bytes();
-    if bytes.is_empty() {
+    // Iterate over Unicode scalar values (chars), not bytes, so that non-ASCII
+    // identifier keys like `$.café` / `$.über` / CJK resolve. Java's readIdent uses
+    // Character.isLetter / isLetterOrDigit (Unicode-aware); Rust's char::is_alphabetic /
+    // char::is_alphanumeric closely match those.
+    let chars: Vec<char> = path.chars().collect();
+    if chars.is_empty() {
         return Err("variant path must start with '$'".to_string());
     }
-    if bytes[0] != b'$' {
+    if chars[0] != '$' {
         return Err(format!("variant path must start with '$', got: {path}"));
     }
     let mut out = Vec::new();
     let mut pos = 1usize;
-    while pos < bytes.len() {
-        match bytes[pos] {
-            b'.' => {
+    while pos < chars.len() {
+        match chars[pos] {
+            '.' => {
                 pos += 1;
-                if pos >= bytes.len() || !is_ident_start(bytes[pos]) {
+                if pos >= chars.len() || !is_ident_start(chars[pos]) {
                     return Err(format!(
                         "expected identifier (starting with a letter or '_') after '.' in variant path: {path}"
                     ));
                 }
                 let start = pos;
                 pos += 1;
-                while pos < bytes.len() && is_ident_part(bytes[pos]) {
+                while pos < chars.len() && is_ident_part(chars[pos]) {
                     pos += 1;
                 }
-                out.push(Segment::Field(path[start..pos].to_string()));
+                out.push(Segment::Field(chars[start..pos].iter().collect()));
             }
-            b'[' => {
+            '[' => {
                 pos += 1;
-                if pos >= bytes.len() {
+                if pos >= chars.len() {
                     return Err(format!("unexpected end of input after '[' in variant path: {path}"));
                 }
-                if bytes[pos] == b'"' || bytes[pos] == b'\'' {
-                    let (key, next) = read_quoted_key(path, bytes, pos)?;
+                if chars[pos] == '"' || chars[pos] == '\'' {
+                    let (key, next) = read_quoted_key(path, &chars, pos)?;
                     pos = next;
                     out.push(Segment::Field(key));
                 } else {
-                    let (idx, next) = read_index(path, bytes, pos)?;
+                    let (idx, next) = read_index(path, &chars, pos)?;
                     pos = next;
                     out.push(Segment::Index(idx));
                 }
-                if pos >= bytes.len() || bytes[pos] != b']' {
+                if pos >= chars.len() || chars[pos] != ']' {
                     return Err(format!("expected ']' in variant path: {path}"));
                 }
                 pos += 1;
             }
             other => {
                 return Err(format!(
-                    "unexpected character '{}' in variant path: {path}",
-                    other as char
+                    "unexpected character '{other}' in variant path: {path}"
                 ));
             }
         }
@@ -113,21 +116,21 @@ fn parse(path: &str) -> Result<Vec<Segment>, String> {
     Ok(out)
 }
 
-fn read_quoted_key(path: &str, bytes: &[u8], mut pos: usize) -> Result<(String, usize), String> {
-    let quote = bytes[pos];
+fn read_quoted_key(path: &str, chars: &[char], mut pos: usize) -> Result<(String, usize), String> {
+    let quote = chars[pos];
     pos += 1;
     let mut key = String::new();
-    while pos < bytes.len() {
-        let c = bytes[pos];
+    while pos < chars.len() {
+        let c = chars[pos];
         pos += 1;
-        if c == b'\\' {
-            if pos >= bytes.len() {
+        if c == '\\' {
+            if pos >= chars.len() {
                 return Err(format!("unterminated escape at end of quoted key in variant path: {path}"));
             }
-            let esc = bytes[pos];
+            let esc = chars[pos];
             pos += 1;
-            if esc == b'\\' || esc == quote {
-                key.push(esc as char);
+            if esc == '\\' || esc == quote {
+                key.push(esc);
             } else {
                 return Err(format!(
                     "unsupported escape in quoted key of variant path (only '\\\\' and backslash+quote are allowed): {path}"
@@ -136,43 +139,80 @@ fn read_quoted_key(path: &str, bytes: &[u8], mut pos: usize) -> Result<(String, 
         } else if c == quote {
             return Ok((key, pos));
         } else {
-            // Preserve multi-byte UTF-8: fall back to the source slice for non-ASCII.
-            if c < 0x80 {
-                key.push(c as char);
-            } else {
-                // Copy the full UTF-8 code point from the source string.
-                let ch_start = pos - 1;
-                let s = &path[ch_start..];
-                let ch = s.chars().next().unwrap();
-                key.push(ch);
-                pos = ch_start + ch.len_utf8();
-            }
+            key.push(c);
         }
     }
     Err(format!("unterminated quoted key in variant path: {path}"))
 }
 
-fn read_index(path: &str, bytes: &[u8], mut pos: usize) -> Result<(usize, usize), String> {
-    if bytes[pos] == b'-' {
+fn read_index(path: &str, chars: &[char], mut pos: usize) -> Result<(usize, usize), String> {
+    if chars[pos] == '-' {
         return Err(format!("negative indices are not supported in variant path: {path}"));
     }
     let start = pos;
-    while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+    // Indices are ASCII digits only (Java parses via Integer.parseInt); non-ASCII digits
+    // are intentionally not accepted here.
+    while pos < chars.len() && chars[pos].is_ascii_digit() {
         pos += 1;
     }
     if pos == start {
         return Err(format!("expected integer index in variant path: {path}"));
     }
-    match path[start..pos].parse::<i64>() {
+    let digits: String = chars[start..pos].iter().collect();
+    match digits.parse::<i64>() {
         Ok(n) if n >= 0 && n <= i32::MAX as i64 => Ok((n as usize, pos)),
         _ => Err(format!("index out of int range in variant path: {path}")),
     }
 }
 
-fn is_ident_start(b: u8) -> bool {
-    b.is_ascii_alphabetic() || b == b'_'
+fn is_ident_start(c: char) -> bool {
+    c.is_alphabetic() || c == '_'
 }
 
-fn is_ident_part(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
+fn is_ident_part(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serdes::variant::Variant;
+
+    fn resolved_long(root: &Variant, path: &str) -> i64 {
+        walk(root, path)
+            .unwrap_or_else(|e| panic!("path {path} errored: {e}"))
+            .unwrap_or_else(|| panic!("path {path} did not resolve"))
+            .get_long()
+            .unwrap()
+    }
+
+    // Regression: dotted identifiers were ASCII-only (is_ascii_alphabetic/alphanumeric on bytes),
+    // so `$.café` was a parse/CEL error. The scanner now iterates over Unicode scalar values and
+    // uses char::is_alphabetic / char::is_alphanumeric (matching Java's isLetter/isLetterOrDigit).
+    #[test]
+    fn dotted_non_ascii_identifier_resolves() {
+        let v = Variant::parse_json(r#"{"café": 1, "über": 2, "名前": 3}"#).unwrap();
+        assert_eq!(resolved_long(&v, "$.café"), 1);
+        assert_eq!(resolved_long(&v, "$.über"), 2);
+        assert_eq!(resolved_long(&v, "$.名前"), 3);
+    }
+
+    #[test]
+    fn ascii_and_quoted_forms_still_work() {
+        let v = Variant::parse_json(r#"{"café": 1, "foo": 2, "a1_b": 3}"#).unwrap();
+        // ASCII dotted.
+        assert_eq!(resolved_long(&v, "$.foo"), 2);
+        assert_eq!(resolved_long(&v, "$.a1_b"), 3);
+        // Quoted key with non-ASCII (both quote styles).
+        assert_eq!(resolved_long(&v, r#"$["café"]"#), 1);
+        assert_eq!(resolved_long(&v, "$['café']"), 1);
+    }
+
+    #[test]
+    fn indices_remain_ascii_digits() {
+        let v = Variant::parse_json(r#"{"xs": [10, 20, 30]}"#).unwrap();
+        assert_eq!(resolved_long(&v, "$.xs[1]"), 20);
+        // A digit-leading ident after '.' is still rejected.
+        assert!(walk(&v, "$.1abc").is_err());
+    }
 }

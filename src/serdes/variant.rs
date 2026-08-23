@@ -598,12 +598,12 @@ impl Variant {
             }
             Type::TimestampTz => {
                 out.push('"');
-                out.push_str(&format_instant(self.get_long()? * 1000));
+                out.push_str(&format_instant_micros(self.get_long()?));
                 out.push('"');
             }
             Type::TimestampNtz => {
                 out.push('"');
-                out.push_str(&format_local_date_time(self.get_long()? * 1000));
+                out.push_str(&format_local_date_time_micros(self.get_long()?));
                 out.push('"');
             }
             Type::TimestampNanosTz => {
@@ -774,9 +774,34 @@ fn frac(nano: i64) -> String {
     }
 }
 
+// Splits micros into (epoch_second, nano_of_second) BEFORE any scaling, mirroring Java's
+// formatLocalDateTimeMicros. Multiplying the full micros value by 1000 to obtain nanos would
+// overflow i64 outside ~year [1678, 2262]; splitting first keeps the full i64 range valid.
+fn micros_to_secs_nanos(micros: i64) -> (i64, i64) {
+    (
+        floor_div(micros, 1_000_000),
+        floor_mod(micros, 1_000_000) * 1000,
+    )
+}
+
+fn nanos_to_secs_nanos(total_nanos: i64) -> (i64, i64) {
+    (
+        floor_div(total_nanos, 1_000_000_000),
+        floor_mod(total_nanos, 1_000_000_000),
+    )
+}
+
 fn format_instant(total_nanos: i64) -> String {
-    let sec = floor_div(total_nanos, 1_000_000_000);
-    let nano = floor_mod(total_nanos, 1_000_000_000);
+    let (sec, nano) = nanos_to_secs_nanos(total_nanos);
+    format_instant_parts(sec, nano)
+}
+
+fn format_instant_micros(micros: i64) -> String {
+    let (sec, nano) = micros_to_secs_nanos(micros);
+    format_instant_parts(sec, nano)
+}
+
+fn format_instant_parts(sec: i64, nano: i64) -> String {
     let days = floor_div(sec, 86400);
     let sod = floor_mod(sec, 86400);
     let (y, mo, da) = civil_from_days(days);
@@ -793,8 +818,16 @@ fn format_instant(total_nanos: i64) -> String {
 }
 
 fn format_local_date_time(total_nanos: i64) -> String {
-    let sec = floor_div(total_nanos, 1_000_000_000);
-    let nano = floor_mod(total_nanos, 1_000_000_000);
+    let (sec, nano) = nanos_to_secs_nanos(total_nanos);
+    format_local_date_time_parts(sec, nano)
+}
+
+fn format_local_date_time_micros(micros: i64) -> String {
+    let (sec, nano) = micros_to_secs_nanos(micros);
+    format_local_date_time_parts(sec, nano)
+}
+
+fn format_local_date_time_parts(sec: i64, nano: i64) -> String {
     let days = floor_div(sec, 86400);
     let sod = floor_mod(sec, 86400);
     let (y, mo, da) = civil_from_days(days);
@@ -2521,5 +2554,61 @@ mod tests {
         let recovered: Holder = apache_avro::from_value(&decoded).unwrap();
 
         assert_eq!(recovered.data.to_json().unwrap(), v.to_json().unwrap());
+    }
+
+    // Regression: TIMESTAMP_NTZ/TZ to_json previously multiplied the full micros value by 1000,
+    // overflowing i64 outside ~year [1678, 2262] (debug: panic; release: wrong string). The fix
+    // splits micros into seconds + sub-second micros before scaling (mirroring Java's
+    // formatLocalDateTimeMicros), so the full i64 range renders correctly.
+    #[test]
+    fn timestamp_ntz_far_future_no_overflow() {
+        // 3000-01-01T00:00:00 UTC. micros * 1000 = 3.25e19, which overflows i64 (~9.2e18).
+        let micros = 32_503_680_000_000_000i64;
+        let mut b = VariantBuilder::new();
+        b.append_timestamp_ntz(micros).unwrap();
+        let v = b.build().unwrap();
+        assert_eq!(v.to_json().unwrap(), "\"3000-01-01T00:00:00\"");
+
+        // Same instant with sub-second micros.
+        let mut b = VariantBuilder::new();
+        b.append_timestamp_ntz(micros + 123_456).unwrap();
+        let v = b.build().unwrap();
+        assert_eq!(v.to_json().unwrap(), "\"3000-01-01T00:00:00.123456\"");
+    }
+
+    #[test]
+    fn timestamp_tz_far_future_no_overflow() {
+        let micros = 32_503_680_000_000_000i64;
+        let mut b = VariantBuilder::new();
+        b.append_timestamp_tz(micros).unwrap();
+        let v = b.build().unwrap();
+        assert_eq!(v.to_json().unwrap(), "\"3000-01-01T00:00:00Z\"");
+
+        let mut b = VariantBuilder::new();
+        b.append_timestamp_tz(micros + 123_456).unwrap();
+        let v = b.build().unwrap();
+        assert_eq!(v.to_json().unwrap(), "\"3000-01-01T00:00:00.123456Z\"");
+    }
+
+    #[test]
+    fn timestamp_normal_range_unchanged() {
+        // 2021-01-01T00:00:00Z = 1609459200 s.
+        let micros = 1_609_459_200_000_000i64;
+        let mut b = VariantBuilder::new();
+        b.append_timestamp_ntz(micros).unwrap();
+        assert_eq!(b.build().unwrap().to_json().unwrap(), "\"2021-01-01T00:00:00\"");
+
+        let mut b = VariantBuilder::new();
+        b.append_timestamp_tz(micros).unwrap();
+        assert_eq!(b.build().unwrap().to_json().unwrap(), "\"2021-01-01T00:00:00Z\"");
+
+        // Pre-epoch (negative micros) must use floor division, not truncation.
+        // 1969-12-31T23:59:59.500Z = -500000 micros (frac uses 3/6/9-digit grouping).
+        let mut b = VariantBuilder::new();
+        b.append_timestamp_ntz(-500_000).unwrap();
+        assert_eq!(
+            b.build().unwrap().to_json().unwrap(),
+            "\"1969-12-31T23:59:59.500\""
+        );
     }
 }
