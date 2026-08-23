@@ -136,7 +136,7 @@ impl CelExecutor {
         prog = self.cache.get(expr);
         let prog = prog.ok_or(SerdeError::Rule("failed to compile program".to_string()))?;
         let mut context = default_context();
-        // `now` is available to every rule, so a condition like `timestamp.of(this.ts) < now`
+        // `now` is available to every rule, so a condition like `timestamp(this.ts) < now`
         // resolves. It is read fresh per evaluation, matching the other clients.
         context.add_variable_from_value("now", Value::Timestamp(Utc::now().into()));
         for (k, v) in args {

@@ -1905,10 +1905,10 @@ mod tests {
     #[tokio::test]
     async fn test_cel_field_timestamp_value() {
         // The field rule's `value` binding must be a self-describing timestamp, so the 1-arg
-        // `timestamp.of(value)` works (no unit literal).
+        // `timestamp(value)` works (no unit literal).
         let r = serialize_with_cel_field_condition(
             TS_SCHEMA,
-            "name == 'tsField' ; timestamp.of(value) < now",
+            "name == 'tsField' ; timestamp(value) < now",
             vec![("tsField".to_string(), Value::TimestampMillis(1000))],
         )
         .await;
@@ -1935,7 +1935,7 @@ mod tests {
             r#type: "CEL_FIELD".to_string(),
             tags: None,
             params: None,
-            expr: Some("name == 'tsField' ; timestamp.of(value)".to_string()),
+            expr: Some("name == 'tsField' ; timestamp(value)".to_string()),
             on_success: None,
             on_failure: None,
             disabled: None,
@@ -1987,6 +1987,37 @@ mod tests {
         } else {
             unreachable!();
         }
+    }
+
+    /// Cross-client parity: an Avro `decimal` logical type is usable as a Decimal with **no
+    /// `decimal(...)` call**, and the wrapped form keeps working alongside it. The boundary
+    /// applies the schema's scale and produces a `Value::Opaque(CelDecimal)`, which is this
+    /// client's in-CEL decimal representation, so `decimals.*` accept it directly.
+    #[tokio::test]
+    async fn test_cel_decimal_needs_no_constructor() {
+        for expr in [
+            // Bare: no constructor call on the field.
+            "decimals.eq(message.decField, decimal(\"12.34\"))",
+            "decimals.gt(message.decField, decimal(\"10.00\"))",
+            // The wrapped form must keep working (decimal(...) re-entry).
+            "decimals.eq(decimal(message.decField), decimal(\"12.34\"))",
+            // `==` is numeric on it: 12.34 equals 12.340 despite the differing scale.
+            "message.decField == decimal(\"12.340\")",
+            // The schema's scale is applied, not guessed: as scale 0 this would be 1234.
+            "decimals.lt(message.decField, decimal(\"100\"))",
+        ] {
+            let r =
+                serialize_with_cel_condition(DECIMAL_SCHEMA, expr, decimal_field_12_34()).await;
+            assert!(r.is_ok(), "{expr}: {r:?}");
+        }
+        // Negative control: a false comparison must fail.
+        let r = serialize_with_cel_condition(
+            DECIMAL_SCHEMA,
+            "decimals.gt(message.decField, decimal(\"100\"))",
+            decimal_field_12_34(),
+        )
+        .await;
+        assert!(r.is_err());
     }
 
     #[tokio::test]
@@ -2174,7 +2205,7 @@ mod tests {
         // A 1970 timestamp is before now.
         let r = serialize_with_cel_condition(
             schema_str,
-            "timestamp.of(message.tsField) < now",
+            "timestamp(message.tsField) < now",
             vec![("tsField".to_string(), Value::TimestampMillis(1000))],
         )
         .await;
@@ -2194,11 +2225,68 @@ mod tests {
         "#;
         let r = serialize_with_cel_condition(
             schema_str,
-            "timestamp.of(message.tsField) > now",
+            "timestamp(message.tsField) > now",
             vec![("tsField".to_string(), Value::TimestampMillis(1000))],
         )
         .await;
         assert!(r.is_err());
+    }
+
+    /// Cross-client parity: an Avro timestamp logical type is usable as a timestamp with **no
+    /// constructor call at all**. The boundary converts it to `Value::Timestamp`, so it is
+    /// comparable against `now` and carries the timestamp accessors. Every one of the seven
+    /// clients has this test; the constructor is only needed for a plain numeric field whose
+    /// unit the schema cannot supply.
+    #[tokio::test]
+    async fn test_cel_timestamp_millis_needs_no_constructor() {
+        let schema_str = r#"
+        {
+            "type": "record",
+            "name": "test",
+            "fields": [
+                {"name": "tsField", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+            ]
+        }
+        "#;
+        // Bare comparison against `now`, and the negative control that proves it compares.
+        let past = vec![("tsField".to_string(), Value::TimestampMillis(1000))];
+        assert!(
+            serialize_with_cel_condition(schema_str, "message.tsField < now", past)
+                .await
+                .is_ok()
+        );
+        let future = vec![(
+            "tsField".to_string(),
+            Value::TimestampMillis(4_102_444_800_000),
+        )];
+        assert!(
+            serialize_with_cel_condition(schema_str, "message.tsField < now", future)
+                .await
+                .is_err()
+        );
+        // The schema's millis unit is applied, not guessed, and the accessors work directly.
+        let exact = vec![(
+            "tsField".to_string(),
+            Value::TimestampMillis(1_700_000_000_123),
+        )];
+        assert!(
+            serialize_with_cel_condition(
+                schema_str,
+                "message.tsField == timestamp(\"2023-11-14T22:13:20.123Z\")",
+                exact.clone(),
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            serialize_with_cel_condition(
+                schema_str,
+                "message.tsField.getFullYear() == 2023",
+                exact,
+            )
+            .await
+            .is_ok()
+        );
     }
 
     #[tokio::test]

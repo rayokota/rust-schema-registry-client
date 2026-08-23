@@ -90,7 +90,9 @@ fn parse(path: &str) -> Result<Vec<Segment>, String> {
             '[' => {
                 pos += 1;
                 if pos >= chars.len() {
-                    return Err(format!("unexpected end of input after '[' in variant path: {path}"));
+                    return Err(format!(
+                        "unexpected end of input after '[' in variant path: {path}"
+                    ));
                 }
                 if chars[pos] == '"' || chars[pos] == '\'' {
                     let (key, next) = read_quoted_key(path, &chars, pos)?;
@@ -125,7 +127,9 @@ fn read_quoted_key(path: &str, chars: &[char], mut pos: usize) -> Result<(String
         pos += 1;
         if c == '\\' {
             if pos >= chars.len() {
-                return Err(format!("unterminated escape at end of quoted key in variant path: {path}"));
+                return Err(format!(
+                    "unterminated escape at end of quoted key in variant path: {path}"
+                ));
             }
             let esc = chars[pos];
             pos += 1;
@@ -147,7 +151,9 @@ fn read_quoted_key(path: &str, chars: &[char], mut pos: usize) -> Result<(String
 
 fn read_index(path: &str, chars: &[char], mut pos: usize) -> Result<(usize, usize), String> {
     if chars[pos] == '-' {
-        return Err(format!("negative indices are not supported in variant path: {path}"));
+        return Err(format!(
+            "negative indices are not supported in variant path: {path}"
+        ));
     }
     let start = pos;
     // Indices are ASCII digits only (Java parses via Integer.parseInt); non-ASCII digits

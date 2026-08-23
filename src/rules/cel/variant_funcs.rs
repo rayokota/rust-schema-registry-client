@@ -78,9 +78,10 @@ fn type_label(t: Type) -> &'static str {
         Type::Decimal4 | Type::Decimal8 | Type::Decimal16 => "decimal",
         Type::Date => "date",
         Type::Time => "time",
-        Type::TimestampTz | Type::TimestampNtz | Type::TimestampNanosTz | Type::TimestampNanosNtz => {
-            "timestamp"
-        }
+        Type::TimestampTz
+        | Type::TimestampNtz
+        | Type::TimestampNanosTz
+        | Type::TimestampNanosNtz => "timestamp",
         Type::String => "string",
         Type::Binary => "bytes",
         Type::Uuid => "uuid",
@@ -162,7 +163,9 @@ fn variants_parse_json(v: Value) -> Result<Value, ExecutionError> {
 
 fn variants_try_parse_json(v: Value) -> Result<Value, ExecutionError> {
     match &v {
-        Value::String(s) => Ok(Variant::parse_json(s).map(variant_value).unwrap_or(Value::Null)),
+        Value::String(s) => Ok(Variant::parse_json(s)
+            .map(variant_value)
+            .unwrap_or(Value::Null)),
         _ => Ok(Value::Null),
     }
 }
@@ -170,7 +173,9 @@ fn variants_try_parse_json(v: Value) -> Result<Value, ExecutionError> {
 fn variants_type(v: Value) -> Result<Value, ExecutionError> {
     match receiver(&v)? {
         None => Ok(Value::Null),
-        Some(vv) => Ok(Value::String(Arc::new(type_label(vv.get_type()).to_string()))),
+        Some(vv) => Ok(Value::String(Arc::new(
+            type_label(vv.get_type()).to_string(),
+        ))),
     }
 }
 
@@ -211,7 +216,10 @@ fn variants_field(a: Value, b: Value) -> Result<Value, ExecutionError> {
         Value::String(s) => s.as_str(),
         _ => return Err(err("variants.field: expected a string key")),
     };
-    Ok(vv.get_field_by_key(key).map(variant_value).unwrap_or(Value::Null))
+    Ok(vv
+        .get_field_by_key(key)
+        .map(variant_value)
+        .unwrap_or(Value::Null))
 }
 
 fn variants_index(a: Value, b: Value) -> Result<Value, ExecutionError> {
@@ -257,8 +265,11 @@ fn variant_as(a: &Value, b: &Value, null_on_error: bool) -> Result<Value, Execut
     let conv = |e: crate::serdes::variant::VariantError| err(format!("variants.as: {e}"));
     let vt = vv.get_type();
     let extracted: Option<Result<Value, ExecutionError>> = match t {
-        "string" => (vt == Type::String)
-            .then(|| vv.get_string().map(|s| Value::String(Arc::new(s))).map_err(conv)),
+        "string" => (vt == Type::String).then(|| {
+            vv.get_string()
+                .map(|s| Value::String(Arc::new(s)))
+                .map_err(conv)
+        }),
         "int" => matches!(vt, Type::Byte | Type::Short | Type::Int | Type::Long)
             .then(|| vv.get_long().map(Value::Int).map_err(conv)),
         "double" => match vt {
@@ -266,8 +277,7 @@ fn variant_as(a: &Value, b: &Value, null_on_error: bool) -> Result<Value, Execut
             Type::Double => Some(vv.get_double().map(Value::Float).map_err(conv)),
             _ => None,
         },
-        "boolean" => (vt == Type::Boolean)
-            .then(|| vv.get_boolean().map(Value::Bool).map_err(conv)),
+        "boolean" => (vt == Type::Boolean).then(|| vv.get_boolean().map(Value::Bool).map_err(conv)),
         "decimal" => matches!(vt, Type::Decimal4 | Type::Decimal8 | Type::Decimal16).then(|| {
             vv.get_decimal_parts()
                 .map_err(conv)
@@ -275,7 +285,10 @@ fn variant_as(a: &Value, b: &Value, null_on_error: bool) -> Result<Value, Execut
         }),
         "timestamp" => matches!(
             vt,
-            Type::TimestampTz | Type::TimestampNtz | Type::TimestampNanosTz | Type::TimestampNanosNtz
+            Type::TimestampTz
+                | Type::TimestampNtz
+                | Type::TimestampNanosTz
+                | Type::TimestampNanosNtz
         )
         .then(|| {
             let unit = if matches!(vt, Type::TimestampTz | Type::TimestampNtz) {
@@ -288,8 +301,11 @@ fn variant_as(a: &Value, b: &Value, null_on_error: bool) -> Result<Value, Execut
                 .map(Value::Timestamp)
                 .map_err(|e| err(format!("variants.as: {e}")))
         }),
-        "bytes" => (vt == Type::Binary)
-            .then(|| vv.get_binary().map(|b| Value::Bytes(Arc::new(b))).map_err(conv)),
+        "bytes" => (vt == Type::Binary).then(|| {
+            vv.get_binary()
+                .map(|b| Value::Bytes(Arc::new(b)))
+                .map_err(conv)
+        }),
         _ => {
             return if null_on_error {
                 Ok(Value::Null)
@@ -353,7 +369,8 @@ mod tests {
     use cel::Program;
 
     // A JSON document exercising objects, arrays, an explicit null, and nesting.
-    const DOC: &str = r#"{"name":"alice","age":30,"explicit":null,"nested":{"x":1},"scores":[10,20,30]}"#;
+    const DOC: &str =
+        r#"{"name":"alice","age":30,"explicit":null,"nested":{"x":1},"scores":[10,20,30]}"#;
 
     fn eval_with(expr: &str, this: Value) -> Value {
         let program = Program::compile(expr).expect("compile");
@@ -399,7 +416,10 @@ mod tests {
     fn try_parse_json_empty_is_null() {
         // Empty / whitespace-only input is a soft failure: variants.tryParseJson maps the
         // VariantError to CEL null rather than propagating an error or panicking.
-        assert_eq!(variants_try_parse_json(Value::String(Arc::new(String::new()))), Ok(Value::Null));
+        assert_eq!(
+            variants_try_parse_json(Value::String(Arc::new(String::new()))),
+            Ok(Value::Null)
+        );
         assert_eq!(
             variants_try_parse_json(Value::String(Arc::new("   ".to_string()))),
             Ok(Value::Null)
@@ -412,7 +432,10 @@ mod tests {
         assert!(variants_parse_json(Value::String(Arc::new(String::new()))).is_err());
         // End to end through the CEL executor.
         assert!(eval_bool("variants.tryParseJson('') == null", doc_string()));
-        assert!(eval_bool("variants.tryParseJson('   ') == null", doc_string()));
+        assert!(eval_bool(
+            "variants.tryParseJson('   ') == null",
+            doc_string()
+        ));
     }
 
     #[test]

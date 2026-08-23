@@ -235,7 +235,9 @@ impl Variant {
     pub fn get_boolean(&self) -> Result<bool, VariantError> {
         let ti = self.primitive_info()?;
         if ti != T_TRUE && ti != T_FALSE {
-            return Err(VariantError::TypeMismatch("variant is not a boolean".to_string()));
+            return Err(VariantError::TypeMismatch(
+                "variant is not a boolean".to_string(),
+            ));
         }
         Ok(ti == T_TRUE)
     }
@@ -245,7 +247,9 @@ impl Variant {
     pub fn get_byte(&self) -> Result<i8, VariantError> {
         let ti = self.primitive_info()?;
         if ti != T_INT1 {
-            return Err(VariantError::TypeMismatch("variant is not a byte".to_string()));
+            return Err(VariantError::TypeMismatch(
+                "variant is not a byte".to_string(),
+            ));
         }
         Ok(read_signed_long(&self.value, self.pos + 1, 1)? as i8)
     }
@@ -257,7 +261,9 @@ impl Variant {
         match ti {
             T_INT1 => Ok(read_signed_long(&self.value, self.pos + 1, 1)? as i16),
             T_INT2 => Ok(read_signed_long(&self.value, self.pos + 1, 2)? as i16),
-            _ => Err(VariantError::TypeMismatch("variant is not a short".to_string())),
+            _ => Err(VariantError::TypeMismatch(
+                "variant is not a short".to_string(),
+            )),
         }
     }
 
@@ -269,7 +275,9 @@ impl Variant {
             T_INT1 => Ok(read_signed_long(&self.value, self.pos + 1, 1)? as i32),
             T_INT2 => Ok(read_signed_long(&self.value, self.pos + 1, 2)? as i32),
             T_INT4 => Ok(read_signed_long(&self.value, self.pos + 1, 4)? as i32),
-            _ => Err(VariantError::TypeMismatch("variant is not an int".to_string())),
+            _ => Err(VariantError::TypeMismatch(
+                "variant is not an int".to_string(),
+            )),
         }
     }
 
@@ -281,7 +289,11 @@ impl Variant {
             T_INT1 => read_signed_long(&self.value, self.pos + 1, 1),
             T_INT2 => read_signed_long(&self.value, self.pos + 1, 2),
             T_INT4 | T_DATE => read_signed_long(&self.value, self.pos + 1, 4),
-            T_INT8 | T_TIMESTAMP | T_TIMESTAMP_NTZ | T_TIME | T_TIMESTAMP_NANOS
+            T_INT8
+            | T_TIMESTAMP
+            | T_TIMESTAMP_NTZ
+            | T_TIME
+            | T_TIMESTAMP_NANOS
             | T_TIMESTAMP_NANOS_NTZ => read_signed_long(&self.value, self.pos + 1, 8),
             _ => Err(VariantError::TypeMismatch(
                 "variant is not an integer-backed type".to_string(),
@@ -293,7 +305,9 @@ impl Variant {
     pub fn get_float(&self) -> Result<f32, VariantError> {
         let ti = self.primitive_info()?;
         if ti != T_FLOAT {
-            return Err(VariantError::TypeMismatch("variant is not a float".to_string()));
+            return Err(VariantError::TypeMismatch(
+                "variant is not a float".to_string(),
+            ));
         }
         read_float_le(&self.value, self.pos + 1)
     }
@@ -303,7 +317,9 @@ impl Variant {
     pub fn get_double(&self) -> Result<f64, VariantError> {
         let ti = self.primitive_info()?;
         if ti != T_DOUBLE {
-            return Err(VariantError::TypeMismatch("variant is not a double".to_string()));
+            return Err(VariantError::TypeMismatch(
+                "variant is not a double".to_string(),
+            ));
         }
         read_double_le(&self.value, self.pos + 1)
     }
@@ -318,7 +334,11 @@ impl Variant {
             T_DECIMAL4 => 4usize,
             T_DECIMAL8 => 8,
             T_DECIMAL16 => 16,
-            _ => return Err(VariantError::TypeMismatch("variant is not a decimal".to_string())),
+            _ => {
+                return Err(VariantError::TypeMismatch(
+                    "variant is not a decimal".to_string(),
+                ));
+            }
         };
         check_index(self.pos + 2 + width - 1, self.value.len())?;
         // Value bytes are little-endian two's-complement; reverse for big-endian.
@@ -340,7 +360,9 @@ impl Variant {
     pub fn get_binary(&self) -> Result<Vec<u8>, VariantError> {
         let ti = self.primitive_info()?;
         if ti != T_BINARY {
-            return Err(VariantError::TypeMismatch("variant is not binary".to_string()));
+            return Err(VariantError::TypeMismatch(
+                "variant is not binary".to_string(),
+            ));
         }
         let length = read_unsigned_le(&self.value, self.pos + 1, U32_SIZE)?;
         let start = self.pos + 1 + U32_SIZE;
@@ -355,7 +377,9 @@ impl Variant {
     pub fn get_uuid(&self) -> Result<String, VariantError> {
         let ti = self.primitive_info()?;
         if ti != T_UUID {
-            return Err(VariantError::TypeMismatch("variant is not a uuid".to_string()));
+            return Err(VariantError::TypeMismatch(
+                "variant is not a uuid".to_string(),
+            ));
         }
         let start = self.pos + 1;
         check_index(start + 15, self.value.len())?;
@@ -374,7 +398,9 @@ impl Variant {
             let length = read_unsigned_le(&self.value, self.pos + 1, U32_SIZE)?;
             (self.pos + 1 + U32_SIZE, length)
         } else {
-            return Err(VariantError::TypeMismatch("variant is not a string".to_string()));
+            return Err(VariantError::TypeMismatch(
+                "variant is not a string".to_string(),
+            ));
         };
         if length == 0 {
             return Ok(String::new());
@@ -392,7 +418,9 @@ impl Variant {
         let basic_type = header & BASIC_TYPE_MASK;
         let type_info = (header >> BASIC_TYPE_BITS) & TYPE_INFO_MASK;
         if basic_type != OBJECT_TYPE {
-            return Err(VariantError::TypeMismatch("variant is not an object".to_string()));
+            return Err(VariantError::TypeMismatch(
+                "variant is not an object".to_string(),
+            ));
         }
         let large_size = ((type_info >> 4) & 0x1) != 0;
         let size_bytes = if large_size { U32_SIZE } else { 1 };
@@ -418,7 +446,9 @@ impl Variant {
         let basic_type = header & BASIC_TYPE_MASK;
         let type_info = (header >> BASIC_TYPE_BITS) & TYPE_INFO_MASK;
         if basic_type != ARRAY_TYPE {
-            return Err(VariantError::TypeMismatch("variant is not an array".to_string()));
+            return Err(VariantError::TypeMismatch(
+                "variant is not an array".to_string(),
+            ));
         }
         let large_size = ((type_info >> 2) & 0x1) != 0;
         let size_bytes = if large_size { U32_SIZE } else { 1 };
@@ -450,12 +480,16 @@ impl Variant {
         let o = self.object_info().ok()?;
         if o.num_fields < BINARY_SEARCH_THRESHOLD {
             for i in 0..o.num_fields {
-                let id = read_unsigned_le(&self.value, o.id_start + o.id_size * i, o.id_size).ok()?;
+                let id =
+                    read_unsigned_le(&self.value, o.id_start + o.id_size * i, o.id_size).ok()?;
                 let k = self.get_metadata_key(id).ok()?;
                 if k == key {
-                    let offset =
-                        read_unsigned_le(&self.value, o.offset_start + o.offset_size * i, o.offset_size)
-                            .ok()?;
+                    let offset = read_unsigned_le(
+                        &self.value,
+                        o.offset_start + o.offset_size * i,
+                        o.offset_size,
+                    )
+                    .ok()?;
                     return Some(self.at(o.data_start + offset));
                 }
             }
@@ -495,8 +529,11 @@ impl Variant {
     fn field_at_index(&self, idx: usize) -> Result<(String, Variant), VariantError> {
         let o = self.object_info()?;
         let id = read_unsigned_le(&self.value, o.id_start + o.id_size * idx, o.id_size)?;
-        let offset =
-            read_unsigned_le(&self.value, o.offset_start + o.offset_size * idx, o.offset_size)?;
+        let offset = read_unsigned_le(
+            &self.value,
+            o.offset_start + o.offset_size * idx,
+            o.offset_size,
+        )?;
         let key = self.get_metadata_key(id)?;
         Ok((key, self.at(o.data_start + offset)))
     }
@@ -508,9 +545,12 @@ impl Variant {
         if index >= a.num_fields {
             return None;
         }
-        let offset =
-            read_unsigned_le(&self.value, a.offset_start + a.offset_size * index, a.offset_size)
-                .ok()?;
+        let offset = read_unsigned_le(
+            &self.value,
+            a.offset_start + a.offset_size * index,
+            a.offset_size,
+        )
+        .ok()?;
         Some(self.at(a.data_start + offset))
     }
 
@@ -519,7 +559,9 @@ impl Variant {
     fn get_metadata_key(&self, id: usize) -> Result<String, VariantError> {
         check_index(0, self.metadata.len())?;
         if self.metadata[0] & VERSION_MASK != VERSION {
-            return Err(VariantError::UnsupportedVersion(self.metadata[0] & VERSION_MASK));
+            return Err(VariantError::UnsupportedVersion(
+                self.metadata[0] & VERSION_MASK,
+            ));
         }
         let offset_size = (((self.metadata[0] >> 6) & 0x3) + 1) as usize;
         let dict_size = read_unsigned_le(&self.metadata, 1, offset_size)?;
@@ -531,7 +573,9 @@ impl Variant {
         let next_offset =
             read_unsigned_le(&self.metadata, 1 + (id + 2) * offset_size, offset_size)?;
         if offset > next_offset {
-            return Err(VariantError::Malformed("non-monotonic metadata offsets".to_string()));
+            return Err(VariantError::Malformed(
+                "non-monotonic metadata offsets".to_string(),
+            ));
         }
         if next_offset == offset {
             return Ok(String::new());
@@ -573,9 +617,9 @@ impl Variant {
                     if i > 0 {
                         out.push(',');
                     }
-                    let el = self
-                        .get_element_at_index(i)
-                        .ok_or_else(|| VariantError::Malformed("array element out of range".to_string()))?;
+                    let el = self.get_element_at_index(i).ok_or_else(|| {
+                        VariantError::Malformed("array element out of range".to_string())
+                    })?;
                     el.write_json(out)?;
                 }
                 out.push(']');
@@ -1098,7 +1142,11 @@ impl Builder {
     /// `next-inserted-offset - this-offset` (the last one runs to the end of the data region). When
     /// duplicates are found, the retained values are compacted leftward, offsets recomputed, the
     /// value buffer truncated, and key order restored. Ported from the Go sibling client.
-    fn dedup_object_fields(&mut self, start: usize, mut fields: Vec<FieldEntry>) -> Vec<FieldEntry> {
+    fn dedup_object_fields(
+        &mut self,
+        start: usize,
+        mut fields: Vec<FieldEntry>,
+    ) -> Vec<FieldEntry> {
         let n = fields.len();
         if n <= 1 {
             return fields;
@@ -1136,7 +1184,8 @@ impl Builder {
             let l = len_at[&o];
             if curr != o {
                 // copy_within is memmove-safe for overlapping ranges.
-                self.value.copy_within(start + o..start + o + l, start + curr);
+                self.value
+                    .copy_within(start + o..start + o + l, start + curr);
             }
             f.offset = curr;
             curr += l;
@@ -1272,14 +1321,20 @@ impl VariantBuilder {
         let len = self.builder.value.len();
         if self.stack.is_empty() {
             if self.root_written {
-                return Err(VariantError::Json("builder already has a root value".to_string()));
+                return Err(VariantError::Json(
+                    "builder already has a root value".to_string(),
+                ));
             }
             self.root_written = true;
             return Ok(());
         }
         match self.stack.last_mut().unwrap() {
             BuilderFrame::Array { start, offsets } => offsets.push(len - *start),
-            BuilderFrame::Object { start, fields, pending } => {
+            BuilderFrame::Object {
+                start,
+                fields,
+                pending,
+            } => {
                 let (key, id) = pending.take().ok_or_else(|| {
                     VariantError::Json(
                         "value appended to object without a preceding append_key".to_string(),
@@ -1388,14 +1443,16 @@ impl VariantBuilder {
     /// Append a DATE value (days since the Unix epoch).
     pub fn append_date(&mut self, days_since_epoch: i32) -> Result<(), VariantError> {
         self.prepare_slot()?;
-        self.builder.append_temporal(T_DATE, 4, days_since_epoch as i64);
+        self.builder
+            .append_temporal(T_DATE, 4, days_since_epoch as i64);
         Ok(())
     }
 
     /// Append a TIME_NTZ value (microseconds since midnight).
     pub fn append_time(&mut self, micros_since_midnight: i64) -> Result<(), VariantError> {
         self.prepare_slot()?;
-        self.builder.append_temporal(T_TIME, 8, micros_since_midnight);
+        self.builder
+            .append_temporal(T_TIME, 8, micros_since_midnight);
         Ok(())
     }
 
@@ -1423,7 +1480,8 @@ impl VariantBuilder {
     /// Append a TIMESTAMP_NANOS_NTZ value in nanoseconds.
     pub fn append_timestamp_nanos_ntz(&mut self, nanos: i64) -> Result<(), VariantError> {
         self.prepare_slot()?;
-        self.builder.append_temporal(T_TIMESTAMP_NANOS_NTZ, 8, nanos);
+        self.builder
+            .append_temporal(T_TIMESTAMP_NANOS_NTZ, 8, nanos);
         Ok(())
     }
 
@@ -1452,7 +1510,9 @@ impl VariantBuilder {
                 }
             }
             _ => {
-                return Err(VariantError::Json("append_key called outside an object".to_string()));
+                return Err(VariantError::Json(
+                    "append_key called outside an object".to_string(),
+                ));
             }
         }
         let id = self.builder.add_key(key);
@@ -1515,10 +1575,14 @@ impl VariantBuilder {
     /// open or no value has been appended.
     pub fn build(self) -> Result<Variant, VariantError> {
         if !self.stack.is_empty() {
-            return Err(VariantError::Json("build called with an open container".to_string()));
+            return Err(VariantError::Json(
+                "build called with an open container".to_string(),
+            ));
         }
         if !self.root_written {
-            return Err(VariantError::Json("build called with no value appended".to_string()));
+            return Err(VariantError::Json(
+                "build called with no value appended".to_string(),
+            ));
         }
         let (value, metadata) = self.builder.finish();
         Ok(Variant::new(value, metadata))
@@ -1554,7 +1618,11 @@ fn append_long_le(out: &mut Vec<u8>, mut v: i64, width: usize) {
 /// `BigInteger.ToByteArray` padded to a fixed width).
 fn append_bigint_le(out: &mut Vec<u8>, n: &BigInt, width: usize) {
     let le = n.to_signed_bytes_le(); // minimal little-endian two's-complement
-    let pad = if n.sign() == Sign::Minus { 0xFFu8 } else { 0x00 };
+    let pad = if n.sign() == Sign::Minus {
+        0xFFu8
+    } else {
+        0x00
+    };
     for i in 0..width {
         out.push(if i < le.len() { le[i] } else { pad });
     }
@@ -1580,7 +1648,9 @@ fn build_from_json(json: &str) -> Result<(Vec<u8>, Vec<u8>), VariantError> {
     parser.parse_value(&mut builder)?;
     parser.skip_ws();
     if parser.i != parser.bytes.len() {
-        return Err(VariantError::Json("trailing content after JSON value".to_string()));
+        return Err(VariantError::Json(
+            "trailing content after JSON value".to_string(),
+        ));
     }
     Ok(builder.finish())
 }
@@ -1614,7 +1684,8 @@ impl<'a> JsonReader<'a> {
     }
 
     fn expect_literal(&mut self, lit: &[u8]) -> Result<(), VariantError> {
-        if self.i + lit.len() <= self.bytes.len() && &self.bytes[self.i..self.i + lit.len()] == lit {
+        if self.i + lit.len() <= self.bytes.len() && &self.bytes[self.i..self.i + lit.len()] == lit
+        {
             self.i += lit.len();
             Ok(())
         } else {
@@ -1700,7 +1771,9 @@ impl<'a> JsonReader<'a> {
             let key = self.parse_string()?;
             self.skip_ws();
             if self.next() != Some(b':') {
-                return Err(VariantError::Json("expected ':' after object key".to_string()));
+                return Err(VariantError::Json(
+                    "expected ':' after object key".to_string(),
+                ));
             }
             let id = out.add_key(&key);
             let offset = out.value.len() - start;
@@ -1710,7 +1783,11 @@ impl<'a> JsonReader<'a> {
             match self.next() {
                 Some(b',') => continue,
                 Some(b'}') => break,
-                _ => return Err(VariantError::Json("expected ',' or '}' in object".to_string())),
+                _ => {
+                    return Err(VariantError::Json(
+                        "expected ',' or '}' in object".to_string(),
+                    ));
+                }
             }
         }
         out.finish_writing_object(start, fields);
@@ -1733,7 +1810,11 @@ impl<'a> JsonReader<'a> {
             match self.next() {
                 Some(b',') => continue,
                 Some(b']') => break,
-                _ => return Err(VariantError::Json("expected ',' or ']' in array".to_string())),
+                _ => {
+                    return Err(VariantError::Json(
+                        "expected ',' or ']' in array".to_string(),
+                    ));
+                }
             }
         }
         out.finish_writing_array(start, &offsets);
@@ -1794,7 +1875,8 @@ impl<'a> JsonReader<'a> {
                 _ => out.push(c),
             }
         }
-        String::from_utf8(out).map_err(|_| VariantError::Json("invalid UTF-8 in string".to_string()))
+        String::from_utf8(out)
+            .map_err(|_| VariantError::Json("invalid UTF-8 in string".to_string()))
     }
 
     fn read_hex4(&mut self) -> Result<u32, VariantError> {
@@ -1826,7 +1908,9 @@ impl<'a> JsonReader<'a> {
         let token = std::str::from_utf8(&self.bytes[start..self.i])
             .map_err(|_| VariantError::Json("invalid number token".to_string()))?;
         if !is_valid_json_number(token) {
-            return Err(VariantError::Json(format!("invalid number literal {token:?}")));
+            return Err(VariantError::Json(format!(
+                "invalid number literal {token:?}"
+            )));
         }
         let fractional = token.contains('.') || token.contains('e') || token.contains('E');
         if !fractional {
@@ -1899,7 +1983,8 @@ fn is_valid_json_number(s: &str) -> bool {
 }
 
 fn push_code_point(out: &mut Vec<u8>, cp: u32) -> Result<(), VariantError> {
-    let ch = char::from_u32(cp).ok_or_else(|| VariantError::Json("invalid code point".to_string()))?;
+    let ch =
+        char::from_u32(cp).ok_or_else(|| VariantError::Json("invalid code point".to_string()))?;
     let mut buf = [0u8; 4];
     out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
     Ok(())
@@ -2044,12 +2129,15 @@ mod tests {
 
         // Key order is chosen so both the builder (append order) and parse_json (document order)
         // assign the same metadata dictionary IDs.
-        let equivalent =
-            r#"{"id":10000000000,"count":100000,"tags":["x","y"],"nested":{"flag":true,"pi":3.14}}"#;
+        let equivalent = r#"{"id":10000000000,"count":100000,"tags":["x","y"],"nested":{"flag":true,"pi":3.14}}"#;
         let parsed = Variant::parse_json(equivalent).unwrap();
 
         assert_eq!(built.to_json().unwrap(), parsed.to_json().unwrap());
-        assert_eq!(built.value_bytes(), parsed.value_bytes(), "value bytes differ");
+        assert_eq!(
+            built.value_bytes(),
+            parsed.value_bytes(),
+            "value bytes differ"
+        );
         assert_eq!(
             built.metadata_bytes(),
             parsed.metadata_bytes(),
@@ -2135,7 +2223,15 @@ mod tests {
         // Bug #22: reject malformed number literals that Rust's from_str accepts but
         // serde_json (arrow-rs) and Jackson (Java reference) reject.
         for json in [
-            "007", "00", "-01", "1.", "1.e3", "1e", "01", "[007]", "{\"a\":1.}",
+            "007",
+            "00",
+            "-01",
+            "1.",
+            "1.e3",
+            "1e",
+            "01",
+            "[007]",
+            "{\"a\":1.}",
         ] {
             assert!(
                 Variant::parse_json(json).is_err(),
@@ -2208,8 +2304,14 @@ mod tests {
         assert_eq!(Variant::parse_json("{}").unwrap().get_type(), Type::Object);
         assert_eq!(Variant::parse_json("[]").unwrap().get_type(), Type::Array);
         assert_eq!(Variant::parse_json("null").unwrap().get_type(), Type::Null);
-        assert_eq!(Variant::parse_json("true").unwrap().get_type(), Type::Boolean);
-        assert_eq!(Variant::parse_json("\"s\"").unwrap().get_type(), Type::String);
+        assert_eq!(
+            Variant::parse_json("true").unwrap().get_type(),
+            Type::Boolean
+        );
+        assert_eq!(
+            Variant::parse_json("\"s\"").unwrap().get_type(),
+            Type::String
+        );
         // Integer widths.
         assert_eq!(Variant::parse_json("1").unwrap().get_type(), Type::Byte);
         assert_eq!(Variant::parse_json("300").unwrap().get_type(), Type::Short);
@@ -2234,7 +2336,10 @@ mod tests {
         assert!(!Variant::parse_json("false").unwrap().get_boolean().unwrap());
         assert_eq!(Variant::parse_json("-42").unwrap().get_long().unwrap(), -42);
         assert_eq!(
-            Variant::parse_json("5000000000").unwrap().get_long().unwrap(),
+            Variant::parse_json("5000000000")
+                .unwrap()
+                .get_long()
+                .unwrap(),
             5_000_000_000
         );
         assert_eq!(
@@ -2242,7 +2347,10 @@ mod tests {
             3.25
         );
         assert_eq!(
-            Variant::parse_json("\"héllo\"").unwrap().get_string().unwrap(),
+            Variant::parse_json("\"héllo\"")
+                .unwrap()
+                .get_string()
+                .unwrap(),
             "héllo"
         );
     }
@@ -2262,7 +2370,10 @@ mod tests {
         );
         let (be, scale) = big.get_decimal_parts().unwrap();
         assert_eq!(scale, 0);
-        assert_eq!(BigInt::from_signed_bytes_be(&be).to_string(), big.to_json().unwrap());
+        assert_eq!(
+            BigInt::from_signed_bytes_be(&be).to_string(),
+            big.to_json().unwrap()
+        );
 
         // Negative wide integer.
         let neg = Variant::parse_json("-98765432109876543210").unwrap();
@@ -2278,10 +2389,7 @@ mod tests {
         let b = v.get_field_by_key("b").unwrap();
         assert_eq!(b.get_type(), Type::Array);
         assert_eq!(b.num_array_elements(), 3);
-        assert_eq!(
-            b.get_element_at_index(1).unwrap().get_long().unwrap(),
-            200
-        );
+        assert_eq!(b.get_element_at_index(1).unwrap().get_long().unwrap(), 200);
         // Miss / OOB -> None.
         assert!(v.get_field_by_key("missing").is_none());
         assert!(b.get_element_at_index(5).is_none());
@@ -2303,7 +2411,10 @@ mod tests {
         // Re-encode the sub-variant as a standalone Variant sharing the same metadata.
         let reencoded = Variant::new(sub.standalone_value_bytes(), sub.metadata_bytes().to_vec());
         assert_eq!(reencoded.to_json().unwrap(), sub.to_json().unwrap());
-        assert_eq!(reencoded.to_json().unwrap(), "{\"inner\":[1,2,3],\"k\":\"v\"}");
+        assert_eq!(
+            reencoded.to_json().unwrap(),
+            "{\"inner\":[1,2,3],\"k\":\"v\"}"
+        );
     }
 
     #[test]
@@ -2363,14 +2474,20 @@ mod tests {
     #[test]
     fn parse_non_finite_barewords_and_overflow() {
         // Out-of-range magnitude parses to f64 infinity and is stored (Java contract).
-        assert_eq!(Variant::parse_json("1e400").unwrap().to_json().unwrap(), "Infinity");
+        assert_eq!(
+            Variant::parse_json("1e400").unwrap().to_json().unwrap(),
+            "Infinity"
+        );
         assert_eq!(
             Variant::parse_json("-1e400").unwrap().to_json().unwrap(),
             "-Infinity"
         );
 
         // Bareword literal input is accepted by the extended number scanner and round-trips.
-        assert_eq!(Variant::parse_json("NaN").unwrap().to_json().unwrap(), "NaN");
+        assert_eq!(
+            Variant::parse_json("NaN").unwrap().to_json().unwrap(),
+            "NaN"
+        );
         assert_eq!(
             Variant::parse_json("Infinity").unwrap().to_json().unwrap(),
             "Infinity"
@@ -2411,7 +2528,16 @@ mod tests {
     #[test]
     fn binary_and_uuid_render() {
         // Binary: header, u32 length=3 (LE), then bytes 0x01 0x02 0x03 -> base64 "AQID".
-        let value = vec![primitive_header(T_BINARY), 0x03, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03];
+        let value = vec![
+            primitive_header(T_BINARY),
+            0x03,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            0x02,
+            0x03,
+        ];
         let metadata = vec![VERSION, 0x00, 0x00];
         let v = Variant::new(value, metadata.clone());
         assert_eq!(v.get_type(), Type::Binary);
@@ -2451,16 +2577,30 @@ mod tests {
         assert!(Variant::parse_json("300").unwrap().get_byte().is_err());
         // get_short: <=INT16, widens.
         assert_eq!(Variant::parse_json("1").unwrap().get_short().unwrap(), 1);
-        assert_eq!(Variant::parse_json("300").unwrap().get_short().unwrap(), 300);
+        assert_eq!(
+            Variant::parse_json("300").unwrap().get_short().unwrap(),
+            300
+        );
         assert!(Variant::parse_json("100000").unwrap().get_short().is_err());
         // get_int: <=INT32, widens.
         assert_eq!(Variant::parse_json("1").unwrap().get_int().unwrap(), 1);
         assert_eq!(Variant::parse_json("300").unwrap().get_int().unwrap(), 300);
-        assert_eq!(Variant::parse_json("100000").unwrap().get_int().unwrap(), 100000);
-        assert!(Variant::parse_json("10000000000").unwrap().get_int().is_err());
+        assert_eq!(
+            Variant::parse_json("100000").unwrap().get_int().unwrap(),
+            100000
+        );
+        assert!(
+            Variant::parse_json("10000000000")
+                .unwrap()
+                .get_int()
+                .is_err()
+        );
         // get_long: widens any int width.
         assert_eq!(
-            Variant::parse_json("10000000000").unwrap().get_long().unwrap(),
+            Variant::parse_json("10000000000")
+                .unwrap()
+                .get_long()
+                .unwrap(),
             10_000_000_000
         );
     }
@@ -2596,11 +2736,17 @@ mod tests {
         let micros = 1_609_459_200_000_000i64;
         let mut b = VariantBuilder::new();
         b.append_timestamp_ntz(micros).unwrap();
-        assert_eq!(b.build().unwrap().to_json().unwrap(), "\"2021-01-01T00:00:00\"");
+        assert_eq!(
+            b.build().unwrap().to_json().unwrap(),
+            "\"2021-01-01T00:00:00\""
+        );
 
         let mut b = VariantBuilder::new();
         b.append_timestamp_tz(micros).unwrap();
-        assert_eq!(b.build().unwrap().to_json().unwrap(), "\"2021-01-01T00:00:00Z\"");
+        assert_eq!(
+            b.build().unwrap().to_json().unwrap(),
+            "\"2021-01-01T00:00:00Z\""
+        );
 
         // Pre-epoch (negative micros) must use floor division, not truncation.
         // 1969-12-31T23:59:59.500Z = -500000 micros (frac uses 3/6/9-digit grouping).

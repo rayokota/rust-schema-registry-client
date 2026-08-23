@@ -37,7 +37,15 @@ mod tests {
 
     #[test]
     fn round_trips_through_confluent_decimal() {
-        for s in ["12.34", "0", "-7.5", "100", "1.50", "0.001", "-0.0000000001"] {
+        for s in [
+            "12.34",
+            "0",
+            "-7.5",
+            "100",
+            "1.50",
+            "0.001",
+            "-0.0000000001",
+        ] {
             let d = BigDecimal::from_str(s).unwrap();
             let back = from_proto_decimal(&to_proto_decimal(&d));
             assert_eq!(back, d, "round-trip mismatch for {s}");

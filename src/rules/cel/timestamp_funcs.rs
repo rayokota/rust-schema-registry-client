@@ -1,20 +1,18 @@
-//! CEL binding for the `timestamp.of` constructor.
+//! CEL bindings for the `timestamp` constructor.
 //!
-//! cel-rust already provides a stdlib `timestamp(string)` (RFC 3339 parsing) plus the standard
-//! timestamp operators (`<`, `>`, `==`, `- duration`, `+ duration`, etc.). The extension we add
-//! here is the namespaced `timestamp.of(...)` constructor, mirroring the other clients:
+//! cel-rust already provides a stdlib `timestamp(string)` (RFC 3339 parsing),
+//! `timestamp(timestamp)` (identity) and the standard timestamp operators (`<`, `>`, `==`,
+//! `- duration`, `+ duration`, etc.). Two overloads are added here, both on the standard name —
+//! there is no `timestamp.of` namespace:
 //!
-//!   * `timestamp.of(dyn) -> timestamp` — runtime-dispatches on the value (already-decoded
-//!     timestamp, RFC 3339 string, etc.).
-//!   * `timestamp.of(int, string) -> timestamp` — epoch numeric + unit
-//!     (`seconds` | `millis` | `micros` | `nanos`).
+//!   * `timestamp(int) -> timestamp` — epoch **seconds**, the one stdlib overload cel-rust is
+//!     missing, which cel-java/go/cpp/csharp all declare.
+//!   * `timestamp(int, int) -> timestamp` — an epoch value at a Flink-style decimal precision:
+//!     0 seconds, 3 millis, 6 micros, 9 nanos.
 //!
-//! We use the namespaced form (rather than extending stdlib `timestamp(...)` with a `(dyn)`
-//! overload) because `(dyn)` and `(string)` would overlap per the CEL signature-overlap rule on
-//! conformant impls (cel-java/go/cpp); the namespaced form keeps cross-client parity.
-//!
-//! We also fill in the one stdlib overload cel-rust is missing: `timestamp(int)` (epoch seconds),
-//! which cel-java/go/cpp/csharp all declare. See [`timestamp_int`].
+//! Nothing extra is needed for the one-argument non-int cases: an Avro timestamp field is
+//! converted to a `Value::Timestamp` at the boundary, which stdlib's identity overload already
+//! accepts, so it needs no wrapper at all.
 
 use cel::extractors::Arguments;
 use cel::{Context, ExecutionError, Value};
@@ -27,84 +25,80 @@ const UNIT_NANOS: &str = "nanos";
 
 fn err(msg: impl Into<String>) -> ExecutionError {
     ExecutionError::FunctionError {
-        function: "timestamp.of".to_string(),
+        function: "timestamp".to_string(),
         message: msg.into(),
     }
 }
 
 fn timestamp_err(msg: impl Into<String>) -> ExecutionError {
-    ExecutionError::FunctionError {
-        function: "timestamp".to_string(),
-        message: msg.into(),
-    }
+    err(msg)
 }
 
 /// Builds a CEL timestamp from an epoch numeric value plus a unit string.
 pub fn from_epoch(value: i64, unit: &str) -> Result<DateTime<FixedOffset>, ExecutionError> {
     let utc: DateTime<Utc> = match unit {
         UNIT_SECONDS => DateTime::from_timestamp(value, 0)
-            .ok_or_else(|| err("timestamp.of: seconds value out of range"))?,
+            .ok_or_else(|| err("timestamp: seconds value out of range"))?,
         UNIT_MILLIS => DateTime::from_timestamp_millis(value)
-            .ok_or_else(|| err("timestamp.of: millis value out of range"))?,
+            .ok_or_else(|| err("timestamp: millis value out of range"))?,
         UNIT_MICROS => DateTime::from_timestamp_micros(value)
-            .ok_or_else(|| err("timestamp.of: micros value out of range"))?,
+            .ok_or_else(|| err("timestamp: micros value out of range"))?,
         // chrono supports nanosecond precision; nanos never overflows an i64 timestamp.
         UNIT_NANOS => DateTime::from_timestamp_nanos(value),
         _ => {
             return Err(err(format!(
-                "timestamp.of: unknown unit '{unit}'; expected one of seconds, millis, micros, nanos"
+                "timestamp: unknown unit '{unit}'; expected one of seconds, millis, micros, nanos"
             )));
         }
     };
     Ok(utc.fixed_offset())
 }
 
-/// Runtime dispatch backing `timestamp.of(...)`: `(dyn)` or `(int, string)`.
-fn timestamp_of(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
-    match args.as_slice() {
-        [Value::Int(value), Value::String(unit)] => Ok(Value::Timestamp(from_epoch(*value, unit)?)),
-        [Value::UInt(value), Value::String(unit)] => Ok(Value::Timestamp(from_epoch(
-            i64::try_from(*value).map_err(|_| err("timestamp.of: epoch value out of range"))?,
-            unit,
-        )?)),
-        [_, _] => Err(err(
-            "timestamp.of: expected (int, string) for the 2-arg form",
-        )),
-        [v] => timestamp_of_dyn(v),
-        _ => Err(err("timestamp.of: expected 1 or 2 args")),
+/// The unit a Flink-style decimal precision names. Precisions outside {0, 3, 6, 9} are rejected
+/// rather than generalized to "any p means 10^-p": with the unit a number rather than a name,
+/// that check is the only thing between a typo and a silently wrong instant.
+fn unit_for_precision(precision: i64) -> Result<&'static str, ExecutionError> {
+    match precision {
+        0 => Ok(UNIT_SECONDS),
+        3 => Ok(UNIT_MILLIS),
+        6 => Ok(UNIT_MICROS),
+        9 => Ok(UNIT_NANOS),
+        _ => Err(err(format!(
+            "timestamp: unknown precision {precision}; expected 0 (seconds), 3 (millis), \
+             6 (micros) or 9 (nanos)"
+        ))),
     }
 }
 
-fn timestamp_of_dyn(v: &Value) -> Result<Value, ExecutionError> {
+fn as_i64(v: &Value) -> Option<i64> {
     match v {
-        // Already a timestamp (e.g. from an Avro timestamp-* logical field): pass through.
-        Value::Timestamp(_) => Ok(v.clone()),
-        // Delegate RFC 3339 strings to the same parse the stdlib timestamp() uses.
-        Value::String(s) => DateTime::parse_from_rfc3339(s)
-            .map(Value::Timestamp)
-            .map_err(|e| err(format!("timestamp.of: invalid RFC 3339 string: {e}"))),
-        Value::Null => Err(err("timestamp.of: cannot convert null to Timestamp")),
-        Value::Bool(_) => Err(err("timestamp.of: cannot convert bool to Timestamp")),
-        // A raw int carries no unit — force the caller to the 2-arg form.
-        Value::Int(_) | Value::UInt(_) => Err(err(
-            "timestamp.of: raw int has no unit; use timestamp.of(value, \
-             \"seconds\"|\"millis\"|\"micros\"|\"nanos\")",
-        )),
-        _ => Err(err("timestamp.of: cannot convert value to Timestamp")),
+        Value::Int(i) => Some(*i),
+        Value::UInt(u) => i64::try_from(*u).ok(),
+        _ => None,
     }
 }
 
-/// Backs the stdlib `timestamp(int)` conversion, which cel-rust's stdlib does not declare (it
-/// registers only `string_to_timestamp` and `timestamp_to_timestamp`). cel-java declares
-/// `int64_to_timestamp` as epoch **seconds** and Go/C++/C# agree, so a bare int is seconds here
-/// too.
+/// Backs the `timestamp` overloads cel-rust's stdlib does not declare (it registers only
+/// `string_to_timestamp` and `timestamp_to_timestamp`): `(int)` as epoch **seconds**, matching
+/// cel-java's `int64_to_timestamp` and Go/C++/C#, and `(int, int)` as an epoch value at a
+/// decimal precision.
 ///
-/// Only the `(int)` shape is handled: cel-rust resolves a call against the `Env` overloads first
-/// and only falls back to the `Context::add_function` registry when no `Env` overload matches, so
-/// `timestamp(string)` and `timestamp(timestamp)` keep hitting the stdlib and never reach this
-/// function. Anything else is reported as the crate's normal no-such-overload error.
-fn timestamp_int(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
+/// cel-rust resolves a call against the `Env` overloads first and only falls back to the
+/// `Context::add_function` registry when no `Env` overload matches, so `timestamp(string)` and
+/// `timestamp(timestamp)` keep hitting the stdlib and never reach this function. Anything else is
+/// reported as the crate's normal no-such-overload error.
+fn timestamp_fn(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
     match args.as_slice() {
+        [value, precision] => {
+            let value =
+                as_i64(value).ok_or_else(|| err("timestamp: the epoch value must be an int"))?;
+            let precision =
+                as_i64(precision).ok_or_else(|| err("timestamp: the precision must be an int"))?;
+            Ok(Value::Timestamp(from_epoch(
+                value,
+                unit_for_precision(precision)?,
+            )?))
+        }
         [Value::Int(seconds)] => {
             let utc: DateTime<Utc> = DateTime::from_timestamp(*seconds, 0).ok_or_else(|| {
                 timestamp_err(format!("timestamp: {seconds} seconds is out of range"))
@@ -115,12 +109,9 @@ fn timestamp_int(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
     }
 }
 
-/// Registers `timestamp.of` and the epoch-seconds `timestamp(int)` overload on `ctx`. The
-/// namespaced name is dispatched by the executor's AST rewrite (cel-rust resolves member calls by
-/// bare name).
+/// Registers the epoch-seconds `timestamp(int)` and precision `timestamp(int, int)` overloads.
 pub fn add_timestamp_functions(ctx: &mut Context) {
-    ctx.add_function("timestamp.of", timestamp_of);
-    ctx.add_function("timestamp", timestamp_int);
+    ctx.add_function("timestamp", timestamp_fn);
 }
 
 #[cfg(test)]
@@ -170,24 +161,35 @@ mod tests {
     }
 
     #[test]
-    fn two_arg_dispatch_through_cel() {
-        // timestamp.of(value, unit) constructs, and the result compares as a timestamp.
-        assert!(matches!(
-            eval(
-                "timestamp.of(1500000000000, \"millis\") == timestamp.of(1500000000, \"seconds\")"
-            ),
-            Value::Bool(true)
-        ));
+    fn two_arg_precision_dispatch_through_cel() {
+        // Every precision names the same instant, and precision 0 equals the 1-arg form.
+        for expr in [
+            "timestamp(1500000000, 0) == timestamp(1500000000)",
+            "timestamp(1500000000000, 3) == timestamp(1500000000)",
+            "timestamp(1500000000000000, 6) == timestamp(1500000000)",
+            "timestamp(1500000000000000000, 9) == timestamp(1500000000)",
+            // Sub-second precision survives, and the two arities differ for the same int.
+            "timestamp(1700000000123, 3) == timestamp(\"2023-11-14T22:13:20.123Z\")",
+            "timestamp(1700000000, 3) != timestamp(1700000000)",
+        ] {
+            assert!(matches!(eval(expr), Value::Bool(true)), "{expr}");
+        }
     }
 
     #[test]
-    fn raw_int_without_unit_errors() {
-        assert!(
-            Program::compile("timestamp.of(1500000000)")
-                .unwrap()
-                .execute(&default_context())
-                .is_err()
-        );
+    fn precision_outside_the_set_errors() {
+        for precision in [1, 2, 4, 5, 7, 8, 10, -3] {
+            match try_eval(&format!("timestamp(1700000000, {precision})")) {
+                Err(cel::ExecutionError::FunctionError { function, message }) => {
+                    assert_eq!(function, "timestamp");
+                    assert!(
+                        message.contains("unknown precision"),
+                        "precision {precision}: {message}"
+                    );
+                }
+                other => panic!("precision {precision}: expected a FunctionError, got {other:?}"),
+            }
+        }
     }
 
     fn try_eval(expr: &str) -> Result<Value, cel::ExecutionError> {
@@ -252,21 +254,15 @@ mod tests {
             Value::Bool(true)
         ));
         assert!(matches!(
-            eval("timestamp(timestamp.of(1700000000, \"seconds\")) == timestamp(1700000000)"),
+            eval("timestamp(timestamp(1700000000, 0)) == timestamp(1700000000)"),
             Value::Bool(true)
         ));
     }
 
     #[test]
-    fn timestamp_of_still_works_unchanged() {
-        assert!(matches!(
-            eval("timestamp.of(1700000000000, \"millis\") == timestamp(1700000000)"),
-            Value::Bool(true)
-        ));
-        assert!(matches!(
-            eval("timestamp.of(\"2023-11-14T22:13:20Z\") == timestamp(1700000000)"),
-            Value::Bool(true)
-        ));
+    fn timestamp_of_namespace_is_gone() {
+        // The namespaced form is no longer registered; `timestamp.of` must not resolve.
+        assert!(try_eval("timestamp.of(1700000000000, 3)").is_err());
     }
 
     #[test]
@@ -274,6 +270,7 @@ mod tests {
         // Not swallowed: no matching Env overload and no matching arm here.
         assert!(try_eval("timestamp(1.5)").is_err());
         assert!(try_eval("timestamp(true)").is_err());
+        // Two args now means (value, precision), so this fails on the precision, not the arity.
         assert!(try_eval("timestamp(1, 2)").is_err());
     }
 }

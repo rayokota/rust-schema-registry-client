@@ -226,7 +226,9 @@ fn decimals_round(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
             .ok_or_else(|| err("decimals.round: missing argument"))?,
     )?;
     let scale = require_int_scale(scale_arg(&args)?, "decimals.round")?;
-    Ok(decimal_value(d.with_scale_round(scale, RoundingMode::HalfUp)))
+    Ok(decimal_value(
+        d.with_scale_round(scale, RoundingMode::HalfUp),
+    ))
 }
 fn decimals_trunc(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
     let d = to_decimal(
@@ -511,8 +513,14 @@ mod tests {
     #[test]
     fn require_int_scale_boundaries() {
         use super::require_int_scale;
-        assert_eq!(require_int_scale(i32::MAX as i64, "f").unwrap(), i32::MAX as i64);
-        assert_eq!(require_int_scale(i32::MIN as i64, "f").unwrap(), i32::MIN as i64);
+        assert_eq!(
+            require_int_scale(i32::MAX as i64, "f").unwrap(),
+            i32::MAX as i64
+        );
+        assert_eq!(
+            require_int_scale(i32::MIN as i64, "f").unwrap(),
+            i32::MIN as i64
+        );
         assert_eq!(require_int_scale(0, "f").unwrap(), 0);
         assert!(require_int_scale(i32::MAX as i64 + 1, "f").is_err());
         assert!(require_int_scale(i32::MIN as i64 - 1, "f").is_err());
