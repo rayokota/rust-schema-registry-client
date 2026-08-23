@@ -354,6 +354,20 @@ mod tests {
         ));
     }
 
+    /// The CEL `==` / `!=` operators on two Decimal opaques are NUMERIC (scale-insensitive),
+    /// agreeing with `decimals.eq`. This exercises the `CelDecimal::eq` path (via cel's
+    /// `PartialEq` dispatch on `Value::Opaque`), which must use `cmp(...) == Equal` and NOT
+    /// bigdecimal's own scale-sensitive `BigDecimal::eq` (where `2.0 != 2.00`).
+    #[test]
+    fn equality_operator_is_numeric() {
+        assert!(eval_bool("decimal(\"2.0\") == decimal(\"2.00\")"));
+        assert!(eval_bool("decimal(\"2.0\") == decimal(\"2.0\")"));
+        assert!(!eval_bool("decimal(\"2.0\") == decimal(\"2.1\")"));
+        // `!=` negates.
+        assert!(!eval_bool("decimal(\"2.0\") != decimal(\"2.00\")"));
+        assert!(eval_bool("decimal(\"2.0\") != decimal(\"2.1\")"));
+    }
+
     #[test]
     fn arithmetic_is_exact() {
         assert!(eval_bool(

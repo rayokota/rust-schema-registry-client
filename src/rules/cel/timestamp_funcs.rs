@@ -12,6 +12,9 @@
 //! We use the namespaced form (rather than extending stdlib `timestamp(...)` with a `(dyn)`
 //! overload) because `(dyn)` and `(string)` would overlap per the CEL signature-overlap rule on
 //! conformant impls (cel-java/go/cpp); the namespaced form keeps cross-client parity.
+//!
+//! We also fill in the one stdlib overload cel-rust is missing: `timestamp(int)` (epoch seconds),
+//! which cel-java/go/cpp/csharp all declare. See [`timestamp_int`].
 
 use cel::extractors::Arguments;
 use cel::{Context, ExecutionError, Value};
@@ -25,6 +28,13 @@ const UNIT_NANOS: &str = "nanos";
 fn err(msg: impl Into<String>) -> ExecutionError {
     ExecutionError::FunctionError {
         function: "timestamp.of".to_string(),
+        message: msg.into(),
+    }
+}
+
+fn timestamp_err(msg: impl Into<String>) -> ExecutionError {
+    ExecutionError::FunctionError {
+        function: "timestamp".to_string(),
         message: msg.into(),
     }
 }
@@ -84,10 +94,33 @@ fn timestamp_of_dyn(v: &Value) -> Result<Value, ExecutionError> {
     }
 }
 
-/// Registers `timestamp.of` on `ctx`. The namespaced name is dispatched by the executor's AST
-/// rewrite (cel-rust resolves member calls by bare name).
+/// Backs the stdlib `timestamp(int)` conversion, which cel-rust's stdlib does not declare (it
+/// registers only `string_to_timestamp` and `timestamp_to_timestamp`). cel-java declares
+/// `int64_to_timestamp` as epoch **seconds** and Go/C++/C# agree, so a bare int is seconds here
+/// too.
+///
+/// Only the `(int)` shape is handled: cel-rust resolves a call against the `Env` overloads first
+/// and only falls back to the `Context::add_function` registry when no `Env` overload matches, so
+/// `timestamp(string)` and `timestamp(timestamp)` keep hitting the stdlib and never reach this
+/// function. Anything else is reported as the crate's normal no-such-overload error.
+fn timestamp_int(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
+    match args.as_slice() {
+        [Value::Int(seconds)] => {
+            let utc: DateTime<Utc> = DateTime::from_timestamp(*seconds, 0).ok_or_else(|| {
+                timestamp_err(format!("timestamp: {seconds} seconds is out of range"))
+            })?;
+            Ok(Value::Timestamp(utc.fixed_offset()))
+        }
+        _ => Err(ExecutionError::NoSuchOverload),
+    }
+}
+
+/// Registers `timestamp.of` and the epoch-seconds `timestamp(int)` overload on `ctx`. The
+/// namespaced name is dispatched by the executor's AST rewrite (cel-rust resolves member calls by
+/// bare name).
 pub fn add_timestamp_functions(ctx: &mut Context) {
     ctx.add_function("timestamp.of", timestamp_of);
+    ctx.add_function("timestamp", timestamp_int);
 }
 
 #[cfg(test)]
@@ -155,5 +188,82 @@ mod tests {
                 .execute(&default_context())
                 .is_err()
         );
+    }
+
+    fn try_eval(expr: &str) -> Result<Value, cel::ExecutionError> {
+        Program::compile(expr)
+            .expect("compile")
+            .execute(&default_context())
+    }
+
+    #[test]
+    fn bare_int_is_epoch_seconds() {
+        // cel-java's int64_to_timestamp: a bare int is seconds since the epoch.
+        assert!(matches!(
+            eval("timestamp(1700000000) == timestamp(\"2023-11-14T22:13:20Z\")"),
+            Value::Bool(true)
+        ));
+        assert!(matches!(
+            eval("timestamp(1700000000).getFullYear()"),
+            Value::Int(2023)
+        ));
+    }
+
+    #[test]
+    fn bare_int_accepts_pre_epoch() {
+        assert!(matches!(
+            eval("timestamp(-1) == timestamp(\"1969-12-31T23:59:59Z\")"),
+            Value::Bool(true)
+        ));
+    }
+
+    #[test]
+    fn bare_int_out_of_range_errors() {
+        // Must be a clean error, not a panic.
+        assert!(try_eval("timestamp(9223372036854775807)").is_err());
+        assert!(try_eval("timestamp(-9223372036854775807)").is_err());
+    }
+
+    #[test]
+    fn stdlib_string_overload_is_not_shadowed() {
+        // `Context::add_function` is a single impl per name, so verify the Env overloads still win.
+        assert!(matches!(
+            eval("timestamp(\"2023-11-14T22:13:20Z\").getFullYear()"),
+            Value::Int(2023)
+        ));
+        // An unparseable string still reaches the stdlib parse error rather than our int impl.
+        assert!(try_eval("timestamp(\"not-a-timestamp\")").is_err());
+    }
+
+    #[test]
+    fn stdlib_timestamp_identity_is_not_shadowed() {
+        assert!(matches!(
+            eval("timestamp(timestamp(\"2023-11-14T22:13:20Z\")) == timestamp(1700000000)"),
+            Value::Bool(true)
+        ));
+        assert!(matches!(
+            eval("timestamp(timestamp.of(1700000000, \"seconds\")) == timestamp(1700000000)"),
+            Value::Bool(true)
+        ));
+    }
+
+    #[test]
+    fn timestamp_of_still_works_unchanged() {
+        assert!(matches!(
+            eval("timestamp.of(1700000000000, \"millis\") == timestamp(1700000000)"),
+            Value::Bool(true)
+        ));
+        assert!(matches!(
+            eval("timestamp.of(\"2023-11-14T22:13:20Z\") == timestamp(1700000000)"),
+            Value::Bool(true)
+        ));
+    }
+
+    #[test]
+    fn unhandled_timestamp_arg_shapes_error() {
+        // Not swallowed: no matching Env overload and no matching arm here.
+        assert!(try_eval("timestamp(1.5)").is_err());
+        assert!(try_eval("timestamp(true)").is_err());
+        assert!(try_eval("timestamp(1, 2)").is_err());
     }
 }
