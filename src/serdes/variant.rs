@@ -829,10 +829,8 @@ fn format_date(days: i64) -> String {
 /// stay in plain decimal - a minor divergence from Go's/C++'s `%g` and Java's `Double.toString`,
 /// which is the documented cross-language edge case for doubles.)
 fn format_double(d: f64) -> Result<String, VariantError> {
-    if !d.is_finite() {
-        return Err(VariantError::Malformed(
-            "cannot render non-finite double as JSON".to_string(),
-        ));
+    if let Some(s) = non_finite_json(d) {
+        return Ok(s.to_string());
     }
     if d == d.floor() && d.abs() < 1e16 {
         return Ok(format!("{}.0", d as i64));
@@ -844,15 +842,26 @@ fn format_double(d: f64) -> Result<String, VariantError> {
 /// shortest round-tripping decimal (matching Java's `Float.toString` and Apache Arrow) rather than
 /// the f64-widened form. Rust's `Display` on an `f32` yields the shortest float32 decimal.
 fn format_float(f: f32) -> Result<String, VariantError> {
-    if !f.is_finite() {
-        return Err(VariantError::Malformed(
-            "cannot render non-finite float as JSON".to_string(),
-        ));
+    if let Some(s) = non_finite_json(f as f64) {
+        return Ok(s.to_string());
     }
     if f == f.floor() && f.abs() < 1e16 {
         return Ok(format!("{}.0", f as i64));
     }
     Ok(format!("{f}"))
+}
+
+/// Renders non-finite doubles/floats as the bareword JSON tokens `NaN`, `Infinity`, and
+/// `-Infinity` (matching Jackson with `ALLOW_NON_NUMERIC_NUMBERS`, the Java reference), rather
+/// than Rust's `Display` spelling (`NaN`/`inf`/`-inf`). Returns `None` for finite values.
+fn non_finite_json(d: f64) -> Option<&'static str> {
+    if d.is_nan() {
+        Some("NaN")
+    } else if d.is_infinite() {
+        Some(if d > 0.0 { "Infinity" } else { "-Infinity" })
+    } else {
+        None
+    }
 }
 
 fn format_uuid(data: &[u8], start: usize) -> String {
@@ -1614,6 +1623,24 @@ impl<'a> JsonReader<'a> {
                 out.append_null();
                 Ok(())
             }
+            // Bareword non-finite literals (Jackson's ALLOW_NON_NUMERIC_NUMBERS, the Java
+            // reference), stored as doubles. `-Infinity` is disambiguated from a negative
+            // number by peeking at the byte after '-'.
+            Some(b'N') => {
+                self.expect_literal(b"NaN")?;
+                out.append_double(f64::NAN);
+                Ok(())
+            }
+            Some(b'I') => {
+                self.expect_literal(b"Infinity")?;
+                out.append_double(f64::INFINITY);
+                Ok(())
+            }
+            Some(b'-') if self.bytes.get(self.i + 1) == Some(&b'I') => {
+                self.expect_literal(b"-Infinity")?;
+                out.append_double(f64::NEG_INFINITY);
+                Ok(())
+            }
             Some(c) if c == b'-' || c.is_ascii_digit() => self.parse_number(out),
             Some(c) => Err(VariantError::Json(format!(
                 "unexpected character '{}'",
@@ -1765,6 +1792,9 @@ impl<'a> JsonReader<'a> {
         }
         let token = std::str::from_utf8(&self.bytes[start..self.i])
             .map_err(|_| VariantError::Json("invalid number token".to_string()))?;
+        if !is_valid_json_number(token) {
+            return Err(VariantError::Json(format!("invalid number literal {token:?}")));
+        }
         let fractional = token.contains('.') || token.contains('e') || token.contains('E');
         if !fractional {
             if let Ok(i) = token.parse::<i64>() {
@@ -1782,6 +1812,57 @@ impl<'a> JsonReader<'a> {
         out.append_double(d);
         Ok(())
     }
+}
+
+/// Validates that `s` is a JSON number literal per RFC 8259. Rust's `i64`/`f64`/`BigInt`
+/// `from_str` are more lenient than serde_json (arrow-rs) and Jackson (the Java reference),
+/// accepting leading zeros ("007", "-01") and trailing/misplaced decimal points ("1.", "1.e3");
+/// this rejects such tokens before they reach the numeric parsers.
+fn is_valid_json_number(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    if i < len && bytes[i] == b'-' {
+        i += 1;
+    }
+    // int part
+    if i >= len {
+        return false;
+    }
+    if bytes[i] == b'0' {
+        i += 1; // lone zero; no digit may follow directly
+    } else if (b'1'..=b'9').contains(&bytes[i]) {
+        i += 1;
+        while i < len && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    } else {
+        return false; // rejects leading '+', '.', etc.
+    }
+    // fraction
+    if i < len && bytes[i] == b'.' {
+        i += 1;
+        if i >= len || !bytes[i].is_ascii_digit() {
+            return false;
+        }
+        while i < len && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    // exponent
+    if i < len && (bytes[i] == b'e' || bytes[i] == b'E') {
+        i += 1;
+        if i < len && (bytes[i] == b'+' || bytes[i] == b'-') {
+            i += 1;
+        }
+        if i >= len || !bytes[i].is_ascii_digit() {
+            return false;
+        }
+        while i < len && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    i == len
 }
 
 fn push_code_point(out: &mut Vec<u8>, cp: u32) -> Result<(), VariantError> {
@@ -2017,6 +2098,44 @@ mod tests {
     }
 
     #[test]
+    fn parse_json_strict_number_grammar() {
+        // Bug #22: reject malformed number literals that Rust's from_str accepts but
+        // serde_json (arrow-rs) and Jackson (Java reference) reject.
+        for json in [
+            "007", "00", "-01", "1.", "1.e3", "1e", "01", "[007]", "{\"a\":1.}",
+        ] {
+            assert!(
+                Variant::parse_json(json).is_err(),
+                "expected Err for malformed number {json:?}"
+            );
+        }
+
+        // Valid RFC 8259 number grammar must still parse.
+        for json in [
+            "0",
+            "0.5",
+            "-0",
+            "123",
+            "1.5",
+            "1e10",
+            "-1.5E+3",
+            "3.14e-2",
+            "[1,2,3]",
+            // big integer > i64 range: valid grammar -> scale-0 decimal
+            "123456789012345678901234567890",
+        ] {
+            assert!(
+                Variant::parse_json(json).is_ok(),
+                "expected Ok for valid number {json:?}"
+            );
+        }
+
+        // Numbers inside strings are string values, unaffected by number validation.
+        assert!(Variant::parse_json("{\"x\":\"007\"}").is_ok());
+        assert!(Variant::parse_json("\"1.\"").is_ok());
+    }
+
+    #[test]
     fn simple_object_round_trip() {
         assert_eq!(
             Variant::parse_json("{\"x\":1}").unwrap().to_json().unwrap(),
@@ -2177,6 +2296,73 @@ mod tests {
         assert_eq!(format_double(-3.0).unwrap(), "-3.0");
         assert_eq!(format_double(1.5).unwrap(), "1.5");
         assert_eq!(format_double(0.1).unwrap(), "0.1");
+    }
+
+    #[test]
+    fn non_finite_double_and_float_render_as_barewords() {
+        // toJson emits bareword NaN/Infinity/-Infinity (Java/Jackson contract), not quoted
+        // strings and not Rust's `inf`/`-inf` Display spelling.
+        assert_eq!(format_double(f64::NAN).unwrap(), "NaN");
+        assert_eq!(format_double(f64::INFINITY).unwrap(), "Infinity");
+        assert_eq!(format_double(f64::NEG_INFINITY).unwrap(), "-Infinity");
+        assert_eq!(format_float(f32::NAN).unwrap(), "NaN");
+        assert_eq!(format_float(f32::INFINITY).unwrap(), "Infinity");
+        assert_eq!(format_float(f32::NEG_INFINITY).unwrap(), "-Infinity");
+
+        // Binary builder accepts and stores non-finite doubles/floats; to_json renders barewords.
+        let mut b = VariantBuilder::new();
+        b.append_double(f64::NAN).unwrap();
+        assert_eq!(b.build().unwrap().to_json().unwrap(), "NaN");
+
+        let mut b = VariantBuilder::new();
+        b.append_double(f64::INFINITY).unwrap();
+        assert_eq!(b.build().unwrap().to_json().unwrap(), "Infinity");
+
+        let mut b = VariantBuilder::new();
+        b.append_double(f64::NEG_INFINITY).unwrap();
+        assert_eq!(b.build().unwrap().to_json().unwrap(), "-Infinity");
+
+        let mut b = VariantBuilder::new();
+        b.append_float(f32::NEG_INFINITY).unwrap();
+        assert_eq!(b.build().unwrap().to_json().unwrap(), "-Infinity");
+    }
+
+    #[test]
+    fn parse_non_finite_barewords_and_overflow() {
+        // Out-of-range magnitude parses to f64 infinity and is stored (Java contract).
+        assert_eq!(Variant::parse_json("1e400").unwrap().to_json().unwrap(), "Infinity");
+        assert_eq!(
+            Variant::parse_json("-1e400").unwrap().to_json().unwrap(),
+            "-Infinity"
+        );
+
+        // Bareword literal input is accepted by the extended number scanner and round-trips.
+        assert_eq!(Variant::parse_json("NaN").unwrap().to_json().unwrap(), "NaN");
+        assert_eq!(
+            Variant::parse_json("Infinity").unwrap().to_json().unwrap(),
+            "Infinity"
+        );
+        assert_eq!(
+            Variant::parse_json("-Infinity").unwrap().to_json().unwrap(),
+            "-Infinity"
+        );
+
+        // The bug #22 strict grammar is still enforced.
+        for json in ["007", "1.", "1e", ".5", "Inf", "nan", "infinity"] {
+            assert!(
+                Variant::parse_json(json).is_err(),
+                "expected Err for {json:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_empty_and_whitespace_are_soft_errors() {
+        // Empty / whitespace-only input returns a normal VariantError (no panic), which
+        // variants.tryParseJson maps to CEL null.
+        assert!(Variant::parse_json("").is_err());
+        assert!(Variant::parse_json("   ").is_err());
+        assert!(Variant::parse_json("\t\n\r ").is_err());
     }
 
     #[test]

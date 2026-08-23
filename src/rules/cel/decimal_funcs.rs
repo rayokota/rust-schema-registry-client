@@ -93,7 +93,8 @@ fn decimal(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
     match args.as_slice() {
         [v] => Ok(decimal_value(to_decimal(v)?)),
         [Value::Bytes(bytes), Value::Int(scale)] => {
-            Ok(decimal_value(from_bytes_scale(bytes, *scale)))
+            let scale = require_int_scale(*scale, "decimal(bytes, scale)")?;
+            Ok(decimal_value(from_bytes_scale(bytes, scale)))
         }
         _ => Err(err("decimal: expected (dyn) or (bytes, int)")),
     }
@@ -207,21 +208,32 @@ fn scale_arg(args: &[Value]) -> Result<i64, ExecutionError> {
         _ => Err(err("expected 1 or 2 arguments")),
     }
 }
+
+/// Narrow a CEL int (i64) scale into the i32 range a `BigDecimal` scale occupies elsewhere,
+/// erroring on out-of-range values instead of silently honoring them. CEL int is i64, but
+/// Java/Python/JS all back the scale with a 32-bit int, so a value like `3_000_000_000` is
+/// rejected there. bigdecimal accepts an i64 scale, so without this check Rust would diverge
+/// and honor it. Mirrors Java's `requireIntScale` (`Math.toIntExact`), same error text.
+fn require_int_scale(scale: i64, function_name: &str) -> Result<i64, ExecutionError> {
+    i32::try_from(scale)
+        .map(i64::from)
+        .map_err(|_| err(format!("{function_name}: scale out of int range: {scale}")))
+}
+
 fn decimals_round(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
     let d = to_decimal(
         args.first()
             .ok_or_else(|| err("decimals.round: missing argument"))?,
     )?;
-    Ok(decimal_value(
-        d.with_scale_round(scale_arg(&args)?, RoundingMode::HalfUp),
-    ))
+    let scale = require_int_scale(scale_arg(&args)?, "decimals.round")?;
+    Ok(decimal_value(d.with_scale_round(scale, RoundingMode::HalfUp)))
 }
 fn decimals_trunc(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
     let d = to_decimal(
         args.first()
             .ok_or_else(|| err("decimals.trunc: missing argument"))?,
     )?;
-    let scale = scale_arg(&args)?;
+    let scale = require_int_scale(scale_arg(&args)?, "decimals.trunc")?;
     // Flink's TRUNCATE early-returns when the target scale is at-or-finer than the current one:
     // there is nothing to drop, so the input is returned unchanged. Without this guard
     // `with_scale_round` would zero-pad and `string(trunc(d, n >= cur))` would diverge from
@@ -443,6 +455,55 @@ mod tests {
                 .execute(&default_context())
                 .is_err()
         );
+    }
+
+    /// A scale outside i32 range must error rather than silently narrow. CEL int is i64, but
+    /// the scale is a 32-bit int in Java/Python/JS (Java's `requireIntScale`), so all clients
+    /// reject the same inputs; bigdecimal would otherwise honor an i64 scale here.
+    #[test]
+    fn out_of_int32_scale_errors_instead_of_narrowing() {
+        // decimals.round / decimals.trunc with a scale beyond i32::MAX.
+        assert!(
+            Program::compile("decimals.round(decimal(\"1.5\"), 3000000000)")
+                .unwrap()
+                .execute(&default_context())
+                .is_err()
+        );
+        assert!(
+            Program::compile("decimals.trunc(decimal(\"1.5\"), 3000000000)")
+                .unwrap()
+                .execute(&default_context())
+                .is_err()
+        );
+        // Below i32::MIN as well.
+        assert!(
+            Program::compile("decimals.round(decimal(\"1.5\"), -3000000000)")
+                .unwrap()
+                .execute(&default_context())
+                .is_err()
+        );
+        // The decimal(bytes, scale) constructor guards its scale the same way.
+        assert!(
+            Program::compile("decimal(b\"\\x01\", 9223372036854775807)")
+                .unwrap()
+                .execute(&default_context())
+                .is_err()
+        );
+    }
+
+    /// The bounds check accepts the full i32 range and rejects anything past it (matching Java's
+    /// `Math.toIntExact`). Tested on the helper directly so the "accepted" cases don't zero-pad a
+    /// BigDecimal out to billions of digits the way a real `round` at i32::MAX would.
+    #[test]
+    fn require_int_scale_boundaries() {
+        use super::require_int_scale;
+        assert_eq!(require_int_scale(i32::MAX as i64, "f").unwrap(), i32::MAX as i64);
+        assert_eq!(require_int_scale(i32::MIN as i64, "f").unwrap(), i32::MIN as i64);
+        assert_eq!(require_int_scale(0, "f").unwrap(), 0);
+        assert!(require_int_scale(i32::MAX as i64 + 1, "f").is_err());
+        assert!(require_int_scale(i32::MIN as i64 - 1, "f").is_err());
+        assert!(require_int_scale(i64::MAX, "f").is_err());
+        assert!(require_int_scale(i64::MIN, "f").is_err());
     }
 
     fn eval_str(expr: &str) -> String {

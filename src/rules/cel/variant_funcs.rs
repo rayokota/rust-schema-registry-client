@@ -140,6 +140,8 @@ fn receiver(v: &Value) -> Result<Option<Variant>, ExecutionError> {
 
 fn variant(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
     match args.as_slice() {
+        // CEL null passes through (aligns with the Java reference variant(null) -> null).
+        [Value::Null] => Ok(Value::Null),
         [v] => Ok(variant_value(to_variant(v)?)),
         [Value::Bytes(value), Value::Bytes(metadata)] => Ok(variant_value(Variant::new(
             value.as_ref().clone(),
@@ -383,10 +385,56 @@ mod tests {
             // tryAs returns CEL null on a type mismatch (age is an int, not a string).
             "variants.tryAs(variants.field(variants.parseJson(this), 'age'), 'string') == null",
             r#"variants.toJson(variants.field(variants.parseJson(this), 'nested')) == '{"x":1}'"#,
+            // variant(null) passes CEL null through (aligns with the Java reference), both
+            // directly and composed with a navigation accessor over an absent field.
+            "variant(null) == null",
+            "variants.field(variant(variants.field(variants.parseJson(this), 'missing')), 'k') == null",
         ];
         for expr in cases {
             assert!(eval_bool(expr, doc_string()), "expr failed: {expr}");
         }
+    }
+
+    #[test]
+    fn try_parse_json_empty_is_null() {
+        // Empty / whitespace-only input is a soft failure: variants.tryParseJson maps the
+        // VariantError to CEL null rather than propagating an error or panicking.
+        assert_eq!(variants_try_parse_json(Value::String(Arc::new(String::new()))), Ok(Value::Null));
+        assert_eq!(
+            variants_try_parse_json(Value::String(Arc::new("   ".to_string()))),
+            Ok(Value::Null)
+        );
+        assert_eq!(
+            variants_try_parse_json(Value::String(Arc::new("\t\n\r ".to_string()))),
+            Ok(Value::Null)
+        );
+        // parseJson (the strict variant) surfaces the same input as an error.
+        assert!(variants_parse_json(Value::String(Arc::new(String::new()))).is_err());
+        // End to end through the CEL executor.
+        assert!(eval_bool("variants.tryParseJson('') == null", doc_string()));
+        assert!(eval_bool("variants.tryParseJson('   ') == null", doc_string()));
+    }
+
+    #[test]
+    fn non_finite_round_trip_through_cel() {
+        // Bareword non-finite literals parse and re-render as barewords through the CEL layer.
+        assert!(eval_bool(
+            "variants.toJson(variants.parseJson('NaN')) == 'NaN'",
+            doc_string(),
+        ));
+        assert!(eval_bool(
+            "variants.toJson(variants.parseJson('Infinity')) == 'Infinity'",
+            doc_string(),
+        ));
+        assert!(eval_bool(
+            "variants.toJson(variants.parseJson('-Infinity')) == '-Infinity'",
+            doc_string(),
+        ));
+        // Out-of-range magnitude becomes Infinity.
+        assert!(eval_bool(
+            "variants.toJson(variants.parseJson('1e400')) == 'Infinity'",
+            doc_string(),
+        ));
     }
 
     // An Avro variant record, converted through the real Avro→CEL path (from_serde_value →
