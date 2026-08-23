@@ -219,9 +219,19 @@ mod tests {
 
     #[test]
     fn bare_int_out_of_range_errors() {
-        // Must be a clean error, not a panic.
-        assert!(try_eval("timestamp(9223372036854775807)").is_err());
-        assert!(try_eval("timestamp(-9223372036854775807)").is_err());
+        // Must be a clean FunctionError, not a panic (and not an UndeclaredReference, which would
+        // mean the overload never reached us).
+        for expr in [
+            "timestamp(9223372036854775807)",
+            "timestamp(-9223372036854775807)",
+        ] {
+            match try_eval(expr) {
+                Err(cel::ExecutionError::FunctionError { function, .. }) => {
+                    assert_eq!(function, "timestamp")
+                }
+                other => panic!("{expr}: expected a timestamp FunctionError, got {other:?}"),
+            }
+        }
     }
 
     #[test]
