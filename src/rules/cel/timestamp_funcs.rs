@@ -30,8 +30,24 @@ fn err(msg: impl Into<String>) -> ExecutionError {
     }
 }
 
-fn timestamp_err(msg: impl Into<String>) -> ExecutionError {
-    err(msg)
+/// CEL's timestamp range: `0001-01-01T00:00:00Z` through `9999-12-31T23:59:59.999999999Z`, the
+/// `google.protobuf.Timestamp` contract the CEL specification adopts wholesale.
+///
+/// chrono's own range is far wider (roughly year -262143 through 262142), so `from_timestamp`
+/// accepts instants no other client will: `timestamp(253402300800)` built a year-10000 value that
+/// merely compared unequal, where cel-java, cel-go, cel-cpp and cel-python all raise.
+const MIN_TIMESTAMP_SECONDS: i64 = -62_135_596_800;
+const MAX_TIMESTAMP_SECONDS: i64 = 253_402_300_799;
+
+fn check_range(utc: DateTime<Utc>) -> Result<DateTime<Utc>, ExecutionError> {
+    let seconds = utc.timestamp();
+    if !(MIN_TIMESTAMP_SECONDS..=MAX_TIMESTAMP_SECONDS).contains(&seconds) {
+        return Err(err(format!(
+            "timestamp: seconds ({seconds}) must be in range \
+             [{MIN_TIMESTAMP_SECONDS}, {MAX_TIMESTAMP_SECONDS}]"
+        )));
+    }
+    Ok(utc)
 }
 
 /// Builds a CEL timestamp from an epoch numeric value plus a unit string.
@@ -51,7 +67,7 @@ pub fn from_epoch(value: i64, unit: &str) -> Result<DateTime<FixedOffset>, Execu
             )));
         }
     };
-    Ok(utc.fixed_offset())
+    Ok(check_range(utc)?.fixed_offset())
 }
 
 /// The unit a Flink-style decimal precision names. Precisions outside {0, 3, 6, 9} are rejected
@@ -99,12 +115,7 @@ fn timestamp_fn(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
                 unit_for_precision(precision)?,
             )?))
         }
-        [Value::Int(seconds)] => {
-            let utc: DateTime<Utc> = DateTime::from_timestamp(*seconds, 0).ok_or_else(|| {
-                timestamp_err(format!("timestamp: {seconds} seconds is out of range"))
-            })?;
-            Ok(Value::Timestamp(utc.fixed_offset()))
-        }
+        [Value::Int(seconds)] => Ok(Value::Timestamp(from_epoch(*seconds, UNIT_SECONDS)?)),
         _ => Err(ExecutionError::NoSuchOverload),
     }
 }
@@ -217,6 +228,34 @@ mod tests {
             eval("timestamp(-1) == timestamp(\"1969-12-31T23:59:59Z\")"),
             Value::Bool(true)
         ));
+    }
+
+    #[test]
+    fn cel_timestamp_range_is_enforced() {
+        // CEL's range is google.protobuf.Timestamp's: 0001-01-01T00:00:00Z through
+        // 9999-12-31T23:59:59.999999999Z. chrono accepts far wider (roughly year -262143 to
+        // 262142), so it has to be checked explicitly — cel-java raises on each of these, and
+        // before this check the first one built a year-10000 instant that merely compared unequal.
+        for expr in [
+            "timestamp(253402300800)",
+            "timestamp(-62135596801)",
+            "timestamp(253402300800000, 3)",
+        ] {
+            match try_eval(expr) {
+                Err(cel::ExecutionError::FunctionError { function, message }) => {
+                    assert_eq!(function, "timestamp");
+                    assert!(message.contains("must be in range"), "{expr}: {message}");
+                }
+                other => panic!("{expr}: expected a FunctionError, got {other:?}"),
+            }
+        }
+        // Both boundaries are themselves valid.
+        for expr in [
+            "timestamp(253402300799).getFullYear() == 9999",
+            "timestamp(-62135596800).getFullYear() == 1",
+        ] {
+            assert!(matches!(eval(expr), Value::Bool(true)), "{expr}");
+        }
     }
 
     #[test]
