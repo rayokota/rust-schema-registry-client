@@ -534,4 +534,52 @@ mod tests {
             other => panic!("expected string, got {other:?}"),
         }
     }
+
+    /// Cross-client parity: a bare `confluent.type.Decimal` field is usable with `decimals.*`,
+    /// `==`, `string()` and `double()` with **no `decimal(...)` call** on it. The discriminating
+    /// case is the scale-differing equality: a client comparing decimals by their protobuf
+    /// encoding (unscaled bytes plus scale, field by field) answers false for
+    /// `decimal("12.340")`, because 12.34 and 12.340 are the same number in two encodings.
+    #[test]
+    fn proto_decimal_needs_no_constructor() {
+        use crate::rules::cel::cel_executor::from_protobuf_value_for_test;
+        use prost_reflect::{DynamicMessage, Value as ProtoValue};
+
+        let desc = crate::DESCRIPTOR_POOL
+            .get_message_by_name(super::DECIMAL_TYPE_NAME)
+            .expect("decimal.proto is compiled into the descriptor pool");
+        let mut msg = DynamicMessage::new(desc);
+        // 12.34 = unscaled 1234 (0x04D2) at scale 2.
+        msg.set_field_by_name("value", ProtoValue::Bytes(vec![0x04, 0xd2].into()));
+        msg.set_field_by_name("scale", ProtoValue::I32(2));
+        let this = from_protobuf_value_for_test(&ProtoValue::Message(msg));
+
+        for expr in [
+            // Bare: no constructor call on the field.
+            "decimals.eq(this, decimal(\"12.34\"))",
+            "decimals.gt(this, decimal(\"10.00\"))",
+            // The wrapped form must keep working (decimal(...) re-entry).
+            "decimals.eq(decimal(this), decimal(\"12.34\"))",
+            // `==` is numeric on it: 12.34 equals 12.340 despite the differing scale.
+            "this == decimal(\"12.340\")",
+            "decimals.lt(this, decimal(\"100\"))",
+            "string(this) == \"12.34\"",
+            "double(this) == 12.34",
+        ] {
+            assert!(eval_bool_with(expr, this.clone()), "{expr}");
+        }
+        // Negative controls.
+        assert!(!eval_bool_with("this != decimal(\"12.340\")", this.clone()));
+        assert!(!eval_bool_with(
+            "decimals.gt(this, decimal(\"100\"))",
+            this.clone()
+        ));
+    }
+
+    fn eval_bool_with(expr: &str, this: Value) -> bool {
+        let program = Program::compile(expr).expect("compile");
+        let mut ctx = default_context();
+        ctx.add_variable_from_value("this", this);
+        matches!(program.execute(&ctx).expect("execute"), Value::Bool(true))
+    }
 }

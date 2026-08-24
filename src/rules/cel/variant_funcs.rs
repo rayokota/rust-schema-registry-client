@@ -180,11 +180,13 @@ fn variants_type(v: Value) -> Result<Value, ExecutionError> {
 }
 
 fn variants_is_null(v: Value) -> Result<bool, ExecutionError> {
-    Ok(match &v {
-        Value::Opaque(o) if o.runtime_type_name() == VARIANT_TYPE_NAME => o
-            .downcast_ref::<CelVariant>()
-            .map(|cv| cv.0.get_type() == Type::Null)
-            .unwrap_or(false),
+    // Coerces through `receiver` like every other accessor. Matching only the opaque form
+    // answered false for the shapes a variant-typed field decodes to — the `Value::Map` an Avro
+    // variant record and a protobuf confluent.type.Variant both convert to — which the untyped
+    // signature admits, so a bare variant holding an explicit JSON null reported "not null".
+    // A non-variant stays false rather than erroring: this predicate never fails.
+    Ok(match receiver(&v) {
+        Ok(Some(vv)) => vv.get_type() == Type::Null,
         _ => false,
     })
 }
@@ -508,5 +510,120 @@ mod tests {
             "variants.as(variants.field(variant(this), 'age'), 'int') == 30",
             this,
         ));
+    }
+    /// `variants.isNull` must coerce its receiver like every other accessor. It is declared over
+    /// dyn, so a bare variant field reaches it; a receiver check that only accepts the opaque
+    /// form answers false for the shapes a variant-typed field decodes to, reporting "not null"
+    /// for a variant holding an explicit JSON null. A bare *object* cannot catch this — isNull on
+    /// an object is false either way — so only a variant that is itself null discriminates.
+    #[test]
+    fn variant_is_null_coerces_bare_receiver() {
+        use crate::rules::cel::cel_executor::{from_protobuf_value_for_test, from_serde_value};
+        use crate::serdes::serde::SerdeValue;
+        use apache_avro::types::Value as AvroValue;
+        use prost_reflect::{DynamicMessage, Value as ProtoValue};
+
+        for (json, expected) in [("null", true), ("5", false)] {
+            let pv = Variant::parse_json(json).expect("parse");
+
+            let record = AvroValue::Record(vec![
+                (
+                    "metadata".to_string(),
+                    AvroValue::Bytes(pv.metadata_bytes().to_vec()),
+                ),
+                (
+                    "value".to_string(),
+                    AvroValue::Bytes(pv.value_bytes().to_vec()),
+                ),
+            ]);
+            let avro_this = from_serde_value(&SerdeValue::Avro(record));
+
+            let desc = crate::DESCRIPTOR_POOL
+                .get_message_by_name("confluent.type.Variant")
+                .expect("variant.proto is compiled into the descriptor pool");
+            let mut msg = DynamicMessage::new(desc);
+            msg.set_field_by_name(
+                "metadata",
+                ProtoValue::Bytes(pv.metadata_bytes().to_vec().into()),
+            );
+            msg.set_field_by_name("value", ProtoValue::Bytes(pv.value_bytes().to_vec().into()));
+            let proto_this = from_protobuf_value_for_test(&ProtoValue::Message(msg));
+
+            for (kind, this) in [("avro", avro_this), ("proto", proto_this)] {
+                assert_eq!(
+                    eval_bool("variants.isNull(this)", this.clone()),
+                    expected,
+                    "{kind}: bare variants.isNull on {json}"
+                );
+                // The wrapped form has always worked and must keep working.
+                assert_eq!(
+                    eval_bool("variants.isNull(variant(this))", this.clone()),
+                    expected,
+                    "{kind}: wrapped variants.isNull on {json}"
+                );
+            }
+        }
+    }
+
+    /// Cross-client parity: a variant value is usable with the `variants.*` accessors with **no
+    /// `variant(...)` call**, in both formats, and the wrapped form keeps working alongside it.
+    /// The accessors take an untyped `Arguments` and coerce through `receiver`, which accepts
+    /// both the opaque form and the `Value::Map` that the Avro and Protobuf paths produce.
+    #[test]
+    fn variant_needs_no_constructor() {
+        use crate::rules::cel::cel_executor::{from_protobuf_value_for_test, from_serde_value};
+        use crate::serdes::serde::SerdeValue;
+        use apache_avro::types::Value as AvroValue;
+        use prost_reflect::{DynamicMessage, Value as ProtoValue};
+
+        let pv = Variant::parse_json(DOC).expect("parse");
+
+        // Avro: a variant record through the real Avro -> CEL path.
+        let record = AvroValue::Record(vec![
+            (
+                "metadata".to_string(),
+                AvroValue::Bytes(pv.metadata_bytes().to_vec()),
+            ),
+            (
+                "value".to_string(),
+                AvroValue::Bytes(pv.value_bytes().to_vec()),
+            ),
+        ]);
+        let avro_this = from_serde_value(&SerdeValue::Avro(record));
+
+        // Protobuf: a confluent.type.Variant message through the real Protobuf -> CEL path.
+        let desc = crate::DESCRIPTOR_POOL
+            .get_message_by_name("confluent.type.Variant")
+            .expect("variant.proto is compiled into the descriptor pool");
+        let mut msg = DynamicMessage::new(desc);
+        msg.set_field_by_name(
+            "metadata",
+            ProtoValue::Bytes(pv.metadata_bytes().to_vec().into()),
+        );
+        msg.set_field_by_name("value", ProtoValue::Bytes(pv.value_bytes().to_vec().into()));
+        let proto_this = from_protobuf_value_for_test(&ProtoValue::Message(msg));
+
+        for (kind, this) in [("avro", avro_this), ("proto", proto_this)] {
+            for expr in [
+                // Bare: no constructor call.
+                "variants.type(this) == 'object'",
+                "variants.as(variants.field(this, 'name'), 'string') == 'alice'",
+                "variants.as(variants.path(this, '$.nested.x'), 'int') == 1",
+                // The wrapped form must keep working (variant(...) re-entry).
+                "variants.as(variants.field(variant(this), 'name'), 'string') == 'alice'",
+                // A missing key is CEL null, not an error.
+                "variants.field(this, 'nope') == null",
+            ] {
+                assert!(eval_bool(expr, this.clone()), "{kind}: {expr}");
+            }
+            // Negative control.
+            assert!(
+                !eval_bool(
+                    "variants.as(variants.field(this, 'name'), 'string') == 'bob'",
+                    this.clone(),
+                ),
+                "{kind}: negative control held"
+            );
+        }
     }
 }
