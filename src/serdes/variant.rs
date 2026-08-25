@@ -637,17 +637,17 @@ impl Variant {
             }
             Type::Date => {
                 out.push('"');
-                out.push_str(&format_date(self.get_long()?));
+                out.push_str(&format_date(self.get_long()?)?);
                 out.push('"');
             }
             Type::TimestampTz => {
                 out.push('"');
-                out.push_str(&format_instant_micros(self.get_long()?));
+                out.push_str(&format_instant_micros(self.get_long()?)?);
                 out.push('"');
             }
             Type::TimestampNtz => {
                 out.push('"');
-                out.push_str(&format_local_date_time_micros(self.get_long()?));
+                out.push_str(&format_local_date_time_micros(self.get_long()?)?);
                 out.push('"');
             }
             Type::TimestampNanosTz => {
@@ -662,7 +662,7 @@ impl Variant {
             }
             Type::Time => {
                 out.push('"');
-                out.push_str(&format_local_time(self.get_long()?));
+                out.push_str(&format_local_time(self.get_long()?)?);
                 out.push('"');
             }
             Type::Binary => {
@@ -840,9 +840,34 @@ fn format_instant(total_nanos: i64) -> String {
     format_instant_parts(sec, nano)
 }
 
-fn format_instant_micros(micros: i64) -> String {
-    let (sec, nano) = micros_to_secs_nanos(micros);
-    format_instant_parts(sec, nano)
+/// The range a timestamp may occupy when rendered to JSON, in microseconds since the epoch:
+/// 0001-01-01T00:00:00 through 9999-12-31T23:59:59.999999.
+///
+/// A variant TIMESTAMP_TZ / TIMESTAMP_NTZ is an arbitrary i64 of microseconds - roughly
+/// +/-292,471 years - so it can hold instants outside the four-digit-year form every client
+/// renders. Those are refused rather than rendered: for TIMESTAMP_TZ, ISO-8601's expanded year
+/// ("+10000-01-01T00:00:00Z") is not RFC 3339 and would not parse back; for TIMESTAMP_NTZ the
+/// same range keeps the zone-less form parseable by the same date readers and matches the
+/// zone-aware one. It is also exactly what Python's `datetime` and .NET's `DateTime` can hold,
+/// so every client can enforce it natively.
+///
+/// The nanosecond-based types need no check: an i64 of nanoseconds spans only 1677-2262.
+const MIN_TIMESTAMP_MICROS: i64 = -62135596800000000;
+const MAX_TIMESTAMP_MICROS: i64 = 253402300799999999;
+
+fn check_micros_range(micros: i64) -> Result<i64, VariantError> {
+    if !(MIN_TIMESTAMP_MICROS..=MAX_TIMESTAMP_MICROS).contains(&micros) {
+        return Err(VariantError::Malformed(format!(
+            "timestamp microseconds ({micros}) must be in range \
+             [{MIN_TIMESTAMP_MICROS}, {MAX_TIMESTAMP_MICROS}]"
+        )));
+    }
+    Ok(micros)
+}
+
+fn format_instant_micros(micros: i64) -> Result<String, VariantError> {
+    let (sec, nano) = micros_to_secs_nanos(check_micros_range(micros)?);
+    Ok(format_instant_parts(sec, nano))
 }
 
 fn format_instant_parts(sec: i64, nano: i64) -> String {
@@ -866,9 +891,9 @@ fn format_local_date_time(total_nanos: i64) -> String {
     format_local_date_time_parts(sec, nano)
 }
 
-fn format_local_date_time_micros(micros: i64) -> String {
-    let (sec, nano) = micros_to_secs_nanos(micros);
-    format_local_date_time_parts(sec, nano)
+fn format_local_date_time_micros(micros: i64) -> Result<String, VariantError> {
+    let (sec, nano) = micros_to_secs_nanos(check_micros_range(micros)?);
+    Ok(format_local_date_time_parts(sec, nano))
 }
 
 fn format_local_date_time_parts(sec: i64, nano: i64) -> String {
@@ -887,18 +912,51 @@ fn format_local_date_time_parts(sec: i64, nano: i64) -> String {
     )
 }
 
-fn format_local_time(micros: i64) -> String {
+/// The range a TIME may occupy, in microseconds since midnight: 00:00:00 through 23:59:59.999999.
+/// RFC 3339's `partial-time` requires `time-hour = 2DIGIT` in 00-23, so a value at or past 24 hours
+/// (or negative) has no valid form. A variant TIME is an i64 of microseconds, so those are
+/// reachable and are refused rather than rendered; checking also removes an overflow, since
+/// `micros * 1000` wraps for a large enough value.
+const MIN_TIME_MICROS: i64 = 0;
+const MAX_TIME_MICROS: i64 = 86_400_000_000 - 1;
+
+/// The range a DATE may occupy, in days since the epoch: 0001-01-01 through 9999-12-31. RFC 3339's
+/// `full-date` requires `date-fullyear = 4DIGIT`, so an expanded or negative year is not a valid
+/// `full-date`. A variant DATE is an i32 of days - roughly +/-5.8 million years - so those are
+/// reachable and are refused too.
+const MIN_DATE_EPOCH_DAY: i64 = -719162;
+const MAX_DATE_EPOCH_DAY: i64 = 2932896;
+
+fn format_local_time(micros: i64) -> Result<String, VariantError> {
+    if !(MIN_TIME_MICROS..=MAX_TIME_MICROS).contains(&micros) {
+        return Err(VariantError::Malformed(format!(
+            "time microseconds of day ({micros}) must be in range \
+             [{MIN_TIME_MICROS}, {MAX_TIME_MICROS}]"
+        )));
+    }
     let nano_of_day = micros * 1000;
     let secs = floor_div(nano_of_day, 1_000_000_000);
     let nano = floor_mod(nano_of_day, 1_000_000_000);
     let hour = secs / 3600;
     let rem = secs % 3600;
-    format!("{:02}:{:02}:{:02}{}", hour, rem / 60, rem % 60, frac(nano))
+    Ok(format!(
+        "{:02}:{:02}:{:02}{}",
+        hour,
+        rem / 60,
+        rem % 60,
+        frac(nano)
+    ))
 }
 
-fn format_date(days: i64) -> String {
+fn format_date(days: i64) -> Result<String, VariantError> {
+    if !(MIN_DATE_EPOCH_DAY..=MAX_DATE_EPOCH_DAY).contains(&days) {
+        return Err(VariantError::Malformed(format!(
+            "date epoch day ({days}) must be in range \
+             [{MIN_DATE_EPOCH_DAY}, {MAX_DATE_EPOCH_DAY}]"
+        )));
+    }
     let (y, mo, da) = civil_from_days(days);
-    format!("{:04}-{:02}-{:02}", y, mo, da)
+    Ok(format!("{:04}-{:02}-{:02}", y, mo, da))
 }
 
 /// Integral doubles render as N.0; other values use Rust's shortest round-trip decimal
@@ -2428,8 +2486,8 @@ mod tests {
         assert_eq!(v.to_json().unwrap(), "\"1969-12-31\"");
 
         // A well-before-1970 date: -719162 days ~ year 0001-01-01 area; just check it renders.
-        assert_eq!(format_date(-1), "1969-12-31");
-        assert_eq!(format_date(0), "1970-01-01");
+        assert_eq!(format_date(-1).unwrap(), "1969-12-31");
+        assert_eq!(format_date(0).unwrap(), "1970-01-01");
         // Negative timestamp micros -> pre-epoch instant.
         assert_eq!(format_instant(-1_000_000_000), "1969-12-31T23:59:59Z");
     }
