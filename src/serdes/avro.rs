@@ -2006,8 +2006,7 @@ mod tests {
             // The schema's scale is applied, not guessed: as scale 0 this would be 1234.
             "decimals.lt(message.decField, decimal(\"100\"))",
         ] {
-            let r =
-                serialize_with_cel_condition(DECIMAL_SCHEMA, expr, decimal_field_12_34()).await;
+            let r = serialize_with_cel_condition(DECIMAL_SCHEMA, expr, decimal_field_12_34()).await;
             assert!(r.is_ok(), "{expr}: {r:?}");
         }
         // Negative control: a false comparison must fail.
