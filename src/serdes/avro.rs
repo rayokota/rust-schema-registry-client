@@ -191,11 +191,10 @@ impl<'a, T: Client + Sync> AvroSerializer<'a, T> {
                 }
             }
         } else {
-            apache_avro::to_avro_datum_schemata(
-                &schema_tuple.0,
-                schema_tuple.1.iter().collect(),
-                value,
-            )?
+            apache_avro::writer::datum::GenericDatumWriter::builder(&schema_tuple.0)
+                .schemata(schema_tuple.1.iter().collect())?
+                .build()?
+                .write_value_to_vec(value)?
         };
         if let Some(ref latest_schema) = latest_schema {
             let schema = latest_schema.to_schema();
@@ -271,9 +270,9 @@ impl<'a, T: Client + Sync> AvroSerializer<'a, T> {
     pub async fn get_record_name(&self, schema: &Schema) -> Result<String, SerdeError> {
         let (parsed_schema, _) = self.get_parsed_schema(schema).await?;
         match parsed_schema {
-            apache_avro::Schema::Record(r) => Ok(match &r.name.namespace {
-                Some(ns) => format!("{ns}.{}", r.name.name),
-                None => r.name.name.clone(),
+            apache_avro::Schema::Record(r) => Ok(match &r.name.namespace() {
+                Some(ns) => format!("{ns}.{}", r.name.name()),
+                None => r.name.name().to_string(),
             }),
             _ => Err(Serialization(
                 "Schema is not an Avro record type".to_string(),
@@ -523,12 +522,10 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
                 // If the writer schema is bytes, just pass the bytes along
                 Value::Bytes(data.to_vec())
             } else {
-                apache_avro::from_avro_datum_schemata(
-                    &writer_schema,
-                    writer_named.iter().collect(),
-                    &mut reader,
-                    None,
-                )?
+                apache_avro::reader::datum::GenericDatumReader::builder(&writer_schema)
+                    .writer_schemata(writer_named.iter().collect())?
+                    .build()?
+                    .read_value(&mut reader)?
             };
             let json = from_avro_value(value.clone())?;
             let mut serde_value = SerdeValue::Json(json);
@@ -545,13 +542,12 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
             value = if matches!(writer_schema, apache_avro::Schema::Bytes) {
                 Value::Bytes(data.to_vec())
             } else {
-                apache_avro::from_avro_datum_reader_schemata(
-                    &writer_schema,
-                    writer_named.iter().collect(),
-                    &mut reader,
-                    Some(&reader_schema),
-                    reader_named.iter().collect(),
-                )?
+                apache_avro::reader::datum::GenericDatumReader::builder(&writer_schema)
+                    .writer_schemata(writer_named.iter().collect())?
+                    .maybe_reader_schema(Some(&reader_schema))
+                    .reader_schemata(reader_named.iter().collect())?
+                    .build()?
+                    .read_value(&mut reader)?
             };
         }
 
@@ -621,9 +617,9 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
     pub async fn get_record_name(&self, schema: &Schema) -> Result<String, SerdeError> {
         let (parsed_schema, _) = self.get_parsed_schema(schema).await?;
         match parsed_schema {
-            apache_avro::Schema::Record(r) => Ok(match &r.name.namespace {
-                Some(ns) => format!("{ns}.{}", r.name.name),
-                None => r.name.name.clone(),
+            apache_avro::Schema::Record(r) => Ok(match &r.name.namespace() {
+                Some(ns) => format!("{ns}.{}", r.name.name()),
+                None => r.name.name().to_string(),
             }),
             _ => Err(Serialization(
                 "Schema is not an Avro record type".to_string(),
@@ -910,7 +906,7 @@ fn get_type(schema: &apache_avro::Schema) -> FieldType {
         apache_avro::Schema::Record(_) => FieldType::Record,
         apache_avro::Schema::Decimal(_) => FieldType::Bytes,
         apache_avro::Schema::BigDecimal => FieldType::Bytes,
-        apache_avro::Schema::Uuid => FieldType::String,
+        apache_avro::Schema::Uuid(_) => FieldType::String,
         apache_avro::Schema::Date => FieldType::Int,
         apache_avro::Schema::TimeMillis => FieldType::Int,
         apache_avro::Schema::TimeMicros => FieldType::Long,
@@ -920,7 +916,7 @@ fn get_type(schema: &apache_avro::Schema) -> FieldType {
         apache_avro::Schema::LocalTimestampMillis => FieldType::Long,
         apache_avro::Schema::LocalTimestampMicros => FieldType::Long,
         apache_avro::Schema::LocalTimestampNanos => FieldType::Long,
-        apache_avro::Schema::Duration => FieldType::Fixed,
+        apache_avro::Schema::Duration(_) => FieldType::Fixed,
         // TODO assume Ref is a record, is this correct?
         apache_avro::Schema::Ref { name: _ } => FieldType::Record,
     }
@@ -1189,7 +1185,7 @@ fn resolve_union<'a>(
     union: &'a UnionSchema,
     message: &Value,
 ) -> Option<(usize, &'a apache_avro::Schema)> {
-    union.find_schema_with_known_schemata::<apache_avro::Schema>(message, None, &None)
+    union.find_schema_with_known_schemata::<apache_avro::Schema>(message, None, None)
 }
 
 fn from_avro_value(value: Value) -> Result<serde_json::Value, SerdeError> {
