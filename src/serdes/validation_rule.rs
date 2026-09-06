@@ -49,6 +49,25 @@ pub enum ValidationRuleResult {
     Message(String),
 }
 
+/// The schema a validation rule is evaluated against, borrowed from the validation walk.
+///
+/// Some values are not self-describing: an Avro decimal is unscaled bytes, and its scale lives
+/// only in the schema. Without this a rule reads `12.34` as `1234` — silently, with no error.
+///
+/// Borrowed rather than reusing [`SerdeSchema`](crate::serdes::serde::SerdeSchema) because the
+/// walk reaches a different schema at every field, and `SerdeSchema` owns its contents: passing
+/// it would clone the schema and every named definition once per rule.
+#[non_exhaustive]
+pub enum ValidationSchema<'a> {
+    /// The Avro schema the value conforms to, plus the named definitions that a
+    /// `Schema::Ref` inside it resolves against — already collected by the walk, so this
+    /// borrows the map rather than rebuilding it per rule.
+    Avro(
+        &'a apache_avro::Schema,
+        &'a std::collections::HashMap<apache_avro::schema::Name, &'a apache_avro::Schema>,
+    ),
+}
+
 /// Evaluates a single inline validation rule against a value.
 pub trait ValidationRuleExecutor: Send + Sync {
     /// The type identifier for this executor.
@@ -57,9 +76,14 @@ pub trait ValidationRuleExecutor: Send + Sync {
     /// Evaluates the rule against `value`. Returns an error when the rule cannot be
     /// compiled or evaluated, or when it resolves to something other than a bool or a
     /// string.
+    ///
+    /// `schema` is the schema `value` conforms to, when the walk knows it. It is needed
+    /// wherever the value alone is not self-describing — see [`ValidationSchema`]. This
+    /// mirrors the JVM client's `ValidationRuleExecutor.execute(rule, schema, message)`.
     fn execute(
         &self,
         rule: &ValidationRule,
+        schema: Option<ValidationSchema<'_>>,
         value: &SerdeValue,
     ) -> Result<ValidationRuleResult, SerdeError>;
 }
@@ -169,11 +193,12 @@ pub fn parse_validation_rules(prop: Option<&serde_json::Value>) -> Vec<Validatio
 pub fn evaluate_validation_rule(
     executor: &dyn ValidationRuleExecutor,
     rule: &ValidationRule,
+    schema: Option<ValidationSchema<'_>>,
     value: &SerdeValue,
     path: &str,
     violations: &mut Vec<ValidationRuleError>,
 ) -> bool {
-    match executor.execute(rule, value) {
+    match executor.execute(rule, schema, value) {
         Err(e) => {
             violations.push(ValidationRuleError {
                 rule: rule.clone(),
@@ -250,13 +275,13 @@ mod tests {
 
         assert_eq!(
             validator
-                .execute(&rule("n", "this.name == 'alice'"), &value)
+                .execute(&rule("n", "this.name == 'alice'"), None, &value)
                 .unwrap(),
             ValidationRuleResult::Bool(true)
         );
         assert_eq!(
             validator
-                .execute(&rule("n", "this.name == 'bob'"), &value)
+                .execute(&rule("n", "this.name == 'bob'"), None, &value)
                 .unwrap(),
             ValidationRuleResult::Bool(false)
         );
@@ -271,6 +296,7 @@ mod tests {
             validator
                 .execute(
                     &rule("n", "this.age >= 18 ? '' : 'must be an adult'"),
+                    None,
                     &value
                 )
                 .unwrap(),
@@ -282,14 +308,14 @@ mod tests {
     fn test_cel_validator_rejects_non_boolean_result() {
         let validator = CelValidator::new();
         let value = SerdeValue::Json(json!({"age": 3}));
-        assert!(validator.execute(&rule("n", "this.age"), &value).is_err());
+        assert!(validator.execute(&rule("n", "this.age"), None, &value).is_err());
     }
 
     #[test]
     fn test_cel_validator_rejects_empty_expression() {
         let validator = CelValidator::new();
         let value = SerdeValue::Json(json!({"age": 3}));
-        assert!(validator.execute(&rule("n", ""), &value).is_err());
+        assert!(validator.execute(&rule("n", ""), None, &value).is_err());
     }
 
     #[test]
@@ -303,6 +329,7 @@ mod tests {
         assert!(evaluate_validation_rule(
             &validator,
             &rule("bad", "this.missing"),
+            None,
             &value,
             "$",
             &mut violations

@@ -1,10 +1,10 @@
 use crate::rules::cel::cel_executor::{
-    PresencePaths, collect_has_paths, from_serde_value_with_presence,
+    PresencePaths, collect_has_paths, from_avro_value_with_schema, from_serde_value_with_presence,
 };
 use crate::rules::cel::cel_lib::default_context;
 use crate::serdes::serde::{SerdeError, SerdeValue};
 use crate::serdes::validation_rule::{
-    ValidationRule, ValidationRuleExecutor, ValidationRuleResult,
+    ValidationRule, ValidationRuleExecutor, ValidationRuleResult, ValidationSchema,
 };
 use cel::{Program, Value};
 use chrono::Utc;
@@ -46,6 +46,7 @@ impl ValidationRuleExecutor for CelValidator {
     fn execute(
         &self,
         rule: &ValidationRule,
+        schema: Option<ValidationSchema<'_>>,
         value: &SerdeValue,
     ) -> Result<ValidationRuleResult, SerdeError> {
         let name = rule_name(rule);
@@ -68,8 +69,20 @@ impl ValidationRuleExecutor for CelValidator {
         })?;
         let (program, presence) = cached.value();
 
+        // Bind `this` against the schema when the walk supplied one. An Avro decimal is
+        // unscaled bytes with the scale held in the schema, so without this a rule reads
+        // 12.34 as 1234 and answers wrongly with no error. This is the same resolution
+        // CelExecutor::message_binding applies to `message` for domain rules; presence
+        // dropping is a protobuf concern, so the Avro arm does not need it.
+        let this = match (&schema, value) {
+            (Some(ValidationSchema::Avro(s, defs)), SerdeValue::Avro(v)) => {
+                from_avro_value_with_schema(v, s, defs)
+            }
+            _ => from_serde_value_with_presence(value, presence),
+        };
+
         let mut context = default_context();
-        context.add_variable_from_value("this", from_serde_value_with_presence(value, presence));
+        context.add_variable_from_value("this", this);
         context.add_variable_from_value("now", Value::Timestamp(Utc::now().into()));
 
         match program.execute(&context)? {

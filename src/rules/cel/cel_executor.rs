@@ -1,4 +1,6 @@
 use crate::rules::cel::cel_lib::default_context;
+use crate::rules::cel::protobuf_result_writer::{write_back_protobuf, write_back_value_type};
+use crate::rules::cel::variant_funcs::{to_variant, VARIANT_TYPE_NAME};
 use crate::rules::cel::decimal_funcs::{
     DECIMAL_TYPE_NAME, decimal_value, from_bytes_scale, to_decimal,
 };
@@ -159,6 +161,29 @@ impl CelExecutor {
                     input, &result, schema, &defs,
                 )?))
             }
+            // A message-level transform returns a map that is the whole new message; rebuild
+            // it. Without this the protobuf arm of to_serde_value turns the map into a
+            // prost_reflect Map and its catch-all turns an unrecognised value into empty bytes,
+            // so decimal and timestamp were replaced with b"" rather than merely unwritten.
+            (SerdeValue::Protobuf(prost_reflect::Value::Message(m)), _) => {
+                // A field rule over a decimal or timestamp is handed the whole message and
+                // hands back a CEL value; encode it against that message's own descriptor.
+                // The generic conversion below has no arm for a decimal opaque and would turn
+                // it into empty bytes.
+                // A condition answers with a bool, which is a verdict on the value rather
+                // than a replacement for it and must not be encoded as one.
+                if ctx.rule.kind != Some(crate::rest::models::Kind::Condition)
+                    && let Some(encoded) = write_back_value_type(&m.descriptor(), &result)
+                {
+                    return Ok(SerdeValue::Protobuf(prost_reflect::Value::Message(encoded?)));
+                }
+                match write_back_protobuf(m, &result)? {
+                    Some(rebuilt) => {
+                        Ok(SerdeValue::Protobuf(prost_reflect::Value::Message(rebuilt)))
+                    }
+                    None => Ok(to_serde_value(msg, &result)),
+                }
+            }
             _ => Ok(to_serde_value(msg, &result)),
         }
     }
@@ -275,7 +300,7 @@ fn avro_definitions<'a>(
 /// Converts an Avro value for CEL, walking it against its schema so that decimal fields get
 /// their scale and logical types are recognised. Anything the schema does not add information to
 /// falls back to the schemaless [`from_avro_value`].
-fn from_avro_value_with_schema(
+pub(crate) fn from_avro_value_with_schema(
     value: &apache_avro::types::Value,
     schema: &AvroSchema,
     defs: &HashMap<AvroName, &AvroSchema>,
@@ -879,6 +904,34 @@ fn to_avro_value_with_schema(
                 unscaled.to_signed_bytes_be(),
             )))
         }
+        // A computed variant is a CEL opaque, not a map of the record's fields, so the
+        // Record/Map arm below never sees it. Without this it fell through to the loose
+        // conversion and was written back as Avro null - the counterpart of the decimal arm
+        // above, and the one shape that arm did not cover.
+        (AvroSchema::Record(rs), Value::Opaque(o))
+            if o.runtime_type_name() == VARIANT_TYPE_NAME =>
+        {
+            let variant = to_variant(value)
+                .map_err(|e| SerdeError::Rule(e.to_string()))?
+                .ok_or_else(|| {
+                    SerdeError::Rule(
+                        "cannot write an absent variant; use null to clear the field"
+                            .to_string(),
+                    )
+                })?;
+            let mut out = Vec::with_capacity(rs.fields.len());
+            for field in &rs.fields {
+                let bytes = match field.name.as_str() {
+                    "metadata" => variant.metadata_bytes().to_vec(),
+                    "value" => variant.value_bytes().to_vec(),
+                    // A variant record carries exactly these two fields; anything else is
+                    // not part of the shape and has no value to write.
+                    _ => continue,
+                };
+                out.push((field.name.clone(), AV::Bytes(bytes)));
+            }
+            Ok(AV::Record(out))
+        }
         (AvroSchema::TimestampMillis, Value::Timestamp(ts)) => {
             Ok(AV::TimestampMillis(ts.timestamp_millis()))
         }
@@ -895,6 +948,26 @@ fn to_avro_value_with_schema(
             let mut out = Vec::with_capacity(rs.fields.len());
             for field in &rs.fields {
                 let Some(cel_v) = m.map.get(&Key::String(Arc::new(field.name.clone()))) else {
+                    // Replace, not merge: the map is the whole new record, so a field the rule
+                    // does not name is not carried over from the input. Avro has no absent
+                    // field, so it takes the schema's declared default - or is an error, which
+                    // is what GenericRecordBuilder.build() does on the JVM. Omitting it instead
+                    // produced a record the writer rejected with "Value does not match schema",
+                    // naming nothing.
+                    let Some(default) = field.default.as_ref() else {
+                        return Err(SerdeError::Rule(format!(
+                            "CEL transform result does not set field '{}' of '{}', which has \
+                             no default value",
+                            field.name, rs.name
+                        )));
+                    };
+                    // The default is stored as the raw JSON it was written as; `resolve` is how
+                    // apache-avro itself reads one, so a union default lands on the right branch
+                    // and a logical type is lifted rather than left as its underlying value.
+                    out.push((
+                        field.name.clone(),
+                        AV::try_from(default.clone())?.resolve(&field.schema)?,
+                    ));
                     continue;
                 };
                 let child_input = match input {

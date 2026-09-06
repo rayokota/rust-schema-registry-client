@@ -1214,7 +1214,7 @@ fn evaluate_rules(
     }
     let serde_value = SerdeValue::Json(value.clone());
     for rule in &rules {
-        evaluate_validation_rule(executor, rule, &serde_value, path, violations);
+        evaluate_validation_rule(executor, rule, None, &serde_value, path, violations);
         if fail_fast && !violations.is_empty() {
             return true;
         }

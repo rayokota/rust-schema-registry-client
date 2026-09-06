@@ -88,9 +88,20 @@ fn type_label(t: Type) -> &'static str {
     }
 }
 
+/// A variant whose metadata is empty carries no value at all: a Protobuf field left unset, or an
+/// Avro variant record with empty byte fields. `Variant::new` accepts it — the version byte is
+/// only read later — so the check belongs here, and callers map it to CEL null rather than
+/// letting an accessor fail on a buffer that was never populated.
+fn is_absent(v: &Variant) -> bool {
+    v.metadata_bytes().is_empty()
+}
+
 /// Reads a Variant from a CEL map with `metadata`/`value` byte entries (an Avro record or a
-/// Protobuf message decoded into CEL). None if the map lacks either byte field.
-fn variant_from_map(m: &Map) -> Option<Variant> {
+/// Protobuf message decoded into CEL).
+///
+/// Three outcomes: `None` if the map is not variant-shaped (the caller reports that), `Some(None)`
+/// if it is variant-shaped but absent, and `Some(Some(v))` for a readable variant.
+fn variant_from_map(m: &Map) -> Option<Option<Variant>> {
     let get = |k: &str| -> Option<Vec<u8>> {
         match m.map.get(&Key::String(Arc::new(k.to_string()))) {
             Some(Value::Bytes(b)) => Some(b.as_ref().clone()),
@@ -98,18 +109,30 @@ fn variant_from_map(m: &Map) -> Option<Variant> {
         }
     };
     match (get("value"), get("metadata")) {
-        (Some(value), Some(metadata)) => Some(Variant::new(value, metadata)),
+        (Some(value), Some(metadata)) => Some(if metadata.is_empty() {
+            None
+        } else {
+            Some(Variant::new(value, metadata))
+        }),
         _ => None,
     }
 }
 
 /// The `variant(dyn)` dispatch: an opaque Variant, or a map with metadata/value bytes.
-/// Rejects strings (use `variants.parseJson`) and null.
-fn to_variant(v: &Value) -> Result<Variant, ExecutionError> {
+/// Rejects strings (use `variants.parseJson`) and null. `Ok(None)` means the input is an absent
+/// variant, which the caller reports as CEL null.
+pub(crate) fn to_variant(v: &Value) -> Result<Option<Variant>, ExecutionError> {
     match v {
         Value::Opaque(o) if o.runtime_type_name() == VARIANT_TYPE_NAME => o
             .downcast_ref::<CelVariant>()
-            .map(|cv| cv.0.clone())
+            .map(|cv| {
+                let inner = cv.0.clone();
+                if is_absent(&inner) {
+                    None
+                } else {
+                    Some(inner)
+                }
+            })
             .ok_or_else(|| err("variant: opaque value is not a Variant")),
         Value::Map(m) => variant_from_map(m)
             .ok_or_else(|| err("variant: map missing 'metadata'/'value' byte entries")),
@@ -128,11 +151,16 @@ fn receiver(v: &Value) -> Result<Option<Variant>, ExecutionError> {
         Value::Null => Ok(None),
         Value::Opaque(o) if o.runtime_type_name() == VARIANT_TYPE_NAME => o
             .downcast_ref::<CelVariant>()
-            .map(|cv| Some(cv.0.clone()))
+            .map(|cv| {
+                let inner = cv.0.clone();
+                if is_absent(&inner) {
+                    None
+                } else {
+                    Some(inner)
+                }
+            })
             .ok_or_else(|| err("variant: opaque value is not a Variant")),
-        Value::Map(m) => variant_from_map(m)
-            .map(Some)
-            .ok_or_else(|| err("expected a Variant")),
+        Value::Map(m) => variant_from_map(m).ok_or_else(|| err("expected a Variant")),
         _ => Err(err("expected a Variant")),
     }
 }
@@ -143,11 +171,24 @@ fn variant(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
     match args.as_slice() {
         // CEL null passes through (aligns with the Java reference variant(null) -> null).
         [Value::Null] => Ok(Value::Null),
-        [v] => Ok(variant_value(to_variant(v)?)),
-        [Value::Bytes(value), Value::Bytes(metadata)] => Ok(variant_value(Variant::new(
-            value.as_ref().clone(),
-            metadata.as_ref().clone(),
-        ))),
+        [v] => Ok(match to_variant(v)? {
+            Some(variant) => variant_value(variant),
+            // An absent variant reports as CEL null, like the `variant(null)` arm above.
+            None => Value::Null,
+        }),
+        [Value::Bytes(value), Value::Bytes(metadata)] => {
+            if metadata.is_empty() {
+                // Passing empty metadata explicitly is a rule-authoring mistake rather than an
+                // absent field, so it is reported instead of yielding null.
+                return Err(err(
+                    "variant: metadata is empty, so there is no variant to read",
+                ));
+            }
+            Ok(variant_value(Variant::new(
+                value.as_ref().clone(),
+                metadata.as_ref().clone(),
+            )))
+        }
         _ => Err(err("variant: expected (dyn) or (bytes, bytes)")),
     }
 }
@@ -412,6 +453,67 @@ mod tests {
         for expr in cases {
             assert!(eval_bool(expr, doc_string()), "expr failed: {expr}");
         }
+    }
+
+    /// The CEL map shape a variant-typed field decodes to, with the given raw bytes.
+    fn variant_map(value: Vec<u8>, metadata: Vec<u8>) -> Value {
+        let mut m = std::collections::HashMap::new();
+        m.insert(Key::String(Arc::new("value".to_string())), Value::Bytes(Arc::new(value)));
+        m.insert(
+            Key::String(Arc::new("metadata".to_string())),
+            Value::Bytes(Arc::new(metadata)),
+        );
+        Value::Map(Map { map: Arc::new(m) })
+    }
+
+    /// An *absent* variant — a Protobuf field left unset, or an Avro variant record whose byte
+    /// fields are empty — carries no metadata, so there is nothing to read. It reads as CEL null
+    /// and every accessor propagates that, rather than `Variant::new` accepting it and an
+    /// accessor later indexing into a buffer that was never populated.
+    #[test]
+    fn absent_variant_reads_as_null() {
+        let absent = variant_map(Vec::new(), Vec::new());
+        let cases = [
+            "variants.type(this) == null",
+            // isNull is false, not an error: an absent variant is not a JSON null.
+            "!variants.isNull(this)",
+            "variants.field(this, 'name') == null",
+            "variants.path(this, '$.name') == null",
+            // The explicit constructor reports it as CEL null too, like `variant(null)`.
+            "variant(this) == null",
+        ];
+        for expr in cases {
+            assert!(eval_bool(expr, absent.clone()), "expr failed: {expr}");
+        }
+    }
+
+    /// Absent must stay distinguishable from a variant that genuinely holds JSON null: the former
+    /// is CEL null, the latter a present variant whose type is NULL.
+    #[test]
+    fn explicit_null_variant_is_not_absent() {
+        assert!(eval_bool(
+            "variants.isNull(variants.parseJson('null'))",
+            doc_string()
+        ));
+        assert!(eval_bool(
+            "variants.type(variants.parseJson('null')) != null",
+            doc_string()
+        ));
+    }
+
+    /// Passing empty metadata explicitly is a rule-authoring mistake rather than an absent field,
+    /// so it is reported instead of yielding null.
+    #[test]
+    fn variant_from_empty_metadata_bytes_is_rejected() {
+        let err = variant(Arguments(Arc::new(vec![
+            Value::Bytes(Arc::new(Vec::new())),
+            Value::Bytes(Arc::new(Vec::new())),
+        ])))
+        .expect_err("empty metadata must be rejected");
+        assert!(
+            format!("{err:?}").contains("metadata is empty"),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
