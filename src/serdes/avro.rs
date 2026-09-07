@@ -753,6 +753,14 @@ async fn transform(
                     return Ok(message.clone());
                 };
                 let result = transform(ctx, subschema, named_schemas, inner).await?;
+                // A condition's result is a verdict on the field, not a replacement for it, so
+                // it does not belong inside the union: re-wrapping hid the bare
+                // `Value::Boolean(false)` that the record-field check tests for, and every
+                // false `CEL_FIELD` condition over a nullable field passed silently. Plain
+                // fields never went through here, which is why the existing tests missed it.
+                if ctx.rule.kind == Some(Kind::Condition) {
+                    return Ok(result);
+                }
                 return Ok(Value::Union(*index, Box::new(result)));
             }
             // Not wrapped in a union: fall back to matching structurally.
@@ -1727,6 +1735,321 @@ mod tests {
         }
     }
 
+    // TEMP C8 sweep. Delete once recorded.
+    #[tokio::test]
+    async fn zz_c8() {
+        const DIR: &str = "/private/tmp/claude-501/-Users-robertyokota-code-work-schema-registry/2e779696-9557-474c-8a8d-6c163f6d2bf3/scratchpad/mine/c8";
+        let schema_str = std::fs::read_to_string(format!("{DIR}/schema.avsc")).unwrap();
+        let cases = std::fs::read_to_string(format!("{DIR}/cases.tsv")).unwrap();
+        let record = || {
+            Value::Record(vec![
+                ("amount".to_string(), Value::Union(0, Box::new(Value::Null))),
+                ("ts".to_string(), Value::Union(0, Box::new(Value::Null))),
+                ("plain".to_string(), Value::String("hi".to_string())),
+            ])
+        };
+        let mut out: Vec<String> = Vec::new();
+        for line in cases.trim().split('\n') {
+            let f: Vec<&str> = line.split('\t').collect();
+            let (label, kind, rtype, tag, expr) =
+                (f[0], f[1], f[2], f.get(3).copied().unwrap_or(""), f[4]);
+            let client = MockSchemaRegistryClient::new(
+                ClientConfig::new(vec!["mock://".to_string()]));
+            let rule = Rule {
+                name: "r".to_string(), doc: None,
+                kind: Some(if kind == "CONDITION" { Kind::Condition } else { Kind::Transform }),
+                mode: Some(Mode::Write), r#type: rtype.to_string(),
+                tags: if tag.is_empty() { None } else { Some(vec![tag.to_string()]) },
+                params: None, expr: Some(expr.to_string()),
+                on_success: None, on_failure: None, disabled: None,
+            };
+            let schema = Schema {
+                schema_type: Some("AVRO".to_string()), references: None, metadata: None,
+                rule_set: Some(Box::new(RuleSet { migration_rules: None,
+                    domain_rules: Some(vec![rule]), encoding_rules: None, enable_at: None })),
+                schema: schema_str.clone() };
+            client.register_schema("test-value", &schema, false).await.unwrap();
+            let reg = RuleRegistry::new();
+            reg.register_executor(CelExecutor::new());
+            reg.register_executor(crate::rules::cel::cel_field_executor::CelFieldExecutor::new());
+            let ser = AvroSerializer::new(&client, None, Some(reg.clone()),
+                SerializerConfig::new(false, Some(SchemaSelector::LatestVersion), true, false,
+                                      HashMap::new())).unwrap();
+            let ctx = SerializationContext { topic: "test".to_string(),
+                serde_type: SerdeType::Value, serde_format: SerdeFormat::Avro, headers: None };
+            let res = match ser.serialize(&ctx, record()).await {
+                Ok(bytes) => {
+                    if kind == "CONDITION" { "true".to_string() } else {
+                        let d = AvroDeserializer::new(&client, Some(reg.clone()),
+                            DeserializerConfig::default()).unwrap();
+                        match d.deserialize(&ctx, &bytes).await {
+                            Ok(v) => {
+                                let Record(fs) = v.value else { panic!() };
+                                let n = if tag == "AMOUNT" { "amount" } else { "ts" };
+                                format!("field={:?}",
+                                    fs.iter().find(|(k, _)| k == n).unwrap().1)
+                            }
+                            Err(e) => format!("DESERR: {e:?}"),
+                        }
+                    }
+                }
+                Err(e) => {
+                    let m = format!("{e:?}");
+                    if kind == "CONDITION" && m.contains("condition failed") {
+                        "false".to_string()
+                    } else {
+                        format!("ERR: {}", &m[..m.len().min(95)])
+                    }
+                }
+            };
+            out.push(format!("{label}|{res}"));
+        }
+        std::fs::write(format!("{DIR}/rust.txt"), out.join("\n")).unwrap();
+        println!("{}", out.join("\n"));
+    }
+
+    // TEMP C8 extended sweep. Delete once recorded.
+    #[tokio::test]
+    async fn zz_c8ext() {
+        const DIR: &str = "/private/tmp/claude-501/-Users-robertyokota-code-work-schema-registry/2e779696-9557-474c-8a8d-6c163f6d2bf3/scratchpad/mine/c8";
+        let schema_str = std::fs::read_to_string(format!("{DIR}/schema.avsc")).unwrap();
+        let cases = std::fs::read_to_string(format!("{DIR}/cases_ext.tsv")).unwrap();
+        let record = |present: bool| {
+            Value::Record(vec![
+                ("amount".to_string(), Value::Union(0, Box::new(Value::Null))),
+                ("ts".to_string(), if present {
+                    Value::Union(1, Box::new(Value::TimestampMillis(1700000000000)))
+                } else { Value::Union(0, Box::new(Value::Null)) }),
+                ("plain".to_string(), Value::String("hi".to_string())),
+            ])
+        };
+        let mut out: Vec<String> = Vec::new();
+        for line in cases.trim().split('\n') {
+            let f: Vec<&str> = line.split('\t').collect();
+            let (label, kind, rtype, tag, expr) =
+                (f[0], f[1], f[2], f.get(3).copied().unwrap_or(""), f[4]);
+            let client = MockSchemaRegistryClient::new(
+                ClientConfig::new(vec!["mock://".to_string()]));
+            let rule = Rule {
+                name: "r".to_string(), doc: None,
+                kind: Some(if kind == "CONDITION" { Kind::Condition } else { Kind::Transform }),
+                mode: Some(Mode::Write), r#type: rtype.to_string(),
+                tags: if tag.is_empty() { None } else { Some(vec![tag.to_string()]) },
+                params: None, expr: Some(expr.to_string()),
+                on_success: None, on_failure: None, disabled: None,
+            };
+            let schema = Schema {
+                schema_type: Some("AVRO".to_string()), references: None, metadata: None,
+                rule_set: Some(Box::new(RuleSet { migration_rules: None,
+                    domain_rules: Some(vec![rule]), encoding_rules: None, enable_at: None })),
+                schema: schema_str.clone() };
+            client.register_schema("test-value", &schema, false).await.unwrap();
+            let reg = RuleRegistry::new();
+            reg.register_executor(CelExecutor::new());
+            reg.register_executor(crate::rules::cel::cel_field_executor::CelFieldExecutor::new());
+            let ser = AvroSerializer::new(&client, None, Some(reg.clone()),
+                SerializerConfig::new(false, Some(SchemaSelector::LatestVersion), true, false,
+                                      HashMap::new())).unwrap();
+            let ctx = SerializationContext { topic: "test".to_string(),
+                serde_type: SerdeType::Value, serde_format: SerdeFormat::Avro, headers: None };
+            let res = match ser.serialize(&ctx, record(label.ends_with("_PRESENT"))).await {
+                Ok(bytes) => {
+                    let d = AvroDeserializer::new(&client, Some(reg.clone()),
+                        DeserializerConfig::default()).unwrap();
+                    match d.deserialize(&ctx, &bytes).await {
+                        Ok(v) => {
+                            let Record(fs) = v.value else { panic!() };
+                            let g = |n: &str| format!("{:?}",
+                                fs.iter().find(|(k, _)| k == n).map(|(_, v)| v));
+                            format!("ok (amount={}, ts={})", g("amount"), g("ts"))
+                        }
+                        Err(e) => format!("DESERR: {e:?}"),
+                    }
+                }
+                Err(e) => {
+                    let m = format!("{e:?}");
+                    format!("ERR: {}", &m[..m.len().min(110)])
+                }
+            };
+            out.push(format!("{label}|{res}"));
+        }
+        std::fs::write(format!("{DIR}/rust_ext.txt"), out.join("\n")).unwrap();
+        println!("{}", out.join("\n"));
+    }
+
+    // TEMP C9 sweep. Delete once recorded.
+    #[tokio::test]
+    async fn zz_c9() {
+        const DIR: &str = "/private/tmp/claude-501/-Users-robertyokota-code-work-schema-registry/2e779696-9557-474c-8a8d-6c163f6d2bf3/scratchpad/mine/c9";
+        let schema_str = std::fs::read_to_string(format!("{DIR}/schema.avsc")).unwrap();
+        let cases = std::fs::read_to_string(format!("{DIR}/cases.tsv")).unwrap();
+
+        let variant = crate::serdes::variant::Variant::parse_json(r#"{"name":"alice"}"#).unwrap();
+        let var_rec = || {
+            Value::Record(vec![
+                ("metadata".to_string(), Value::Bytes(variant.metadata_bytes().to_vec())),
+                ("value".to_string(), Value::Bytes(variant.value_bytes().to_vec())),
+            ])
+        };
+        let dec = |b: Vec<u8>| Value::Decimal(apache_avro::Decimal::from(b));
+        let record = || {
+            Value::Record(vec![
+                ("amounts".to_string(), Value::Array(vec![dec(vec![0, 0, 0, 0x6f]), dec(vec![0, 0, 0, 0xde])])),
+                ("amountMap".to_string(), Value::Map(
+                    [("a".to_string(), dec(vec![0, 0, 0x01, 0x4d]))].into_iter().collect())),
+                ("nested".to_string(), Value::Record(vec![
+                    ("inner".to_string(), dec(vec![0, 0, 0x01, 0xbc]))])),
+                ("stamps".to_string(), Value::Array(vec![Value::TimestampMillis(1_700_000_000_123)])),
+                ("vars".to_string(), Value::Array(vec![var_rec()])),
+                ("nestedVar".to_string(), Value::Record(vec![("innerVar".to_string(), var_rec())])),
+            ])
+        };
+
+        // Control: encode the fixture with NO rule at all. If this fails, the record does not
+        // match the schema and every "failure" below is a fixture artifact, not a client defect.
+        {
+            let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+            let client = MockSchemaRegistryClient::new(client_conf);
+            let schema = Schema {
+                schema_type: Some("AVRO".to_string()), references: None, metadata: None,
+                rule_set: None, schema: schema_str.clone() };
+            client.register_schema("test-value", &schema, false).await.unwrap();
+            let ser_conf = SerializerConfig::new(
+                false, Some(SchemaSelector::LatestVersion), true, false, HashMap::new());
+            let ser = AvroSerializer::new(&client, None, None, ser_conf).unwrap();
+            let ser_ctx = SerializationContext {
+                topic: "test".to_string(), serde_type: SerdeType::Value,
+                serde_format: SerdeFormat::Avro, headers: None };
+            match ser.serialize(&ser_ctx, record()).await {
+                Ok(b) => println!("CONTROL no-rule encode -> OK ({} bytes)", b.len()),
+                Err(e) => println!("CONTROL no-rule encode -> {e:?}"),
+            }
+            // Is the by-name reference to confluent.type.Variant inside nestedVar the blocker?
+            // Encode the same fixture with that one field dropped from both schema and record.
+            let mut j: serde_json::Value = serde_json::from_str(&schema_str).unwrap();
+            j["fields"].as_array_mut().unwrap().retain(|f| f["name"] != "nestedVar");
+            let trimmed = serde_json::to_string(&j).unwrap();
+            let Record(fs2) = record() else { unreachable!() };
+            let rec2 = Record(fs2.into_iter().filter(|(k, _)| k != "nestedVar").collect());
+            let client2 = MockSchemaRegistryClient::new(
+                ClientConfig::new(vec!["mock://".to_string()]));
+            let schema2 = Schema {
+                schema_type: Some("AVRO".to_string()), references: None, metadata: None,
+                rule_set: None, schema: trimmed };
+            client2.register_schema("t2-value", &schema2, false).await.unwrap();
+            let ser2 = AvroSerializer::new(&client2, None, None,
+                SerializerConfig::new(false, Some(SchemaSelector::LatestVersion), true, false,
+                                      HashMap::new())).unwrap();
+            let ctx2 = SerializationContext { topic: "t2".to_string(),
+                serde_type: SerdeType::Value, serde_format: SerdeFormat::Avro, headers: None };
+            match ser2.serialize(&ctx2, rec2).await {
+                Ok(b) => println!("CONTROL without nestedVar -> OK ({} bytes)", b.len()),
+                Err(e) => println!("CONTROL without nestedVar -> {e:?}"),
+            }
+
+            // Is the decimal read-back failure container-specific? Round-trip a TOP-LEVEL
+            // decimal field of the same precision through the same serializer.
+            let top = r#"{"type":"record","name":"TopDec","fields":[{"name":"amount","type":{"type":"bytes","logicalType":"decimal","precision":8,"scale":2}}]}"#;
+            let client3 = MockSchemaRegistryClient::new(
+                ClientConfig::new(vec!["mock://".to_string()]));
+            let schema3 = Schema { schema_type: Some("AVRO".to_string()), references: None,
+                metadata: None, rule_set: None, schema: top.to_string() };
+            client3.register_schema("t3-value", &schema3, false).await.unwrap();
+            let ser3 = AvroSerializer::new(&client3, None, None,
+                SerializerConfig::new(false, Some(SchemaSelector::LatestVersion), true, false,
+                                      HashMap::new())).unwrap();
+            let ctx3 = SerializationContext { topic: "t3".to_string(),
+                serde_type: SerdeType::Value, serde_format: SerdeFormat::Avro, headers: None };
+            let two_byte = Record(vec![("amount".to_string(),
+                Value::Decimal(apache_avro::Decimal::from(vec![0x04u8, 0xd2])))]);
+            match ser3.serialize(&ctx3, two_byte).await {
+                Err(e) => println!("CONTROL top-level 2-byte decimal encode -> {e:?}"),
+                Ok(b) => {
+                    let d3 = AvroDeserializer::new(&client3, None,
+                        DeserializerConfig::default()).unwrap();
+                    match d3.deserialize(&ctx3, &b).await {
+                        Ok(_) => println!("CONTROL top-level 2-byte decimal round-trip -> OK"),
+                        Err(e) => println!("CONTROL top-level 2-byte decimal read-back -> {e:?}"),
+                    }
+                }
+            }
+        }
+
+        let mut j0: serde_json::Value = serde_json::from_str(&schema_str).unwrap();
+        j0["fields"].as_array_mut().unwrap().retain(|f| f["name"] != "nestedVar");
+        let schema_str = serde_json::to_string(&j0).unwrap();
+        let record = || {
+            let Record(fs) = record() else { unreachable!() };
+            Record(fs.into_iter().filter(|(k, _)| k != "nestedVar").collect())
+        };
+
+        let mut out: Vec<String> = Vec::new();
+        for line in cases.trim().split('\n') {
+            let f: Vec<&str> = line.split('\t').collect();
+            let (label, kind, rtype, tag, expr) = (f[0], f[1], f[2], f[3], f[4]);
+            if label.contains("nst_var") {
+                out.push(format!("{label}|SKIPPED: apache-avro cannot encode a by-name reference to confluent.type.Variant in nested position"));
+                continue;
+            }
+            let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+            let client = MockSchemaRegistryClient::new(client_conf);
+            let ser_conf = SerializerConfig::new(
+                false, Some(SchemaSelector::LatestVersion), true, false, HashMap::new());
+            let rule = Rule {
+                name: "r".to_string(), doc: None,
+                kind: Some(if kind == "CONDITION" { Kind::Condition } else { Kind::Transform }),
+                mode: Some(Mode::Write), r#type: rtype.to_string(),
+                tags: if tag.is_empty() { None } else { Some(vec![tag.to_string()]) },
+                params: None, expr: Some(expr.to_string()),
+                on_success: None, on_failure: None, disabled: None,
+            };
+            let schema = Schema {
+                schema_type: Some("AVRO".to_string()), references: None, metadata: None,
+                rule_set: Some(Box::new(RuleSet {
+                    migration_rules: None, domain_rules: Some(vec![rule]),
+                    encoding_rules: None, enable_at: None })),
+                schema: schema_str.clone(),
+            };
+            client.register_schema("test-value", &schema, false).await.unwrap();
+            let rule_registry = RuleRegistry::new();
+            rule_registry.register_executor(CelExecutor::new());
+            rule_registry.register_executor(crate::rules::cel::cel_field_executor::CelFieldExecutor::new());
+            let ser = AvroSerializer::new(&client, None, Some(rule_registry.clone()), ser_conf).unwrap();
+            let ser_ctx = SerializationContext {
+                topic: "test".to_string(), serde_type: SerdeType::Value,
+                serde_format: SerdeFormat::Avro, headers: None };
+            let res = match ser.serialize(&ser_ctx, record()).await {
+                Err(e) => {
+                    let m = format!("{e:?}");
+                    format!("{}: {}", if kind == "CONDITION" { "fail" } else { "ERR" },
+                            &m[..m.len().min(110)])
+                }
+                Ok(bytes) => {
+                    if kind == "CONDITION" { "pass".to_string() } else {
+                        let deser = AvroDeserializer::new(
+                            &client, Some(rule_registry.clone()), DeserializerConfig::default()).unwrap();
+                        match deser.deserialize(&ser_ctx, &bytes).await {
+                            Err(e) => format!("DESERR: {e:?}"),
+                            Ok(v) => {
+                                let Record(fs) = v.value else { panic!() };
+                                let g = |n: &str| fs.iter().find(|(k, _)| k == n).unwrap().1.clone();
+                                match tag {
+                                    "AMOUNTS" | "STAMPS" => format!("{:?}", g(if tag == "AMOUNTS" { "amounts" } else { "stamps" })),
+                                    "AMOUNTMAP" => format!("{:?}", g("amountMap")),
+                                    "INNER" => format!("{:?}", g("nested")),
+                                    _ => "?".to_string(),
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            out.push(format!("{label}|{res}"));
+        }
+        std::fs::write(format!("{DIR}/rust.txt"), out.join("\n")).unwrap();
+        println!("{}", out.join("\n"));
+    }
+
     #[tokio::test]
     async fn test_cel_condition() {
         let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
@@ -2043,6 +2366,45 @@ mod tests {
         ]
     }
     "#;
+
+    const NULLABLE_TS_SCHEMA: &str = r#"
+    {
+        "type": "record",
+        "name": "test",
+        "fields": [
+            {"name": "tsField",
+             "type": ["null", {"type": "long", "logicalType": "timestamp-millis"}]}
+        ]
+    }
+    "#;
+
+    /// A `CEL_FIELD` condition over a *nullable* field must still be able to fail. The union arm
+    /// of the walk used to re-wrap the rule's result, so the bare `Value::Boolean(false)` the
+    /// record-field check tests for arrived as `Union(1, Boolean(false))` and every false
+    /// condition passed. Only union-typed fields went through that path, so the plain-field
+    /// tests above could not see it.
+    #[tokio::test]
+    async fn test_cel_field_condition_fails_on_nullable_field() {
+        let present = vec![(
+            "tsField".to_string(),
+            Value::Union(1, Box::new(Value::TimestampMillis(1000))),
+        )];
+        let r = serialize_with_cel_field_condition(
+            NULLABLE_TS_SCHEMA,
+            "name == 'tsField' ; timestamp(value) > now",
+            present.clone(),
+        )
+        .await;
+        assert!(r.is_err(), "a false condition on a nullable field must fail");
+
+        let r = serialize_with_cel_field_condition(
+            NULLABLE_TS_SCHEMA,
+            "name == 'tsField' ; timestamp(value) < now",
+            present,
+        )
+        .await;
+        assert!(r.is_ok(), "a true condition on a nullable field must pass");
+    }
 
     #[tokio::test]
     async fn test_cel_field_timestamp_value() {
@@ -3987,6 +4349,37 @@ mod tests {
         assert_eq!(violations.len(), 1, "{violations:?}");
         assert_eq!(violations[0].rule.name, "note_not_empty");
         assert_eq!(violations[0].field_path, "note");
+    }
+
+    // TEMP probe: C8 for INLINE rules (C1/C2) over a null Avro value. Delete once recorded.
+    #[tokio::test]
+    async fn zz_c8_inline() {
+        const DIR: &str = "/private/tmp/claude-501/-Users-robertyokota-code-work-schema-registry/2e779696-9557-474c-8a8d-6c163f6d2bf3/scratchpad/mine/c8";
+        let schema_str = std::fs::read_to_string(format!("{DIR}/schema_inline.avsc")).unwrap();
+        let client = MockSchemaRegistryClient::new(
+            ClientConfig::new(vec!["mock://".to_string()]));
+        let schema = Schema {
+            schema_type: Some("AVRO".to_string()), references: None, metadata: None,
+            rule_set: None, schema: schema_str.clone() };
+        client.register_schema("test-value", &schema, false).await.unwrap();
+        let mut ser_conf = SerializerConfig::new(
+            false, Some(SchemaSelector::LatestVersion), true, false, HashMap::new());
+        ser_conf.validation_rules_execution = ValidationRulesExecution::AfterDomainRules;
+        let ser = AvroSerializer::new(&client, None, Some(validating_registry()), ser_conf)
+            .unwrap();
+        let ctx = SerializationContext { topic: "test".to_string(),
+            serde_type: SerdeType::Value, serde_format: SerdeFormat::Avro, headers: None };
+        let record = Value::Record(vec![
+            ("amount".to_string(), Value::Union(0, Box::new(Value::Null))),
+            ("ts".to_string(), Value::Union(0, Box::new(Value::Null))),
+            ("plain".to_string(), Value::String("hi".to_string())),
+        ]);
+        let res = match ser.serialize(&ctx, record).await {
+            Ok(_) => "(no violations)".to_string(),
+            Err(e) => format!("{e}").replace('\n', " "),
+        };
+        std::fs::write(format!("{DIR}/rust_inline.txt"), &res).unwrap();
+        println!("C8_inline_avro|{res}");
     }
 
     #[tokio::test]

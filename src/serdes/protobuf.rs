@@ -2715,7 +2715,7 @@ mod tests {
             "value",
             prost_reflect::Value::Bytes(vec![0x04u8, 0xd2].into()),
         );
-        dec.set_field_by_name("scale", prost_reflect::Value::I32(2));
+        dec.set_field_by_name("scale", prost_reflect::Value::U32(2));
         let value = from_protobuf_value_for_test(&prost_reflect::Value::Message(dec));
         assert_eq!(
             to_decimal(&value).expect("binds as a Decimal"),
@@ -3422,6 +3422,54 @@ mod tests {
         assert_eq!(validate_proto(&message, false), vec![]);
     }
 
+    // TEMP probe: C8 for INLINE protobuf rules (C1/C2) over an UNSET value type.
+    // parity.ParityRecord already carries msgDec/msgTs at message level and fldDec/fldTs at
+    // field level, so no fixture change is needed. Delete once recorded.
+    #[tokio::test]
+    async fn zz_c8_pb_inline() {
+        const DIR: &str = "/private/tmp/claude-501/-Users-robertyokota-code-work-schema-registry/2e779696-9557-474c-8a8d-6c163f6d2bf3/scratchpad/mine/c8";
+        let md = crate::TEST_DESCRIPTOR_POOL
+            .get_message_by_name("parity.ParityRecord")
+            .expect("parity.ParityRecord not in the test descriptor pool");
+        let mut msg = DynamicMessage::new(md.clone());
+        msg.set_field_by_name("plain", prost_reflect::Value::String("hi".to_string()));
+        // `data` is SET to a real variant so its two rules pass and the cell isolates the
+        // null decimal and timestamp - the same two rules Java's C8Inline carries.
+        let v = crate::serdes::variant::Variant::parse_json(r#"{"name":"alice"}"#).unwrap();
+        let vd = crate::TEST_DESCRIPTOR_POOL
+            .get_message_by_name("confluent.type.Variant").unwrap();
+        let mut var = DynamicMessage::new(vd);
+        var.set_field_by_name("metadata",
+            prost_reflect::Value::Bytes(v.metadata_bytes().to_vec().into()));
+        var.set_field_by_name("value",
+            prost_reflect::Value::Bytes(v.value_bytes().to_vec().into()));
+        msg.set_field_by_name("data", prost_reflect::Value::Message(var));
+
+        let validator = CelValidator::new();
+        let violations = validate_message(&validator, &md, &msg, None, false);
+        let res = if violations.is_empty() {
+            "(no violations)".to_string()
+        } else {
+            let mut parts: Vec<String> = violations
+                .iter()
+                .map(|v| {
+                    if v.cause.is_empty() {
+                        // No cause means the rule returned false rather than erroring - the
+                        // distinction this cell turns on.
+                        v.rule.name.clone()
+                    } else {
+                        format!("{}(caused by: {})", v.rule.name,
+                                &v.cause[..v.cause.len().min(70)])
+                    }
+                })
+                .collect();
+            parts.sort();
+            format!("{} violations: {}", violations.len(), parts.join(" "))
+        };
+        std::fs::write(format!("{DIR}/rust_pb_inline.txt"), &res).unwrap();
+        println!("C8p_inline|{res}");
+    }
+
     #[tokio::test]
     async fn test_validation_serializer_rejects_invalid_message() {
         let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
@@ -3555,7 +3603,7 @@ mod tests {
         let mut d = parity_pool_msg("confluent.type.Decimal");
         d.set_field_by_name("value", prost_reflect::Value::Bytes(vec![0x04u8, 0xd2].into()));
         d.set_field_by_name("precision", prost_reflect::Value::U32(8));
-        d.set_field_by_name("scale", prost_reflect::Value::I32(2));
+        d.set_field_by_name("scale", prost_reflect::Value::U32(2));
         prost_reflect::Value::Message(d)
     }
 
@@ -3626,6 +3674,152 @@ mod tests {
             None,
             None,
         )
+    }
+
+    // TEMP C8 protobuf sweep. Delete once recorded.
+    #[tokio::test]
+    async fn zz_c8_pb() {
+        const DIR: &str = "/private/tmp/claude-501/-Users-robertyokota-code-work-schema-registry/2e779696-9557-474c-8a8d-6c163f6d2bf3/scratchpad/mine/c8";
+        let cases = std::fs::read_to_string(format!("{DIR}/cases_pb.tsv")).unwrap();
+        // amount and ts left UNSET.
+        let unset = || {
+            let md = crate::TEST_DESCRIPTOR_POOL
+                .get_message_by_name("parity.ParityPlain").unwrap();
+            let mut m = DynamicMessage::new(md);
+            m.set_field_by_name("plain", prost_reflect::Value::String("hi".to_string()));
+            m
+        };
+        let mut out: Vec<String> = Vec::new();
+        for line in cases.trim().split('\n') {
+            let f: Vec<&str> = line.split('\t').collect();
+            let (label, kind, rtype, tag, expr) = (f[0], f[1], f[2], f[3], f[4]);
+            let k = if kind == "CONDITION" { Kind::Condition } else { Kind::Transform };
+            let mut ctx = parity_field_ctx(
+                expr, k, if tag.is_empty() { None } else { Some(vec![tag.to_string()]) });
+            if rtype == "CEL" {
+                ctx.rule.r#type = "CEL".to_string();
+            }
+            ctx.rule_registry = Some(RuleRegistry::new());
+            if let Some(r) = &ctx.rule_registry {
+                r.register_executor(CelFieldExecutor::new());
+            }
+            let res = if rtype == "CEL" {
+                let exec = CelExecutor::new();
+                let input = SerdeValue::Protobuf(prost_reflect::Value::Message(unset()));
+                let mut args = std::collections::HashMap::new();
+                args.insert("message".to_string(), exec.message_binding(&ctx, &input));
+                match exec.execute(&mut ctx, &input, &args) {
+                    Ok(SerdeValue::Protobuf(prost_reflect::Value::Bool(b))) => b.to_string(),
+                    Ok(other) => format!("UNEXPECTED {other:?}"),
+                    Err(e) => {
+                        let m = format!("{e:?}");
+                        format!("ERR: {}", &m[..m.len().min(85)])
+                    }
+                }
+            } else {
+                let msg = unset();
+                let desc = msg.descriptor();
+                match transform(&mut ctx, &desc, &prost_reflect::Value::Message(msg)).await {
+                    Ok(v) => {
+                        let prost_reflect::Value::Message(m) = v else { panic!() };
+                        let fd = m.descriptor().get_field_by_name("amount").unwrap();
+                        if m.has_field(&fd) { format!("set:{:?}", m.get_field(&fd)) }
+                        else { "unset".to_string() }
+                    }
+                    Err(e) => {
+                        let m = format!("{e:?}");
+                        format!("ERR: {}", &m[..m.len().min(85)])
+                    }
+                }
+            };
+            out.push(format!("{label}|{res}"));
+        }
+        std::fs::write(format!("{DIR}/rust_pb.txt"), out.join("\n")).unwrap();
+        println!("{}", out.join("\n"));
+    }
+
+    // TEMP C8 protobuf extended sweep (C4 + discriminator, C6, C7). Delete once recorded.
+    #[tokio::test]
+    async fn zz_c8_pb_ext() {
+        const DIR: &str = "/private/tmp/claude-501/-Users-robertyokota-code-work-schema-registry/2e779696-9557-474c-8a8d-6c163f6d2bf3/scratchpad/mine/c8";
+        let cases = std::fs::read_to_string(format!("{DIR}/cases_pb_ext.tsv")).unwrap();
+        // amount and ts UNSET, unless the case asks for a set field (the discriminator twin).
+        let build = |present: bool| {
+            let md = crate::TEST_DESCRIPTOR_POOL
+                .get_message_by_name("parity.ParityPlain").unwrap();
+            let mut m = DynamicMessage::new(md);
+            m.set_field_by_name("plain", prost_reflect::Value::String("hi".to_string()));
+            if present {
+                let dd = crate::TEST_DESCRIPTOR_POOL
+                    .get_message_by_name("confluent.type.Decimal").unwrap();
+                let mut d = DynamicMessage::new(dd);
+                d.set_field_by_name("value",
+                    prost_reflect::Value::Bytes(vec![0x04, 0xD2].into()));
+                // precision is uint32 and scale is int32 in confluent/type/decimal.proto;
+                // prost-reflect rejects the wrong width outright.
+                d.set_field_by_name("precision", prost_reflect::Value::U32(8));
+                d.set_field_by_name("scale", prost_reflect::Value::I32(2));
+                m.set_field_by_name("amount", prost_reflect::Value::Message(d));
+            }
+            m
+        };
+        let describe = |v: &prost_reflect::Value| -> String {
+            let prost_reflect::Value::Message(m) = v else {
+                return format!("UNEXPECTED {v:?}");
+            };
+            let state = |n: &str| {
+                m.descriptor().get_field_by_name(n)
+                    .map(|fd| if m.has_field(&fd) { "SET" } else { "unset" })
+                    .unwrap_or("missing")
+            };
+            format!("ok (amount {}, ts {})", state("amount"), state("ts"))
+        };
+        let mut out: Vec<String> = Vec::new();
+        for line in cases.trim().split('\n') {
+            let f: Vec<&str> = line.split('\t').collect();
+            let (label, kind, rtype, tag) = (f[0], f[1], f[2], f[3]);
+            // This client's fixture calls the plain string field `plain`, not `label`; the map
+            // key has to name a real field too, so both spellings are rewritten.
+            let expr = f[4].replace("message.label", "message.plain").replace("\"label\"", "\"plain\"");
+            let present = label.ends_with("_SET");
+            let k = if kind == "CONDITION" { Kind::Condition } else { Kind::Transform };
+            let mut ctx = parity_field_ctx(
+                &expr, k, if tag.is_empty() { None } else { Some(vec![tag.to_string()]) });
+            if rtype == "CEL" {
+                ctx.rule.r#type = "CEL".to_string();
+            }
+            ctx.rule_registry = Some(RuleRegistry::new());
+            if let Some(r) = &ctx.rule_registry {
+                r.register_executor(CelFieldExecutor::new());
+            }
+            let res = if rtype == "CEL" {
+                let exec = CelExecutor::new();
+                let input = SerdeValue::Protobuf(prost_reflect::Value::Message(build(present)));
+                let mut args = std::collections::HashMap::new();
+                args.insert("message".to_string(), exec.message_binding(&ctx, &input));
+                match exec.execute(&mut ctx, &input, &args) {
+                    Ok(SerdeValue::Protobuf(v)) => describe(&v),
+                    Ok(other) => format!("UNEXPECTED {other:?}"),
+                    Err(e) => {
+                        let m = format!("{e:?}");
+                        format!("ERR: {}", &m[..m.len().min(85)])
+                    }
+                }
+            } else {
+                let msg = build(present);
+                let desc = msg.descriptor();
+                match transform(&mut ctx, &desc, &prost_reflect::Value::Message(msg)).await {
+                    Ok(v) => describe(&v),
+                    Err(e) => {
+                        let m = format!("{e:?}");
+                        format!("ERR: {}", &m[..m.len().min(85)])
+                    }
+                }
+            };
+            out.push(format!("{label}|{res}"));
+        }
+        std::fs::write(format!("{DIR}/rust_pb_ext.txt"), out.join("\n")).unwrap();
+        println!("{}", out.join("\n"));
     }
 
     // ---- Message-level CEL transforms over protobuf (C6/C7) ----------------------------
