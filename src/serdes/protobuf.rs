@@ -3572,7 +3572,10 @@ mod tests {
 
     fn parity_decimal() -> prost_reflect::Value {
         let mut d = parity_pool_msg("confluent.type.Decimal");
-        d.set_field_by_name("value", prost_reflect::Value::Bytes(vec![0x04u8, 0xd2].into()));
+        d.set_field_by_name(
+            "value",
+            prost_reflect::Value::Bytes(vec![0x04u8, 0xd2].into()),
+        );
         d.set_field_by_name("precision", prost_reflect::Value::U32(8));
         d.set_field_by_name("scale", prost_reflect::Value::I32(2));
         prost_reflect::Value::Message(d)
@@ -3661,10 +3664,15 @@ mod tests {
         // indistinguishable from a client dropping a byte.
         let dec = |unscaled: i64| {
             let dd = crate::TEST_DESCRIPTOR_POOL
-                .get_message_by_name("confluent.type.Decimal").unwrap();
+                .get_message_by_name("confluent.type.Decimal")
+                .unwrap();
             let mut d = DynamicMessage::new(dd);
-            let mut raw: Vec<u8> = unscaled.to_be_bytes().iter()
-                .skip_while(|b| **b == 0).copied().collect();
+            let mut raw: Vec<u8> = unscaled
+                .to_be_bytes()
+                .iter()
+                .skip_while(|b| **b == 0)
+                .copied()
+                .collect();
             if raw.first().is_some_and(|b| b & 0x80 != 0) {
                 raw.insert(0, 0);
             }
@@ -3674,15 +3682,20 @@ mod tests {
             d
         };
         let md = crate::TEST_DESCRIPTOR_POOL
-            .get_message_by_name("parity.ValueTypeContainers").unwrap();
+            .get_message_by_name("parity.ValueTypeContainers")
+            .unwrap();
         let mut m = DynamicMessage::new(md);
         m.set_field_by_name("label", prost_reflect::Value::String("hi".to_string()));
-        m.set_field_by_name("amounts", prost_reflect::Value::List(vec![
-            prost_reflect::Value::Message(dec(first)),
-            prost_reflect::Value::Message(dec(222)),
-        ]));
+        m.set_field_by_name(
+            "amounts",
+            prost_reflect::Value::List(vec![
+                prost_reflect::Value::Message(dec(first)),
+                prost_reflect::Value::Message(dec(222)),
+            ]),
+        );
         let nd = crate::TEST_DESCRIPTOR_POOL
-            .get_message_by_name("parity.ValueTypeNested").unwrap();
+            .get_message_by_name("parity.ValueTypeNested")
+            .unwrap();
         let mut n = DynamicMessage::new(nd);
         n.set_field_by_name("inner", prost_reflect::Value::Message(dec(inner)));
         m.set_field_by_name("nested", prost_reflect::Value::Message(n));
@@ -3698,26 +3711,44 @@ mod tests {
         let msg = c9_containers(111, 444);
         let desc = msg.descriptor();
         let out = transform(&mut ctx, &desc, &prost_reflect::Value::Message(msg)).await?;
-        let prost_reflect::Value::Message(m) = out else { panic!("expected a message") };
-        Ok(m.get_field_by_name("amounts").and_then(|l| l.as_list().map(|xs| {
-            xs.iter().map(|v| {
-                let prost_reflect::Value::Message(d) = v else { return "?".to_string() };
-                let bytes = d.get_field_by_name("value")
-                    .and_then(|b| b.as_bytes().map(|x| x.to_vec())).unwrap_or_default();
-                let mut n: i128 = 0;
-                for b in &bytes { n = (n << 8) | (*b as i128); }
-                if bytes.first().is_some_and(|b| b & 0x80 != 0) {
-                    n -= 1i128 << (8 * bytes.len());
-                }
-                n.to_string()
-            }).collect::<Vec<_>>()
-        })).unwrap_or_default())
+        let prost_reflect::Value::Message(m) = out else {
+            panic!("expected a message")
+        };
+        Ok(m.get_field_by_name("amounts")
+            .and_then(|l| {
+                l.as_list().map(|xs| {
+                    xs.iter()
+                        .map(|v| {
+                            let prost_reflect::Value::Message(d) = v else {
+                                return "?".to_string();
+                            };
+                            let bytes = d
+                                .get_field_by_name("value")
+                                .and_then(|b| b.as_bytes().map(|x| x.to_vec()))
+                                .unwrap_or_default();
+                            let mut n: i128 = 0;
+                            for b in &bytes {
+                                n = (n << 8) | (*b as i128);
+                            }
+                            if bytes.first().is_some_and(|b| b & 0x80 != 0) {
+                                n -= 1i128 << (8 * bytes.len());
+                            }
+                            n.to_string()
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default())
     }
 
     #[tokio::test]
     async fn repeated_decimal_transform_rebuilds_every_element() {
-        let got = c9_run(r#"decimals.add(decimal(value), decimal("1.00"))"#, Kind::Transform)
-            .await.unwrap();
+        let got = c9_run(
+            r#"decimals.add(decimal(value), decimal("1.00"))"#,
+            Kind::Transform,
+        )
+        .await
+        .unwrap();
         assert_eq!(got, vec!["211", "322"], "2.11 and 3.22 at scale 2");
     }
 
@@ -3735,9 +3766,17 @@ mod tests {
     /// The verdict must not be written into the list either.
     #[tokio::test]
     async fn repeated_decimal_condition_verdict_is_discarded() {
-        let got = c9_run(r#"decimals.gt(decimal(value), decimal("100.00"))"#, Kind::Condition)
-            .await.expect("a false condition over a repeated field must not fail");
-        assert_eq!(got, vec!["111", "222"], "a condition must not touch the elements");
+        let got = c9_run(
+            r#"decimals.gt(decimal(value), decimal("100.00"))"#,
+            Kind::Condition,
+        )
+        .await
+        .expect("a false condition over a repeated field must not fail");
+        assert_eq!(
+            got,
+            vec!["111", "222"],
+            "a condition must not touch the elements"
+        );
     }
 
     // ---- Message-level CEL transforms over protobuf (C6/C7) ----------------------------
@@ -3786,7 +3825,10 @@ mod tests {
         let input = SerdeValue::Protobuf(prost_reflect::Value::Message(msg));
         let executor = CelExecutor::new();
         let mut args = HashMap::new();
-        args.insert("message".to_string(), executor.message_binding(&ctx, &input));
+        args.insert(
+            "message".to_string(),
+            executor.message_binding(&ctx, &input),
+        );
         match executor.execute(&mut ctx, &input, &args).unwrap() {
             SerdeValue::Protobuf(prost_reflect::Value::Message(m)) => m,
             other => panic!("expected the message to be rebuilt, got {other:?}"),
@@ -3812,15 +3854,21 @@ mod tests {
         let out = parity_msg_transform(&format!("{{{ALL_FIELDS}}}"), parity_plain());
 
         // 0x04D2 = 1234 unscaled, i.e. 12.34 at scale 2.
-        assert_eq!(parity_field_bytes(&out, "amount", "value"), vec![0x04, 0xd2]);
+        assert_eq!(
+            parity_field_bytes(&out, "amount", "value"),
+            vec![0x04, 0xd2]
+        );
         let ts = out.get_field_by_name("ts").unwrap();
         let ts = ts.as_message().unwrap();
-        assert_eq!(ts.get_field_by_name("seconds").unwrap().as_i64(), Some(1_700_000_000));
-        assert_eq!(ts.get_field_by_name("nanos").unwrap().as_i32(), Some(123_000_000));
         assert_eq!(
-            out.get_field_by_name("plain").unwrap().as_str(),
-            Some("hi")
+            ts.get_field_by_name("seconds").unwrap().as_i64(),
+            Some(1_700_000_000)
         );
+        assert_eq!(
+            ts.get_field_by_name("nanos").unwrap().as_i32(),
+            Some(123_000_000)
+        );
+        assert_eq!(out.get_field_by_name("plain").unwrap().as_str(), Some("hi"));
     }
 
     #[test]
@@ -3831,7 +3879,10 @@ mod tests {
         );
 
         // 0x0536 = 1334, i.e. 13.34 at scale 2.
-        assert_eq!(parity_field_bytes(&out, "amount", "value"), vec![0x05, 0x36]);
+        assert_eq!(
+            parity_field_bytes(&out, "amount", "value"),
+            vec![0x05, 0x36]
+        );
     }
 
     #[test]
@@ -3843,8 +3894,14 @@ mod tests {
 
         let ts = out.get_field_by_name("ts").unwrap();
         let ts = ts.as_message().unwrap();
-        assert_eq!(ts.get_field_by_name("seconds").unwrap().as_i64(), Some(1_700_000_060));
-        assert_eq!(ts.get_field_by_name("nanos").unwrap().as_i32(), Some(123_000_000));
+        assert_eq!(
+            ts.get_field_by_name("seconds").unwrap().as_i64(),
+            Some(1_700_000_060)
+        );
+        assert_eq!(
+            ts.get_field_by_name("nanos").unwrap().as_i32(),
+            Some(123_000_000)
+        );
     }
 
     /// Asserted through the decoded JSON rather than the metadata bytes: metadata holds the
@@ -3870,7 +3927,10 @@ mod tests {
     fn message_transform_drops_unnamed_fields() {
         let out = parity_msg_transform(r#"{"plain": "changed"}"#, parity_plain());
 
-        assert_eq!(out.get_field_by_name("plain").unwrap().as_str(), Some("changed"));
+        assert_eq!(
+            out.get_field_by_name("plain").unwrap().as_str(),
+            Some("changed")
+        );
         assert!(!out.has_field_by_name("amount"));
         assert!(!out.has_field_by_name("ts"));
         assert!(!out.has_field_by_name("data"));
@@ -4006,7 +4066,10 @@ mod tests {
             "AMOUNT",
         )
         .await;
-        assert!(result.is_err(), "expected a violation; the rule did not fire");
+        assert!(
+            result.is_err(),
+            "expected a violation; the rule did not fire"
+        );
     }
 
     #[tokio::test]
@@ -4028,7 +4091,10 @@ mod tests {
             "TS",
         )
         .await;
-        assert!(result.is_err(), "expected a violation; the rule did not fire");
+        assert!(
+            result.is_err(),
+            "expected a violation; the rule did not fire"
+        );
     }
 
     /// C5.

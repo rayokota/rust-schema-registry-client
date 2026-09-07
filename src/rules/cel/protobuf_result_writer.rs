@@ -21,12 +21,12 @@
 //! The behaviours the JVM client gets free from the JSON mapping - null clearing a field, and a
 //! key matching either the declared or the JSON name - are reproduced explicitly below.
 
-use cel::objects::Key;
 use cel::Value;
+use cel::objects::Key;
 use prost_reflect::{DynamicMessage, FieldDescriptor, Kind, MessageDescriptor, ReflectMessage};
 
-use crate::rules::cel::decimal_funcs::{to_decimal, DECIMAL_TYPE_NAME};
-use crate::rules::cel::variant_funcs::{to_variant, VARIANT_TYPE_NAME};
+use crate::rules::cel::decimal_funcs::{DECIMAL_TYPE_NAME, to_decimal};
+use crate::rules::cel::variant_funcs::{VARIANT_TYPE_NAME, to_variant};
 use crate::serdes::serde::SerdeError;
 
 const TIMESTAMP_TYPE_NAME: &str = "google.protobuf.Timestamp";
@@ -79,10 +79,7 @@ fn find_field(desc: &MessageDescriptor, name: &str) -> Option<FieldDescriptor> {
         .or_else(|| desc.get_field_by_json_name(name))
 }
 
-fn to_field_value(
-    fd: &FieldDescriptor,
-    value: &Value,
-) -> Result<prost_reflect::Value, SerdeError> {
+fn to_field_value(fd: &FieldDescriptor, value: &Value) -> Result<prost_reflect::Value, SerdeError> {
     if fd.is_list() {
         let Value::List(items) = value else {
             return Ok(prost_reflect::Value::List(Vec::new()));
@@ -162,22 +159,42 @@ fn build_message(md: &MessageDescriptor, value: &Value) -> Result<DynamicMessage
         let decimal = to_decimal(value).map_err(|e| SerdeError::Rule(e.to_string()))?;
         let (unscaled, exponent) = decimal.into_bigint_and_exponent();
         let mut out = DynamicMessage::new(md.clone());
-        set_named(&mut out, md, "value",
-            prost_reflect::Value::Bytes(unscaled.to_signed_bytes_be().into()));
-        set_named(&mut out, md, "scale", prost_reflect::Value::I32(exponent as i32));
+        set_named(
+            &mut out,
+            md,
+            "value",
+            prost_reflect::Value::Bytes(unscaled.to_signed_bytes_be().into()),
+        );
+        set_named(
+            &mut out,
+            md,
+            "scale",
+            prost_reflect::Value::I32(exponent as i32),
+        );
         return Ok(out);
     }
 
     if full_name == VARIANT_TYPE_NAME {
         let variant = to_variant(value)
             .map_err(|e| SerdeError::Rule(e.to_string()))?
-            .ok_or_else(|| SerdeError::Rule(
-                "cannot write an absent variant; use null to clear the field".to_string()))?;
+            .ok_or_else(|| {
+                SerdeError::Rule(
+                    "cannot write an absent variant; use null to clear the field".to_string(),
+                )
+            })?;
         let mut out = DynamicMessage::new(md.clone());
-        set_named(&mut out, md, "metadata",
-            prost_reflect::Value::Bytes(variant.metadata_bytes().to_vec().into()));
-        set_named(&mut out, md, "value",
-            prost_reflect::Value::Bytes(variant.value_bytes().to_vec().into()));
+        set_named(
+            &mut out,
+            md,
+            "metadata",
+            prost_reflect::Value::Bytes(variant.metadata_bytes().to_vec().into()),
+        );
+        set_named(
+            &mut out,
+            md,
+            "value",
+            prost_reflect::Value::Bytes(variant.value_bytes().to_vec().into()),
+        );
         return Ok(out);
     }
 
@@ -188,9 +205,18 @@ fn build_message(md: &MessageDescriptor, value: &Value) -> Result<DynamicMessage
             )));
         };
         let mut out = DynamicMessage::new(md.clone());
-        set_named(&mut out, md, "seconds", prost_reflect::Value::I64(ts.timestamp()));
-        set_named(&mut out, md, "nanos",
-            prost_reflect::Value::I32(ts.timestamp_subsec_nanos() as i32));
+        set_named(
+            &mut out,
+            md,
+            "seconds",
+            prost_reflect::Value::I64(ts.timestamp()),
+        );
+        set_named(
+            &mut out,
+            md,
+            "nanos",
+            prost_reflect::Value::I32(ts.timestamp_subsec_nanos() as i32),
+        );
         return Ok(out);
     }
 
@@ -223,9 +249,7 @@ fn scalar(fd: &FieldDescriptor, value: &Value) -> Result<prost_reflect::Value, S
     Ok(match (fd.kind(), value) {
         (Kind::Bool, Value::Bool(b)) => prost_reflect::Value::Bool(*b),
         (Kind::String, Value::String(s)) => prost_reflect::Value::String(s.to_string()),
-        (Kind::Bytes, Value::Bytes(b)) => {
-            prost_reflect::Value::Bytes(b.to_vec().into())
-        }
+        (Kind::Bytes, Value::Bytes(b)) => prost_reflect::Value::Bytes(b.to_vec().into()),
         (Kind::Float, v) => prost_reflect::Value::F32(as_f64(v).ok_or_else(err)? as f32),
         (Kind::Double, v) => prost_reflect::Value::F64(as_f64(v).ok_or_else(err)?),
         (Kind::Int32 | Kind::Sint32 | Kind::Sfixed32, v) => {
@@ -240,9 +264,7 @@ fn scalar(fd: &FieldDescriptor, value: &Value) -> Result<prost_reflect::Value, S
         (Kind::Uint64 | Kind::Fixed64, v) => {
             prost_reflect::Value::U64(as_i64(v).ok_or_else(err)? as u64)
         }
-        (Kind::Enum(_), v) => {
-            prost_reflect::Value::EnumNumber(as_i64(v).ok_or_else(err)? as i32)
-        }
+        (Kind::Enum(_), v) => prost_reflect::Value::EnumNumber(as_i64(v).ok_or_else(err)? as i32),
         _ => return Err(err()),
     })
 }

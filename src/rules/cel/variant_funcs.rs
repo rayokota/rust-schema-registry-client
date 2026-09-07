@@ -127,11 +127,7 @@ pub(crate) fn to_variant(v: &Value) -> Result<Option<Variant>, ExecutionError> {
             .downcast_ref::<CelVariant>()
             .map(|cv| {
                 let inner = cv.0.clone();
-                if is_absent(&inner) {
-                    None
-                } else {
-                    Some(inner)
-                }
+                if is_absent(&inner) { None } else { Some(inner) }
             })
             .ok_or_else(|| err("variant: opaque value is not a Variant")),
         Value::Map(m) => variant_from_map(m)
@@ -153,11 +149,7 @@ fn receiver(v: &Value) -> Result<Option<Variant>, ExecutionError> {
             .downcast_ref::<CelVariant>()
             .map(|cv| {
                 let inner = cv.0.clone();
-                if is_absent(&inner) {
-                    None
-                } else {
-                    Some(inner)
-                }
+                if is_absent(&inner) { None } else { Some(inner) }
             })
             .ok_or_else(|| err("variant: opaque value is not a Variant")),
         Value::Map(m) => variant_from_map(m).ok_or_else(|| err("expected a Variant")),
@@ -458,7 +450,10 @@ mod tests {
     /// The CEL map shape a variant-typed field decodes to, with the given raw bytes.
     fn variant_map(value: Vec<u8>, metadata: Vec<u8>) -> Value {
         let mut m = std::collections::HashMap::new();
-        m.insert(Key::String(Arc::new("value".to_string())), Value::Bytes(Arc::new(value)));
+        m.insert(
+            Key::String(Arc::new("value".to_string())),
+            Value::Bytes(Arc::new(value)),
+        );
         m.insert(
             Key::String(Arc::new("metadata".to_string())),
             Value::Bytes(Arc::new(metadata)),

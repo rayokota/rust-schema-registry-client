@@ -1687,7 +1687,10 @@ mod tests {
                 .await
                 .unwrap();
             let obj = Record(vec![
-                ("kept".to_string(), Value::String("original-kept".to_string())),
+                (
+                    "kept".to_string(),
+                    Value::String("original-kept".to_string()),
+                ),
                 (
                     "withDefault".to_string(),
                     Value::String("original-withDefault".to_string()),
@@ -2088,7 +2091,10 @@ mod tests {
             present.clone(),
         )
         .await;
-        assert!(r.is_err(), "a false condition on a nullable field must fail");
+        assert!(
+            r.is_err(),
+            "a false condition on a nullable field must fail"
+        );
 
         let r = serialize_with_cel_field_condition(
             NULLABLE_TS_SCHEMA,
@@ -4487,7 +4493,10 @@ mod tests {
         let input = SerdeValue::Avro(avro_fixture_record());
         let executor = CelExecutor::new();
         let mut args = HashMap::new();
-        args.insert("message".to_string(), executor.message_binding(&ctx, &input));
+        args.insert(
+            "message".to_string(),
+            executor.message_binding(&ctx, &input),
+        );
         match executor.execute(&mut ctx, &input, &args).unwrap() {
             SerdeValue::Avro(v) => v,
             other => panic!("expected an Avro record, got {other:?}"),
@@ -4532,7 +4541,10 @@ mod tests {
         let input = SerdeValue::Avro(avro_fixture_record());
         let executor = CelExecutor::new();
         let mut args = HashMap::new();
-        args.insert("message".to_string(), executor.message_binding(&ctx, &input));
+        args.insert(
+            "message".to_string(),
+            executor.message_binding(&ctx, &input),
+        );
         match executor.execute(&mut ctx, &input, &args)? {
             SerdeValue::Avro(v) => Ok(v),
             other => panic!("expected an Avro record, got {other:?}"),
@@ -4573,8 +4585,7 @@ mod tests {
             Some((_, Value::Bytes(b))) => b.clone(),
             other => panic!("{name} is not bytes: {other:?}"),
         };
-        let variant =
-            crate::serdes::variant::Variant::new(bytes("value"), bytes("metadata"));
+        let variant = crate::serdes::variant::Variant::new(bytes("value"), bytes("metadata"));
         assert_eq!(variant.to_json().unwrap(), r#"{"name":"bob"}"#);
     }
 
@@ -4709,7 +4720,10 @@ mod decimal_round_trip {
             rule_set,
             schema: schema_str.to_string(),
         };
-        client.register_schema("dec-value", &schema, false).await.unwrap();
+        client
+            .register_schema("dec-value", &schema, false)
+            .await
+            .unwrap();
         client
     }
 
@@ -4752,7 +4766,9 @@ mod decimal_round_trip {
     }
 
     fn only_field(v: AvValue) -> AvValue {
-        let AvValue::Record(fields) = v else { panic!("expected a record") };
+        let AvValue::Record(fields) = v else {
+            panic!("expected a record")
+        };
         fields.into_iter().next().expect("a field").1
     }
 
@@ -4801,7 +4817,7 @@ mod decimal_round_trip_cel {
     //! A field transform over an array of decimals, which the read-back defect above blocked.
     //! Separate module because it needs the `rules` feature, while the defect is in the core read
     //! path and its tests must run without it.
-    use super::decimal_round_trip::{ctx, register, ser_conf, unscaled, ARRAY_SCHEMA};
+    use super::decimal_round_trip::{ARRAY_SCHEMA, ctx, register, ser_conf, unscaled};
     use super::*;
     use crate::rest::models::{Rule, RuleSet};
     use crate::rules::cel::cel_field_executor::CelFieldExecutor;
@@ -4833,8 +4849,7 @@ mod decimal_round_trip_cel {
         let client = register(ARRAY_SCHEMA, rule_set).await;
         let registry = RuleRegistry::new();
         registry.register_executor(CelFieldExecutor::new());
-        let ser =
-            AvroSerializer::new(&client, None, Some(registry.clone()), ser_conf()).unwrap();
+        let ser = AvroSerializer::new(&client, None, Some(registry.clone()), ser_conf()).unwrap();
         let obj = AvValue::Record(vec![
             (
                 "amounts".to_string(),
@@ -4848,10 +4863,18 @@ mod decimal_round_trip_cel {
         let bytes = ser.serialize(&ctx(), obj).await.expect("serialize");
         let deser =
             AvroDeserializer::new(&client, Some(registry), DeserializerConfig::default()).unwrap();
-        let back = deser.deserialize(&ctx(), &bytes).await.expect("deserialize").value;
+        let back = deser
+            .deserialize(&ctx(), &bytes)
+            .await
+            .expect("deserialize")
+            .value;
 
-        let AvValue::Record(fields) = back else { panic!("expected a record") };
-        let AvValue::Array(items) = &fields[0].1 else { panic!("expected an array") };
+        let AvValue::Record(fields) = back else {
+            panic!("expected a record")
+        };
+        let AvValue::Array(items) = &fields[0].1 else {
+            panic!("expected an array")
+        };
         assert_eq!(
             items.iter().map(unscaled).collect::<Vec<_>>(),
             vec![211, 322],
@@ -4911,8 +4934,14 @@ mod nested_variant {
             AvValue::Record(vec![(
                 "data".to_string(),
                 AvValue::Record(vec![
-                    ("metadata".to_string(), AvValue::Bytes(v.metadata_bytes().to_vec())),
-                    ("value".to_string(), AvValue::Bytes(v.value_bytes().to_vec())),
+                    (
+                        "metadata".to_string(),
+                        AvValue::Bytes(v.metadata_bytes().to_vec()),
+                    ),
+                    (
+                        "value".to_string(),
+                        AvValue::Bytes(v.value_bytes().to_vec()),
+                    ),
                 ]),
             )]),
         )]);

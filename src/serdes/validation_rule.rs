@@ -308,7 +308,11 @@ mod tests {
     fn test_cel_validator_rejects_non_boolean_result() {
         let validator = CelValidator::new();
         let value = SerdeValue::Json(json!({"age": 3}));
-        assert!(validator.execute(&rule("n", "this.age"), None, &value).is_err());
+        assert!(
+            validator
+                .execute(&rule("n", "this.age"), None, &value)
+                .is_err()
+        );
     }
 
     #[test]

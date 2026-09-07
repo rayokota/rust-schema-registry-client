@@ -1,9 +1,9 @@
 use crate::rules::cel::cel_lib::default_context;
-use crate::rules::cel::protobuf_result_writer::{write_back_protobuf, write_back_value_type};
-use crate::rules::cel::variant_funcs::{to_variant, VARIANT_TYPE_NAME};
 use crate::rules::cel::decimal_funcs::{
     DECIMAL_TYPE_NAME, decimal_value, from_bytes_scale, to_decimal,
 };
+use crate::rules::cel::protobuf_result_writer::{write_back_protobuf, write_back_value_type};
+use crate::rules::cel::variant_funcs::{VARIANT_TYPE_NAME, to_variant};
 use crate::serdes::avro::collect_named_schemas;
 use crate::serdes::serde::{
     RuleBase, RuleContext, RuleExecutor, SerdeError, SerdeSchema, SerdeValue,
@@ -175,7 +175,9 @@ impl CelExecutor {
                 if ctx.rule.kind != Some(crate::rest::models::Kind::Condition)
                     && let Some(encoded) = write_back_value_type(&m.descriptor(), &result)
                 {
-                    return Ok(SerdeValue::Protobuf(prost_reflect::Value::Message(encoded?)));
+                    return Ok(SerdeValue::Protobuf(prost_reflect::Value::Message(
+                        encoded?,
+                    )));
                 }
                 match write_back_protobuf(m, &result)? {
                     Some(rebuilt) => {
@@ -915,8 +917,7 @@ fn to_avro_value_with_schema(
                 .map_err(|e| SerdeError::Rule(e.to_string()))?
                 .ok_or_else(|| {
                     SerdeError::Rule(
-                        "cannot write an absent variant; use null to clear the field"
-                            .to_string(),
+                        "cannot write an absent variant; use null to clear the field".to_string(),
                     )
                 })?;
             let mut out = Vec::with_capacity(rs.fields.len());
