@@ -4679,10 +4679,10 @@ mod decimal_round_trip {
     use crate::serdes::config::SchemaSelector;
     use apache_avro::types::Value as AvValue;
 
-    const DECIMAL_SCHEMA: &str = r#"{"type":"record","name":"D13","fields":[
+    const DECIMAL_SCHEMA: &str = r#"{"type":"record","name":"DecRec","fields":[
         {"name":"amount","type":{"type":"bytes","logicalType":"decimal","precision":8,"scale":2}}]}"#;
 
-    pub(super) const ARRAY_SCHEMA: &str = r#"{"type":"record","name":"D13Arr","fields":[
+    pub(super) const ARRAY_SCHEMA: &str = r#"{"type":"record","name":"DecArr","fields":[
         {"name":"amounts","type":{"type":"array","items":
             {"type":"bytes","logicalType":"decimal","precision":8,"scale":2}},
          "confluent:tags":["AMOUNTS"]},

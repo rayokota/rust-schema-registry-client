@@ -52,10 +52,10 @@ pub struct ParityPlain {
 /// CEL_FIELD rule, and C6/C7 from a message-level transform. Mirrors Java's C9Inline exactly.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(::prost_reflect::ReflectMessage)]
-#[prost_reflect(message_name = "parity.C9Containers")]
+#[prost_reflect(message_name = "parity.ValueTypeContainers")]
 #[prost_reflect(descriptor_pool = "crate::TEST_DESCRIPTOR_POOL")]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct C9Containers {
+pub struct ValueTypeContainers {
     #[prost(message, repeated, tag = "1")]
     pub amounts: ::prost::alloc::vec::Vec<super::confluent::r#type::Decimal>,
     #[prost(map = "string, message", tag = "2")]
@@ -64,16 +64,16 @@ pub struct C9Containers {
         super::confluent::r#type::Decimal,
     >,
     #[prost(message, optional, tag = "3")]
-    pub nested: ::core::option::Option<C9Inner>,
+    pub nested: ::core::option::Option<ValueTypeNested>,
     #[prost(string, tag = "4")]
     pub label: ::prost::alloc::string::String,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(::prost_reflect::ReflectMessage)]
-#[prost_reflect(message_name = "parity.C9Inner")]
+#[prost_reflect(message_name = "parity.ValueTypeNested")]
 #[prost_reflect(descriptor_pool = "crate::TEST_DESCRIPTOR_POOL")]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct C9Inner {
+pub struct ValueTypeNested {
     #[prost(message, optional, tag = "1")]
     pub inner: ::core::option::Option<super::confluent::r#type::Decimal>,
 }

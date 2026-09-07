@@ -3674,7 +3674,7 @@ mod tests {
             d
         };
         let md = crate::TEST_DESCRIPTOR_POOL
-            .get_message_by_name("parity.C9Containers").unwrap();
+            .get_message_by_name("parity.ValueTypeContainers").unwrap();
         let mut m = DynamicMessage::new(md);
         m.set_field_by_name("label", prost_reflect::Value::String("hi".to_string()));
         m.set_field_by_name("amounts", prost_reflect::Value::List(vec![
@@ -3682,7 +3682,7 @@ mod tests {
             prost_reflect::Value::Message(dec(222)),
         ]));
         let nd = crate::TEST_DESCRIPTOR_POOL
-            .get_message_by_name("parity.C9Inner").unwrap();
+            .get_message_by_name("parity.ValueTypeNested").unwrap();
         let mut n = DynamicMessage::new(nd);
         n.set_field_by_name("inner", prost_reflect::Value::Message(dec(inner)));
         m.set_field_by_name("nested", prost_reflect::Value::Message(n));

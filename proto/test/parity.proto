@@ -60,7 +60,7 @@ message ParityPlain {
 // A container message carrying BOTH inline rules and tags, so one fixture serves every C9
 // capability: C1/C2 from the inline rules, C3 from message-level selection, C4/C5 from a tagged
 // CEL_FIELD rule, and C6/C7 from a message-level transform. Mirrors Java's C9Inline exactly.
-message C9Containers {
+message ValueTypeContainers {
   option (.confluent.message_meta) = {
     rules: [
       {name: "msgArr", expr: "decimals.gt(this.amounts[0], decimal('1.00'))"},
@@ -75,11 +75,11 @@ message C9Containers {
   map<string, .confluent.type.Decimal> amount_map = 2 [(.confluent.field_meta) = {
     tags: ["AMOUNTMAP"]
   }];
-  C9Inner nested = 3;
+  ValueTypeNested nested = 3;
   string label = 4;
 }
 
-message C9Inner {
+message ValueTypeNested {
   .confluent.type.Decimal inner = 1 [(.confluent.field_meta) = {
     tags: ["INNER"],
     rules: [{name: "fldInner", expr: "decimals.gt(this, decimal('1.00'))"}]
