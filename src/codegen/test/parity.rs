@@ -31,7 +31,7 @@ pub struct ParityRecordN {
     #[prost(string, tag = "4")]
     pub plain: ::prost::alloc::string::String,
 }
-/// No inline rules: used for the domain-rule capabilities C3-C7.
+/// No inline rules: used for the domain rules.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(::prost_reflect::ReflectMessage)]
 #[prost_reflect(message_name = "parity.ParityPlain")]
@@ -46,4 +46,34 @@ pub struct ParityPlain {
     pub data: ::core::option::Option<super::confluent::r#type::Variant>,
     #[prost(string, tag = "4")]
     pub plain: ::prost::alloc::string::String,
+}
+/// A container message carrying BOTH inline rules and tags, so one fixture serves every C9
+/// capability: C1/C2 from the inline rules, C3 from message-level selection, C4/C5 from a tagged
+/// CEL_FIELD rule, and C6/C7 from a message-level transform. Mirrors Java's C9Inline exactly.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(::prost_reflect::ReflectMessage)]
+#[prost_reflect(message_name = "parity.C9Containers")]
+#[prost_reflect(descriptor_pool = "crate::TEST_DESCRIPTOR_POOL")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct C9Containers {
+    #[prost(message, repeated, tag = "1")]
+    pub amounts: ::prost::alloc::vec::Vec<super::confluent::r#type::Decimal>,
+    #[prost(map = "string, message", tag = "2")]
+    pub amount_map: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        super::confluent::r#type::Decimal,
+    >,
+    #[prost(message, optional, tag = "3")]
+    pub nested: ::core::option::Option<C9Inner>,
+    #[prost(string, tag = "4")]
+    pub label: ::prost::alloc::string::String,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(::prost_reflect::ReflectMessage)]
+#[prost_reflect(message_name = "parity.C9Inner")]
+#[prost_reflect(descriptor_pool = "crate::TEST_DESCRIPTOR_POOL")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct C9Inner {
+    #[prost(message, optional, tag = "1")]
+    pub inner: ::core::option::Option<super::confluent::r#type::Decimal>,
 }

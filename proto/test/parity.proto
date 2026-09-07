@@ -49,10 +49,39 @@ message ParityRecordN {
   string plain = 4;
 }
 
-// No inline rules: used for the domain-rule capabilities C3-C7.
+// No inline rules: used for the domain rules.
 message ParityPlain {
   .confluent.type.Decimal amount = 1 [(.confluent.field_meta) = { tags: ["AMOUNT"] }];
   google.protobuf.Timestamp ts = 2 [(.confluent.field_meta) = { tags: ["TS"] }];
   .confluent.type.Variant data = 3 [(.confluent.field_meta) = { tags: ["DATA"] }];
   string plain = 4 [(.confluent.field_meta) = { tags: ["PLAIN"] }];
+}
+
+// A container message carrying BOTH inline rules and tags, so one fixture serves every C9
+// capability: C1/C2 from the inline rules, C3 from message-level selection, C4/C5 from a tagged
+// CEL_FIELD rule, and C6/C7 from a message-level transform. Mirrors Java's C9Inline exactly.
+message C9Containers {
+  option (.confluent.message_meta) = {
+    rules: [
+      {name: "msgArr", expr: "decimals.gt(this.amounts[0], decimal('1.00'))"},
+      {name: "msgNested", expr: "decimals.gt(this.nested.inner, decimal('1.00'))"}
+    ]
+  };
+
+  repeated .confluent.type.Decimal amounts = 1 [(.confluent.field_meta) = {
+    tags: ["AMOUNTS"],
+    rules: [{name: "fldArr", expr: "decimals.gt(this[0], decimal('1.00'))"}]
+  }];
+  map<string, .confluent.type.Decimal> amount_map = 2 [(.confluent.field_meta) = {
+    tags: ["AMOUNTMAP"]
+  }];
+  C9Inner nested = 3;
+  string label = 4;
+}
+
+message C9Inner {
+  .confluent.type.Decimal inner = 1 [(.confluent.field_meta) = {
+    tags: ["INNER"],
+    rules: [{name: "fldInner", expr: "decimals.gt(this, decimal('1.00'))"}]
+  }];
 }
