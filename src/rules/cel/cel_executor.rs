@@ -1081,47 +1081,42 @@ fn union_variant_index(
 
 /// Converts a CEL result back to a protobuf value, shaped by the value the field already held.
 ///
-/// Narrowing is checked. CEL has one integer type, so a field narrower than i64 needs a
-/// conversion that can fail, and `as` would silently write a different number (2^32 as an int32
-/// becomes 0). The JVM client's field write-back goes through `Builder.setField`, which rejects a
-/// value of the wrong width outright, so failing here is what matches.
+/// **Narrowing is deliberately unchecked, and must stay that way**, however wrong it looks. CEL
+/// has one integer type, so writing to a narrower field truncates - 2^32 into an int32 becomes 0.
+/// That is what the JVM reference does: `CelFieldExecutor` ends with a narrowing chain of
+/// `num.intValue()` / `num.longValue()` / `num.floatValue()` / `num.doubleValue()`, all of which
+/// truncate or saturate silently.
+///
+/// This is *not* the message-level path. A message-level transform returns a map that is rebuilt
+/// through `protobuf_result_writer`, where the JVM client goes via protobuf JSON and `JsonFormat`
+/// rejects an out-of-range value - so that path checks every conversion. The two paths differ in
+/// the reference, so they differ here.
+///
+/// A checked conversion was tried here and reverted: it made Rust reject values every other
+/// client accepts. If this should change, it is a cross-client contract decision and the JVM
+/// narrowing chain has to change with it.
 fn to_protobuf_value(
     input: &prost_reflect::Value,
     value: &Value,
 ) -> Result<prost_reflect::Value, SerdeError> {
-    let err = || SerdeError::Rule(format!("value {value:?} does not fit the protobuf field"));
     Ok(match value {
         Value::Bool(v) => prost_reflect::Value::Bool(*v),
+        // `as`, not `try_from`: see the note above - the JVM field path narrows with
+        // `Number.intValue()`, which truncates the same way.
         Value::Int(v) => match input {
-            prost_reflect::Value::I32(_) => {
-                prost_reflect::Value::I32(i32::try_from(*v).map_err(|_| err())?)
-            }
+            prost_reflect::Value::I32(_) => prost_reflect::Value::I32(*v as i32),
             prost_reflect::Value::I64(_) => prost_reflect::Value::I64(*v),
-            prost_reflect::Value::U32(_) => {
-                prost_reflect::Value::U32(u32::try_from(*v).map_err(|_| err())?)
-            }
-            prost_reflect::Value::U64(_) => {
-                prost_reflect::Value::U64(u64::try_from(*v).map_err(|_| err())?)
-            }
-            prost_reflect::Value::EnumNumber(_) => {
-                prost_reflect::Value::EnumNumber(i32::try_from(*v).map_err(|_| err())?)
-            }
+            prost_reflect::Value::U32(_) => prost_reflect::Value::U32(*v as u32),
+            prost_reflect::Value::U64(_) => prost_reflect::Value::U64(*v as u64),
+            prost_reflect::Value::EnumNumber(_) => prost_reflect::Value::EnumNumber(*v as i32),
             _ => prost_reflect::Value::I64(*v),
         },
         Value::UInt(v) => match input {
-            prost_reflect::Value::I32(_) => {
-                prost_reflect::Value::I32(i32::try_from(*v).map_err(|_| err())?)
-            }
-            prost_reflect::Value::I64(_) => {
-                prost_reflect::Value::I64(i64::try_from(*v).map_err(|_| err())?)
-            }
-            prost_reflect::Value::U32(_) => {
-                prost_reflect::Value::U32(u32::try_from(*v).map_err(|_| err())?)
-            }
+            prost_reflect::Value::I32(_) => prost_reflect::Value::I32(*v as i32),
+            prost_reflect::Value::I64(_) => prost_reflect::Value::I64(*v as i64),
+            prost_reflect::Value::U32(_) => prost_reflect::Value::U32(*v as u32),
             prost_reflect::Value::U64(_) => prost_reflect::Value::U64(*v),
-            prost_reflect::Value::EnumNumber(_) => {
-                prost_reflect::Value::EnumNumber(i32::try_from(*v).map_err(|_| err())?)
-            }
+            prost_reflect::Value::EnumNumber(_) => prost_reflect::Value::EnumNumber(*v as i32),
             _ => prost_reflect::Value::U64(*v),
         },
         Value::Float(v) => {
@@ -1147,8 +1142,24 @@ fn to_protobuf_value(
             }
             prost_reflect::Value::Map(out)
         }
-        Value::Null => prost_reflect::Value::Bytes(Bytes::from(Vec::new())),
-        _ => prost_reflect::Value::Bytes(Bytes::from(Vec::new())),
+        // Neither a null nor an unrecognised CEL value has a protobuf form for an arbitrary
+        // field. Writing empty bytes instead stored a wrong value, and for any non-bytes field
+        // it panics inside `set_field`, which validates the value against the field. The JVM
+        // reference hands the result straight to `Builder.setField`, which rejects both (a
+        // ClassCastException, or a NullPointerException for a null), so failing is what matches
+        // - and an error beats a panic either way.
+        Value::Null => {
+            return Err(SerdeError::Rule(
+                "cannot write a null to this protobuf field; a rule clears a field by returning \
+                 null only where the field is a value-type message"
+                    .to_string(),
+            ));
+        }
+        other => {
+            return Err(SerdeError::Rule(format!(
+                "cannot write {other:?} to this protobuf field"
+            )));
+        }
     })
 }
 
