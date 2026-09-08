@@ -40,9 +40,20 @@ pub const VARIANT_TYPE_NAME: &str = "confluent.type.Variant";
 pub struct CelVariant(pub Variant);
 
 impl PartialEq for CelVariant {
+    /// Identity semantics, matching Java, C#, Python, JavaScript and C++, none of which give a
+    /// variant a value-equality operator.
+    ///
+    /// A variant is a dynamically typed container, so comparing encodings is not value
+    /// equality: it reports `12.34 != 12.340` (different scale) and `int8(1) != int16(1)`
+    /// (different width), and can separate identical documents whose metadata dictionaries
+    /// differ. Real value equality needs a decode and a specification for cross-width integers,
+    /// decimal scale, int/double comparison and object key order - which `==` does not do.
+    ///
+    /// So this is true only when both sides are the same value: a `true` is never wrong, while
+    /// equal values reached separately compare false. Compare values with `variants.as` or
+    /// `variants.toJson` instead.
     fn eq(&self, other: &Self) -> bool {
-        self.0.metadata_bytes() == other.0.metadata_bytes()
-            && self.0.standalone_value_bytes() == other.0.standalone_value_bytes()
+        std::ptr::eq(self, other)
     }
 }
 impl Eq for CelVariant {}

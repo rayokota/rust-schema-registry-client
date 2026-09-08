@@ -1177,6 +1177,25 @@ fn unwrap_union(value: &Value) -> &Value {
     }
 }
 
+/// Unwraps a union value and narrows the schema to the branch it took, keeping the pair
+/// consistent. A named `Schema::Ref` never denotes a union (Avro names only records, enums and
+/// fixed), so the direct case is the whole story.
+fn unwrap_union_with_schema<'a>(
+    schema: &'a apache_avro::Schema,
+    value: &'a Value,
+) -> (&'a apache_avro::Schema, &'a Value) {
+    match (schema, value) {
+        (apache_avro::Schema::Union(u), Value::Union(idx, inner)) => {
+            match u.variants().get(*idx as usize) {
+                Some(branch) => unwrap_union_with_schema(branch, inner),
+                None => (schema, unwrap_union(inner)),
+            }
+        }
+        (_, Value::Union(_, inner)) => unwrap_union_with_schema(schema, inner),
+        _ => (schema, value),
+    }
+}
+
 /// Evaluates the given rules against `value`, skipping null values to honor the
 /// skip-on-null contract. Returns whether the walk should stop.
 fn evaluate_rules(
@@ -1189,7 +1208,11 @@ fn evaluate_rules(
     fail_fast: bool,
     violations: &mut Vec<ValidationRuleError>,
 ) -> bool {
-    let value = unwrap_union(value);
+    // A nullable field arrives as Union(idx, inner) against a union schema. Unwrapping the value
+    // drops the branch index, and the schema-aware conversion can only follow a union while the
+    // value still carries it - so narrow the schema to the branch here as well. Without this a
+    // nullable decimal lost its scale and read 12.34 as 1234.
+    let (schema, value) = unwrap_union_with_schema(schema, value);
     if rules.is_empty() || matches!(value, Value::Null) {
         return false;
     }

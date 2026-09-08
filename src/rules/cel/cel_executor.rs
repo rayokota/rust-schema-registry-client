@@ -924,7 +924,12 @@ fn to_avro_value_with_schema(
             for field in &rs.fields {
                 let bytes = match field.name.as_str() {
                     "metadata" => variant.metadata_bytes().to_vec(),
-                    "value" => variant.value_bytes().to_vec(),
+                    // Slice from this node's offset, not from 0: a Variant from
+                    // variants.field/path/index is a view, and value_bytes() would write the
+                    // entire source variant. Trailing sibling bytes are kept deliberately -
+                    // the Java reference emits ByteBuffer position..limit (VariantFormat.slice
+                    // sets only the position), so this matches it byte for byte.
+                    "value" => variant.standalone_value_bytes(),
                     // A variant record carries exactly these two fields; anything else is
                     // not part of the shape and has no value to write.
                     _ => continue,

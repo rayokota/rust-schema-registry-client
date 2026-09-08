@@ -102,16 +102,17 @@ fn to_field_value(fd: &FieldDescriptor, value: &Value) -> Result<prost_reflect::
             .as_message()
             .and_then(|m| m.get_field_by_name("value"))
             .ok_or_else(|| SerdeError::Rule("map field has no value type".to_string()))?;
+        let key_fd = fd
+            .kind()
+            .as_message()
+            .and_then(|m| m.get_field_by_name("key"))
+            .ok_or_else(|| SerdeError::Rule("map field has no key type".to_string()))?;
         let mut out = std::collections::HashMap::new();
         for (k, v) in entries.map.iter() {
             if matches!(v, Value::Null) {
                 continue;
             }
-            let Key::String(name) = k else { continue };
-            out.insert(
-                prost_reflect::MapKey::String(name.to_string()),
-                scalar_or_message(&value_fd, v)?,
-            );
+            out.insert(map_key(&key_fd, k)?, scalar_or_message(&value_fd, v)?);
         }
         return Ok(prost_reflect::Value::Map(out));
     }
@@ -165,11 +166,18 @@ fn build_message(md: &MessageDescriptor, value: &Value) -> Result<DynamicMessage
             "value",
             prost_reflect::Value::Bytes(unscaled.to_signed_bytes_be().into()),
         );
+        let scale = i32::try_from(exponent)
+            .map_err(|_| SerdeError::Rule(format!("decimal scale out of int range: {exponent}")))?;
+        set_named(&mut out, md, "scale", prost_reflect::Value::I32(scale));
+        // The reference DecimalUtils.fromBigDecimal carries the digit count, so leaving this at
+        // its default would have an identity transform rewrite the field's precision to 0.
+        // confluent.type.Decimal.precision is uint32.
+        let precision = u32::try_from(unscaled.magnitude().to_string().len()).unwrap_or(u32::MAX);
         set_named(
             &mut out,
             md,
-            "scale",
-            prost_reflect::Value::I32(exponent as i32),
+            "precision",
+            prost_reflect::Value::U32(precision),
         );
         return Ok(out);
     }
@@ -193,7 +201,10 @@ fn build_message(md: &MessageDescriptor, value: &Value) -> Result<DynamicMessage
             &mut out,
             md,
             "value",
-            prost_reflect::Value::Bytes(variant.value_bytes().to_vec().into()),
+            // Slice from this node's offset, not from 0. Trailing sibling bytes are kept so
+            // the encoding matches the Java reference, which writes ByteBuffer
+            // position..limit (see VariantFormat.slice and ProtobufResultWriter.toBytes).
+            prost_reflect::Value::Bytes(variant.standalone_value_bytes().into()),
         );
         return Ok(out);
     }
@@ -220,6 +231,12 @@ fn build_message(md: &MessageDescriptor, value: &Value) -> Result<DynamicMessage
         return Ok(out);
     }
 
+    // The inverse of cel_executor::unwrap_well_known: those types were read as bare scalars,
+    // so the rule hands back a scalar and there is no field map to rebuild from.
+    if let Some(wrapped) = build_well_known(md, value)? {
+        return Ok(wrapped);
+    }
+
     // A nested message the rule rebuilt field by field.
     let Value::Map(map) = value else {
         return Err(SerdeError::Rule(format!(
@@ -229,6 +246,101 @@ fn build_message(md: &MessageDescriptor, value: &Value) -> Result<DynamicMessage
     let mut out = DynamicMessage::new(md.clone());
     fill(&mut out, md, map)?;
     Ok(out)
+}
+
+/// Re-wraps a scalar CEL value into the well-known message it was unwrapped from. Returns
+/// `Ok(None)` when the descriptor is not one of those types, so the caller falls through to
+/// rebuilding a message from a field map.
+fn build_well_known(
+    md: &MessageDescriptor,
+    value: &Value,
+) -> Result<Option<DynamicMessage>, SerdeError> {
+    let err = || SerdeError::Rule(format!("cannot write this value to {}", md.full_name()));
+    let mut out = DynamicMessage::new(md.clone());
+    match md.full_name() {
+        "google.protobuf.BoolValue" => {
+            let Value::Bool(b) = value else {
+                return Err(err());
+            };
+            set_named(&mut out, md, "value", prost_reflect::Value::Bool(*b));
+        }
+        "google.protobuf.StringValue" => {
+            let Value::String(v) = value else {
+                return Err(err());
+            };
+            set_named(
+                &mut out,
+                md,
+                "value",
+                prost_reflect::Value::String(v.to_string()),
+            );
+        }
+        "google.protobuf.BytesValue" => {
+            let Value::Bytes(v) = value else {
+                return Err(err());
+            };
+            set_named(
+                &mut out,
+                md,
+                "value",
+                prost_reflect::Value::Bytes(v.to_vec().into()),
+            );
+        }
+        "google.protobuf.Int32Value" => {
+            let v = as_i64(value).ok_or_else(err)?;
+            set_named(
+                &mut out,
+                md,
+                "value",
+                prost_reflect::Value::I32(i32::try_from(v).map_err(|_| err())?),
+            );
+        }
+        "google.protobuf.Int64Value" => {
+            let v = as_i64(value).ok_or_else(err)?;
+            set_named(&mut out, md, "value", prost_reflect::Value::I64(v));
+        }
+        "google.protobuf.UInt32Value" => {
+            let v = as_i64(value).ok_or_else(err)?;
+            set_named(
+                &mut out,
+                md,
+                "value",
+                prost_reflect::Value::U32(u32::try_from(v).map_err(|_| err())?),
+            );
+        }
+        "google.protobuf.UInt64Value" => {
+            let v = as_i64(value).ok_or_else(err)?;
+            set_named(
+                &mut out,
+                md,
+                "value",
+                prost_reflect::Value::U64(u64::try_from(v).map_err(|_| err())?),
+            );
+        }
+        "google.protobuf.FloatValue" => {
+            let v = as_f64(value).ok_or_else(err)?;
+            set_named(&mut out, md, "value", prost_reflect::Value::F32(v as f32));
+        }
+        "google.protobuf.DoubleValue" => {
+            let v = as_f64(value).ok_or_else(err)?;
+            set_named(&mut out, md, "value", prost_reflect::Value::F64(v));
+        }
+        "google.protobuf.Duration" => {
+            let Value::Duration(d) = value else {
+                return Err(err());
+            };
+            set_named(
+                &mut out,
+                md,
+                "seconds",
+                prost_reflect::Value::I64(d.num_seconds()),
+            );
+            let nanos = (d.num_nanoseconds().ok_or_else(err)? % 1_000_000_000) as i32;
+            set_named(&mut out, md, "nanos", prost_reflect::Value::I32(nanos));
+        }
+        _ => return Ok(None),
+    }
+    Ok(Some(out))
 }
 
 fn set_named(
@@ -242,6 +354,48 @@ fn set_named(
     }
 }
 
+/// Converts a CEL map key to the type the map entry declares. Protobuf map keys are integral,
+/// bool or string, and the CEL side keeps whichever it read, so writing every key as a string
+/// would drop each non-string entry and silently shrink the map.
+fn map_key(key_fd: &FieldDescriptor, key: &Key) -> Result<prost_reflect::MapKey, SerdeError> {
+    let err = || {
+        SerdeError::Rule(format!(
+            "cannot write this map key to field {}",
+            key_fd.name()
+        ))
+    };
+    let as_int = |k: &Key| -> Option<i64> {
+        match k {
+            Key::Int(i) => Some(*i),
+            Key::Uint(u) => i64::try_from(*u).ok(),
+            _ => None,
+        }
+    };
+    Ok(match key_fd.kind() {
+        Kind::Bool => match key {
+            Key::Bool(b) => prost_reflect::MapKey::Bool(*b),
+            _ => return Err(err()),
+        },
+        Kind::String => match key {
+            Key::String(s) => prost_reflect::MapKey::String(s.to_string()),
+            _ => return Err(err()),
+        },
+        Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => prost_reflect::MapKey::I32(
+            i32::try_from(as_int(key).ok_or_else(err)?).map_err(|_| err())?,
+        ),
+        Kind::Int64 | Kind::Sint64 | Kind::Sfixed64 => {
+            prost_reflect::MapKey::I64(as_int(key).ok_or_else(err)?)
+        }
+        Kind::Uint32 | Kind::Fixed32 => prost_reflect::MapKey::U32(
+            u32::try_from(as_int(key).ok_or_else(err)?).map_err(|_| err())?,
+        ),
+        Kind::Uint64 | Kind::Fixed64 => prost_reflect::MapKey::U64(
+            u64::try_from(as_int(key).ok_or_else(err)?).map_err(|_| err())?,
+        ),
+        _ => return Err(err()),
+    })
+}
+
 /// Narrows a CEL value to what the field's kind accepts. CEL has one integer type, so a
 /// narrower field needs converting back rather than rejecting.
 fn scalar(fd: &FieldDescriptor, value: &Value) -> Result<prost_reflect::Value, SerdeError> {
@@ -252,19 +406,24 @@ fn scalar(fd: &FieldDescriptor, value: &Value) -> Result<prost_reflect::Value, S
         (Kind::Bytes, Value::Bytes(b)) => prost_reflect::Value::Bytes(b.to_vec().into()),
         (Kind::Float, v) => prost_reflect::Value::F32(as_f64(v).ok_or_else(err)? as f32),
         (Kind::Double, v) => prost_reflect::Value::F64(as_f64(v).ok_or_else(err)?),
+        // CEL has one 64-bit integer type, so writing to a narrower field is a conversion that
+        // can fail. Reject an out-of-range value rather than truncating it, which would write a
+        // numerically different message (2147483648 -> -2147483648).
         (Kind::Int32 | Kind::Sint32 | Kind::Sfixed32, v) => {
-            prost_reflect::Value::I32(as_i64(v).ok_or_else(err)? as i32)
+            prost_reflect::Value::I32(i32::try_from(as_i64(v).ok_or_else(err)?).map_err(|_| err())?)
         }
         (Kind::Int64 | Kind::Sint64 | Kind::Sfixed64, v) => {
             prost_reflect::Value::I64(as_i64(v).ok_or_else(err)?)
         }
         (Kind::Uint32 | Kind::Fixed32, v) => {
-            prost_reflect::Value::U32(as_i64(v).ok_or_else(err)? as u32)
+            prost_reflect::Value::U32(u32::try_from(as_i64(v).ok_or_else(err)?).map_err(|_| err())?)
         }
         (Kind::Uint64 | Kind::Fixed64, v) => {
-            prost_reflect::Value::U64(as_i64(v).ok_or_else(err)? as u64)
+            prost_reflect::Value::U64(u64::try_from(as_i64(v).ok_or_else(err)?).map_err(|_| err())?)
         }
-        (Kind::Enum(_), v) => prost_reflect::Value::EnumNumber(as_i64(v).ok_or_else(err)? as i32),
+        (Kind::Enum(_), v) => prost_reflect::Value::EnumNumber(
+            i32::try_from(as_i64(v).ok_or_else(err)?).map_err(|_| err())?,
+        ),
         _ => return Err(err()),
     })
 }
@@ -272,8 +431,18 @@ fn scalar(fd: &FieldDescriptor, value: &Value) -> Result<prost_reflect::Value, S
 fn as_i64(value: &Value) -> Option<i64> {
     match value {
         Value::Int(i) => Some(*i),
-        Value::UInt(u) => Some(*u as i64),
-        Value::Float(f) => Some(*f as i64),
+        // A u64 above i64::MAX has no i64 form, and `as` would wrap it to a negative. A float
+        // only converts when it is integral and in range - `as` would otherwise saturate.
+        Value::UInt(u) => i64::try_from(*u).ok(),
+        Value::Float(f) => {
+            let truncated = f.trunc();
+            #[allow(clippy::float_cmp)]
+            if truncated == *f && truncated >= i64::MIN as f64 && truncated <= i64::MAX as f64 {
+                Some(truncated as i64)
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }

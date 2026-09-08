@@ -1119,7 +1119,20 @@ async fn transform_field_value(
             };
             let mut result = HashMap::new();
             for (key, entry) in entries {
-                let entry = transform(ctx, &value_kind, entry).await?;
+                // Same leaf reasoning as the list arm: a map of decimals or timestamps holds
+                // single values, so descending into value/scale would leave the rule's result
+                // unwritten and the field unchanged with no error.
+                let entry =
+                    if is_cel_leaf_message(&value_kind) && matches!(entry, Value::Message(_)) {
+                        let new_value = transform_leaf(ctx, entry).await?;
+                        if ctx.rule.kind == Some(Kind::Condition) {
+                            entry.clone()
+                        } else {
+                            rebuild_value_type(ctx, &value_kind, entry, new_value)?
+                        }
+                    } else {
+                        transform(ctx, &value_kind, entry).await?
+                    };
                 result.insert(key.clone(), entry);
             }
             Ok(Value::Map(result))
@@ -3777,6 +3790,115 @@ mod tests {
             vec!["111", "222"],
             "a condition must not touch the elements"
         );
+    }
+
+    fn amount_map_decimal(unscaled: i64, scale: i32) -> DynamicMessage {
+        let dd = crate::TEST_DESCRIPTOR_POOL
+            .get_message_by_name("confluent.type.Decimal")
+            .unwrap();
+        let mut d = DynamicMessage::new(dd);
+        let mut raw: Vec<u8> = unscaled
+            .to_be_bytes()
+            .iter()
+            .skip_while(|b| **b == 0)
+            .copied()
+            .collect();
+        if raw.first().is_some_and(|b| b & 0x80 != 0) {
+            raw.insert(0, 0);
+        }
+        d.set_field_by_name("value", prost_reflect::Value::Bytes(raw.into()));
+        d.set_field_by_name("precision", prost_reflect::Value::U32(8));
+        d.set_field_by_name("scale", prost_reflect::Value::I32(scale));
+        d
+    }
+
+    async fn amount_map_run(expr: &str, kind: Kind) -> Result<Vec<(String, String)>, SerdeError> {
+        amount_map_run_tags(expr, kind, Some(vec!["AMOUNTMAP".to_string()])).await
+    }
+
+    async fn amount_map_run_tags(
+        expr: &str,
+        kind: Kind,
+        tags: Option<Vec<String>>,
+    ) -> Result<Vec<(String, String)>, SerdeError> {
+        let mut ctx = parity_field_ctx(expr, kind, tags);
+        ctx.rule_registry = Some(RuleRegistry::new());
+        if let Some(r) = &ctx.rule_registry {
+            r.register_executor(CelFieldExecutor::new());
+        }
+        let md = crate::TEST_DESCRIPTOR_POOL
+            .get_message_by_name("parity.ValueTypeContainers")
+            .unwrap();
+        let mut m = DynamicMessage::new(md);
+        let mut map = HashMap::new();
+        map.insert(
+            prost_reflect::MapKey::String("a".to_string()),
+            prost_reflect::Value::Message(amount_map_decimal(210, 2)),
+        );
+        m.set_field_by_name("amount_map", prost_reflect::Value::Map(map));
+        let desc = m.descriptor();
+        let out = transform(&mut ctx, &desc, &prost_reflect::Value::Message(m)).await?;
+        let prost_reflect::Value::Message(m) = out else {
+            panic!("expected a message")
+        };
+        let mut got: Vec<(String, String)> = m
+            .get_field_by_name("amount_map")
+            .and_then(|v| {
+                v.as_map().map(|entries| {
+                    entries
+                        .iter()
+                        .map(|(k, v)| {
+                            let key = match k {
+                                prost_reflect::MapKey::String(s) => s.clone(),
+                                other => format!("{other:?}"),
+                            };
+                            let prost_reflect::Value::Message(d) = v else {
+                                return (key, "?".to_string());
+                            };
+                            let bytes = d
+                                .get_field_by_name("value")
+                                .and_then(|b| b.as_bytes().map(|x| x.to_vec()))
+                                .unwrap_or_default();
+                            let mut n: i128 = 0;
+                            for b in &bytes {
+                                n = (n << 8) | (*b as i128);
+                            }
+                            if bytes.first().is_some_and(|b| b & 0x80 != 0) {
+                                n -= 1i128 << (8 * bytes.len());
+                            }
+                            (key, n.to_string())
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default();
+        got.sort();
+        Ok(got)
+    }
+
+    /// A `map<_, confluent.type.Decimal>` holds single values, exactly like a repeated decimal,
+    /// so the tagged rule ought to run on the value rather than descending into value/scale.
+    /// The transform walk now handles that, but the rule still never reaches the field:
+    /// `get_type` reports a map field as `FieldType::Map`, which `CelFieldExecutor` skips as
+    /// non-primitive. The Java reference does exactly the same (`Type.MAP(false)`), so making
+    /// this fire is a cross-client contract change, not a local fix.
+    #[ignore = "blocked on a cross-client decision: a map field reports FieldType::Map, which \
+                the field executor skips - the Java reference behaves identically"]
+    #[tokio::test]
+    async fn map_decimal_transform_rebuilds_every_entry() {
+        let got = amount_map_run(
+            r#"decimals.add(decimal(value), decimal("1.00"))"#,
+            Kind::Transform,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, vec![("a".to_string(), "310".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn map_decimal_identity_transform_round_trips() {
+        let got = amount_map_run("value", Kind::Transform).await.unwrap();
+        assert_eq!(got, vec![("a".to_string(), "210".to_string())]);
     }
 
     // ---- Message-level CEL transforms over protobuf (C6/C7) ----------------------------
