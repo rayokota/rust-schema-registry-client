@@ -93,7 +93,8 @@ fn decimal(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
     match args.as_slice() {
         [v] => Ok(decimal_value(to_decimal(v)?)),
         [Value::Bytes(bytes), Value::Int(scale)] => {
-            Ok(decimal_value(from_bytes_scale(bytes, *scale)))
+            let scale = require_int_scale(*scale, "decimal(bytes, scale)")?;
+            Ok(decimal_value(from_bytes_scale(bytes, scale)))
         }
         _ => Err(err("decimal: expected (dyn) or (bytes, int)")),
     }
@@ -207,13 +208,27 @@ fn scale_arg(args: &[Value]) -> Result<i64, ExecutionError> {
         _ => Err(err("expected 1 or 2 arguments")),
     }
 }
+
+/// Narrow a CEL int (i64) scale into the i32 range a `BigDecimal` scale occupies elsewhere,
+/// erroring on out-of-range values instead of silently honoring them. CEL int is i64, but
+/// Java/Python/JS all back the scale with a 32-bit int, so a value like `3_000_000_000` is
+/// rejected there. bigdecimal accepts an i64 scale, so without this check Rust would diverge
+/// and honor it. Mirrors Java's `requireIntScale` (`Math.toIntExact`), same error text.
+fn require_int_scale(scale: i64, function_name: &str) -> Result<i64, ExecutionError> {
+    i32::try_from(scale)
+        .map(i64::from)
+        .map_err(|_| err(format!("{function_name}: scale out of int range: {scale}")))
+}
+
 fn decimals_round(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
     let d = to_decimal(
         args.first()
             .ok_or_else(|| err("decimals.round: missing argument"))?,
     )?;
+    let scale = require_int_scale(scale_arg(&args)?, "decimals.round")?;
+    check_scale_width(&d, scale, "decimals.round")?;
     Ok(decimal_value(
-        d.with_scale_round(scale_arg(&args)?, RoundingMode::HalfUp),
+        d.with_scale_round(scale, RoundingMode::HalfUp),
     ))
 }
 fn decimals_trunc(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
@@ -221,7 +236,7 @@ fn decimals_trunc(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
         args.first()
             .ok_or_else(|| err("decimals.trunc: missing argument"))?,
     )?;
-    let scale = scale_arg(&args)?;
+    let scale = require_int_scale(scale_arg(&args)?, "decimals.trunc")?;
     // Flink's TRUNCATE early-returns when the target scale is at-or-finer than the current one:
     // there is nothing to drop, so the input is returned unchanged. Without this guard
     // `with_scale_round` would zero-pad and `string(trunc(d, n >= cur))` would diverge from
@@ -262,15 +277,48 @@ fn decimal_to_string(Arguments(args): Arguments) -> Result<Value, ExecutionError
 /// magnitudes. `to_plain_string` expands the full scale into digits, so a pathological scale -
 /// `decimal(b"\x01", 1_000_000_000)` or `decimal("1e-1000000000")` - would allocate gigabytes;
 /// bound the length first and error instead. (Java's `toPlainString` has the same blow-up.)
+/// A practical ceiling on the digits a decimal result may carry. 1 MiB of them is already absurd
+/// for a rule value.
+///
+/// The JVM reference needs no such constant: `BigInteger` caps its own magnitude, so an
+/// over-large `setScale` raises an `ArithmeticException` that surfaces as a failed rule.
+/// `bigdecimal` has no cap, and an allocation failure in Rust aborts the process instead of
+/// unwinding - so the bound is what keeps the caller-visible behaviour the same.
+const MAX_DECIMAL_DIGITS: u64 = 1 << 20;
+
 fn plain_decimal_string(d: &BigDecimal) -> Result<String, ExecutionError> {
-    const MAX_LEN: u64 = 1 << 20; // 1 MiB of digits is already absurd for a rule value
     let length = d
         .digits()
         .saturating_add(d.fractional_digit_count().unsigned_abs());
-    if length > MAX_LEN {
+    if length > MAX_DECIMAL_DIGITS {
         return Err(err("string: decimal is too large to format"));
     }
     Ok(d.to_plain_string())
+}
+
+/// Rejects a target scale whose zero-padded result would exceed [`MAX_DECIMAL_DIGITS`].
+///
+/// Only widening needs checking: rounding to a coarser scale drops digits. `decimals.trunc`
+/// never reaches a widening `with_scale_round` because it early-returns first, so only
+/// `decimals.round` needs this.
+fn check_scale_width(
+    d: &BigDecimal,
+    scale: i64,
+    function_name: &str,
+) -> Result<(), ExecutionError> {
+    let current = d.fractional_digit_count();
+    if scale <= current {
+        return Ok(());
+    }
+    let length = d
+        .digits()
+        .saturating_add(scale.saturating_sub(current).unsigned_abs());
+    if length > MAX_DECIMAL_DIGITS {
+        return Err(err(format!(
+            "{function_name}: scale {scale} would produce {length} digits"
+        )));
+    }
+    Ok(())
 }
 fn decimal_to_double(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
     match args.as_slice() {
@@ -340,6 +388,20 @@ mod tests {
         assert!(!eval_bool(
             "decimals.ge(decimal(\"9.99\"), decimal(\"10.00\"))"
         ));
+    }
+
+    /// The CEL `==` / `!=` operators on two Decimal opaques are NUMERIC (scale-insensitive),
+    /// agreeing with `decimals.eq`. This exercises the `CelDecimal::eq` path (via cel's
+    /// `PartialEq` dispatch on `Value::Opaque`), which must use `cmp(...) == Equal` and NOT
+    /// bigdecimal's own scale-sensitive `BigDecimal::eq` (where `2.0 != 2.00`).
+    #[test]
+    fn equality_operator_is_numeric() {
+        assert!(eval_bool("decimal(\"2.0\") == decimal(\"2.00\")"));
+        assert!(eval_bool("decimal(\"2.0\") == decimal(\"2.0\")"));
+        assert!(!eval_bool("decimal(\"2.0\") == decimal(\"2.1\")"));
+        // `!=` negates.
+        assert!(!eval_bool("decimal(\"2.0\") != decimal(\"2.00\")"));
+        assert!(eval_bool("decimal(\"2.0\") != decimal(\"2.1\")"));
     }
 
     #[test]
@@ -445,10 +507,148 @@ mod tests {
         );
     }
 
+    /// A scale outside i32 range must error rather than silently narrow. CEL int is i64, but
+    /// the scale is a 32-bit int in Java/Python/JS (Java's `requireIntScale`), so all clients
+    /// reject the same inputs; bigdecimal would otherwise honor an i64 scale here.
+    #[test]
+    fn out_of_int32_scale_errors_instead_of_narrowing() {
+        // decimals.round / decimals.trunc with a scale beyond i32::MAX.
+        assert!(
+            Program::compile("decimals.round(decimal(\"1.5\"), 3000000000)")
+                .unwrap()
+                .execute(&default_context())
+                .is_err()
+        );
+        assert!(
+            Program::compile("decimals.trunc(decimal(\"1.5\"), 3000000000)")
+                .unwrap()
+                .execute(&default_context())
+                .is_err()
+        );
+        // Below i32::MIN as well.
+        assert!(
+            Program::compile("decimals.round(decimal(\"1.5\"), -3000000000)")
+                .unwrap()
+                .execute(&default_context())
+                .is_err()
+        );
+        // The decimal(bytes, scale) constructor guards its scale the same way.
+        assert!(
+            Program::compile("decimal(b\"\\x01\", 9223372036854775807)")
+                .unwrap()
+                .execute(&default_context())
+                .is_err()
+        );
+    }
+
+    /// The bounds check accepts the full i32 range and rejects anything past it (matching Java's
+    /// `Math.toIntExact`). Tested on the helper directly so the "accepted" cases don't zero-pad a
+    /// BigDecimal out to billions of digits the way a real `round` at i32::MAX would.
+    #[test]
+    fn decimals_round_rejects_an_absurd_scale() {
+        // i32::MAX passes require_int_scale, and with_scale_round would then zero-pad to that
+        // many digits - gigabytes, and an allocation failure in Rust aborts the process rather
+        // than unwinding. The JVM reference gets an ArithmeticException from BigInteger's own
+        // magnitude cap, so a rule error is the matching outcome. Reaching the assertion at all
+        // is most of the point: it means nothing tried to allocate.
+        assert!(
+            Program::compile("decimals.round(decimal('1.5'), 2147483647)")
+                .unwrap()
+                .execute(&default_context())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn decimals_round_still_widens_reasonably() {
+        assert_eq!(
+            eval_str("string(decimals.round(decimal('1.5'), 10))"),
+            "1.5000000000"
+        );
+        // Coarsening is unaffected by the bound.
+        assert_eq!(
+            eval_str("string(decimals.round(decimal('1.55'), 1))"),
+            "1.6"
+        );
+        // A hugely negative scale drops digits rather than padding, so it must not be rejected.
+        assert!(
+            Program::compile("decimals.round(decimal('1.5'), -2147483648)")
+                .unwrap()
+                .execute(&default_context())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn require_int_scale_boundaries() {
+        use super::require_int_scale;
+        assert_eq!(
+            require_int_scale(i32::MAX as i64, "f").unwrap(),
+            i32::MAX as i64
+        );
+        assert_eq!(
+            require_int_scale(i32::MIN as i64, "f").unwrap(),
+            i32::MIN as i64
+        );
+        assert_eq!(require_int_scale(0, "f").unwrap(), 0);
+        assert!(require_int_scale(i32::MAX as i64 + 1, "f").is_err());
+        assert!(require_int_scale(i32::MIN as i64 - 1, "f").is_err());
+        assert!(require_int_scale(i64::MAX, "f").is_err());
+        assert!(require_int_scale(i64::MIN, "f").is_err());
+    }
+
     fn eval_str(expr: &str) -> String {
         match eval(expr) {
             Value::String(s) => s.to_string(),
             other => panic!("expected string, got {other:?}"),
         }
+    }
+
+    /// Cross-client parity: a bare `confluent.type.Decimal` field is usable with `decimals.*`,
+    /// `==`, `string()` and `double()` with **no `decimal(...)` call** on it. The discriminating
+    /// case is the scale-differing equality: a client comparing decimals by their protobuf
+    /// encoding (unscaled bytes plus scale, field by field) answers false for
+    /// `decimal("12.340")`, because 12.34 and 12.340 are the same number in two encodings.
+    #[test]
+    fn proto_decimal_needs_no_constructor() {
+        use crate::rules::cel::cel_executor::from_protobuf_value_for_test;
+        use prost_reflect::{DynamicMessage, Value as ProtoValue};
+
+        let desc = crate::DESCRIPTOR_POOL
+            .get_message_by_name(super::DECIMAL_TYPE_NAME)
+            .expect("decimal.proto is compiled into the descriptor pool");
+        let mut msg = DynamicMessage::new(desc);
+        // 12.34 = unscaled 1234 (0x04D2) at scale 2.
+        msg.set_field_by_name("value", ProtoValue::Bytes(vec![0x04, 0xd2].into()));
+        msg.set_field_by_name("scale", ProtoValue::I32(2));
+        let this = from_protobuf_value_for_test(&ProtoValue::Message(msg));
+
+        for expr in [
+            // Bare: no constructor call on the field.
+            "decimals.eq(this, decimal(\"12.34\"))",
+            "decimals.gt(this, decimal(\"10.00\"))",
+            // The wrapped form must keep working (decimal(...) re-entry).
+            "decimals.eq(decimal(this), decimal(\"12.34\"))",
+            // `==` is numeric on it: 12.34 equals 12.340 despite the differing scale.
+            "this == decimal(\"12.340\")",
+            "decimals.lt(this, decimal(\"100\"))",
+            "string(this) == \"12.34\"",
+            "double(this) == 12.34",
+        ] {
+            assert!(eval_bool_with(expr, this.clone()), "{expr}");
+        }
+        // Negative controls.
+        assert!(!eval_bool_with("this != decimal(\"12.340\")", this.clone()));
+        assert!(!eval_bool_with(
+            "decimals.gt(this, decimal(\"100\"))",
+            this.clone()
+        ));
+    }
+
+    fn eval_bool_with(expr: &str, this: Value) -> bool {
+        let program = Program::compile(expr).expect("compile");
+        let mut ctx = default_context();
+        ctx.add_variable_from_value("this", this);
+        matches!(program.execute(&ctx).expect("execute"), Value::Bool(true))
     }
 }

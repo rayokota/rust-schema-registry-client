@@ -2,6 +2,8 @@ use crate::rules::cel::cel_lib::default_context;
 use crate::rules::cel::decimal_funcs::{
     DECIMAL_TYPE_NAME, decimal_value, from_bytes_scale, to_decimal,
 };
+use crate::rules::cel::protobuf_result_writer::{write_back_protobuf, write_back_value_type};
+use crate::rules::cel::variant_funcs::{VARIANT_TYPE_NAME, to_variant};
 use crate::serdes::avro::collect_named_schemas;
 use crate::serdes::serde::{
     RuleBase, RuleContext, RuleExecutor, SerdeError, SerdeSchema, SerdeValue,
@@ -136,7 +138,7 @@ impl CelExecutor {
         prog = self.cache.get(expr);
         let prog = prog.ok_or(SerdeError::Rule("failed to compile program".to_string()))?;
         let mut context = default_context();
-        // `now` is available to every rule, so a condition like `timestamp.of(this.ts) < now`
+        // `now` is available to every rule, so a condition like `timestamp(this.ts) < now`
         // resolves. It is read fresh per evaluation, matching the other clients.
         context.add_variable_from_value("now", Value::Timestamp(Utc::now().into()));
         for (k, v) in args {
@@ -159,7 +161,32 @@ impl CelExecutor {
                     input, &result, schema, &defs,
                 )?))
             }
-            _ => Ok(to_serde_value(msg, &result)),
+            // A message-level transform returns a map that is the whole new message; rebuild
+            // it. Without this the protobuf arm of to_serde_value turns the map into a
+            // prost_reflect Map and its catch-all turns an unrecognised value into empty bytes,
+            // so decimal and timestamp were replaced with b"" rather than merely unwritten.
+            (SerdeValue::Protobuf(prost_reflect::Value::Message(m)), _) => {
+                // A field rule over a decimal or timestamp is handed the whole message and
+                // hands back a CEL value; encode it against that message's own descriptor.
+                // The generic conversion below has no arm for a decimal opaque and would turn
+                // it into empty bytes.
+                // A condition answers with a bool, which is a verdict on the value rather
+                // than a replacement for it and must not be encoded as one.
+                if ctx.rule.kind != Some(crate::rest::models::Kind::Condition)
+                    && let Some(encoded) = write_back_value_type(&m.descriptor(), &result)
+                {
+                    return Ok(SerdeValue::Protobuf(prost_reflect::Value::Message(
+                        encoded?,
+                    )));
+                }
+                match write_back_protobuf(m, &result)? {
+                    Some(rebuilt) => {
+                        Ok(SerdeValue::Protobuf(prost_reflect::Value::Message(rebuilt)))
+                    }
+                    None => to_serde_value(msg, &result),
+                }
+            }
+            _ => to_serde_value(msg, &result),
         }
     }
 
@@ -275,7 +302,7 @@ fn avro_definitions<'a>(
 /// Converts an Avro value for CEL, walking it against its schema so that decimal fields get
 /// their scale and logical types are recognised. Anything the schema does not add information to
 /// falls back to the schemaless [`from_avro_value`].
-fn from_avro_value_with_schema(
+pub(crate) fn from_avro_value_with_schema(
     value: &apache_avro::types::Value,
     schema: &AvroSchema,
     defs: &HashMap<AvroName, &AvroSchema>,
@@ -323,6 +350,14 @@ fn from_avro_value_with_schema(
             decimal_value(BigDecimal::new(BigInt::from(d.clone()), ds.scale as i64))
         }
         _ => from_avro_value(value),
+    }
+}
+
+/// The fully qualified name of an Avro record schema.
+fn avro_record_full_name(rs: &apache_avro::schema::RecordSchema) -> String {
+    match rs.name.namespace() {
+        Some(ns) => format!("{ns}.{}", rs.name.name()),
+        None => rs.name.name().to_string(),
     }
 }
 
@@ -758,12 +793,12 @@ fn from_json_value(value: &serde_json::Value) -> Value {
     }
 }
 
-pub fn to_serde_value(input: &SerdeValue, value: &Value) -> SerdeValue {
-    match input {
+pub fn to_serde_value(input: &SerdeValue, value: &Value) -> Result<SerdeValue, SerdeError> {
+    Ok(match input {
         SerdeValue::Avro(v) => SerdeValue::Avro(to_avro_value(v, value)),
-        SerdeValue::Protobuf(v) => SerdeValue::Protobuf(to_protobuf_value(v, value)),
+        SerdeValue::Protobuf(v) => SerdeValue::Protobuf(to_protobuf_value(v, value)?),
         SerdeValue::Json(v) => SerdeValue::Json(to_json_value(v, value)),
-    }
+    })
 }
 
 fn to_avro_value(input: &apache_avro::types::Value, value: &Value) -> apache_avro::types::Value {
@@ -879,6 +914,42 @@ fn to_avro_value_with_schema(
                 unscaled.to_signed_bytes_be(),
             )))
         }
+        // A computed variant is a CEL opaque, not a map of the record's fields, so the
+        // Record/Map arm below never sees it. Without this it fell through to the loose
+        // conversion and was written back as Avro null - the counterpart of the decimal arm
+        // above, and the one shape that arm did not cover.
+        // The record has to be the variant shape, not merely any record: the Java reference
+        // gates this on the branch carrying a logical type (AvroResultWriter, RECORD case), so
+        // without a schema-side check an unrelated record would silently accept a Variant.
+        (AvroSchema::Record(rs), Value::Opaque(o))
+            if o.runtime_type_name() == VARIANT_TYPE_NAME
+                && avro_record_full_name(rs) == VARIANT_TYPE_NAME =>
+        {
+            let variant = to_variant(value)
+                .map_err(|e| SerdeError::Rule(e.to_string()))?
+                .ok_or_else(|| {
+                    SerdeError::Rule(
+                        "cannot write an absent variant; use null to clear the field".to_string(),
+                    )
+                })?;
+            let mut out = Vec::with_capacity(rs.fields.len());
+            for field in &rs.fields {
+                let bytes = match field.name.as_str() {
+                    "metadata" => variant.metadata_bytes().to_vec(),
+                    // Slice from this node's offset, not from 0: a Variant from
+                    // variants.field/path/index is a view, and value_bytes() would write the
+                    // entire source variant. Trailing sibling bytes are kept deliberately -
+                    // the Java reference emits ByteBuffer position..limit (VariantFormat.slice
+                    // sets only the position), so this matches it byte for byte.
+                    "value" => variant.standalone_value_bytes(),
+                    // A variant record carries exactly these two fields; anything else is
+                    // not part of the shape and has no value to write.
+                    _ => continue,
+                };
+                out.push((field.name.clone(), AV::Bytes(bytes)));
+            }
+            Ok(AV::Record(out))
+        }
         (AvroSchema::TimestampMillis, Value::Timestamp(ts)) => {
             Ok(AV::TimestampMillis(ts.timestamp_millis()))
         }
@@ -895,6 +966,26 @@ fn to_avro_value_with_schema(
             let mut out = Vec::with_capacity(rs.fields.len());
             for field in &rs.fields {
                 let Some(cel_v) = m.map.get(&Key::String(Arc::new(field.name.clone()))) else {
+                    // Replace, not merge: the map is the whole new record, so a field the rule
+                    // does not name is not carried over from the input. Avro has no absent
+                    // field, so it takes the schema's declared default - or is an error, which
+                    // is what GenericRecordBuilder.build() does on the JVM. Omitting it instead
+                    // produced a record the writer rejected with "Value does not match schema",
+                    // naming nothing.
+                    let Some(default) = field.default.as_ref() else {
+                        return Err(SerdeError::Rule(format!(
+                            "CEL transform result does not set field '{}' of '{}', which has \
+                             no default value",
+                            field.name, rs.name
+                        )));
+                    };
+                    // The default is stored as the raw JSON it was written as; `resolve` is how
+                    // apache-avro itself reads one, so a union default lands on the right branch
+                    // and a logical type is lifted rather than left as its underlying value.
+                    out.push((
+                        field.name.clone(),
+                        AV::try_from(default.clone())?.resolve(&field.schema)?,
+                    ));
                     continue;
                 };
                 let child_input = match input {
@@ -988,9 +1079,30 @@ fn union_variant_index(
         .position(|v| !matches!(resolve_avro_ref(v, defs), AvroSchema::Null))
 }
 
-fn to_protobuf_value(input: &prost_reflect::Value, value: &Value) -> prost_reflect::Value {
-    match value {
+/// Converts a CEL result back to a protobuf value, shaped by the value the field already held.
+///
+/// **Narrowing is deliberately unchecked, and must stay that way**, however wrong it looks. CEL
+/// has one integer type, so writing to a narrower field truncates - 2^32 into an int32 becomes 0.
+/// That is what the JVM reference does: `CelFieldExecutor` ends with a narrowing chain of
+/// `num.intValue()` / `num.longValue()` / `num.floatValue()` / `num.doubleValue()`, all of which
+/// truncate or saturate silently.
+///
+/// This is *not* the message-level path. A message-level transform returns a map that is rebuilt
+/// through `protobuf_result_writer`, where the JVM client goes via protobuf JSON and `JsonFormat`
+/// rejects an out-of-range value - so that path checks every conversion. The two paths differ in
+/// the reference, so they differ here.
+///
+/// A checked conversion was tried here and reverted: it made Rust reject values every other
+/// client accepts. If this should change, it is a cross-client contract decision and the JVM
+/// narrowing chain has to change with it.
+fn to_protobuf_value(
+    input: &prost_reflect::Value,
+    value: &Value,
+) -> Result<prost_reflect::Value, SerdeError> {
+    Ok(match value {
         Value::Bool(v) => prost_reflect::Value::Bool(*v),
+        // `as`, not `try_from`: see the note above - the JVM field path narrows with
+        // `Number.intValue()`, which truncates the same way.
         Value::Int(v) => match input {
             prost_reflect::Value::I32(_) => prost_reflect::Value::I32(*v as i32),
             prost_reflect::Value::I64(_) => prost_reflect::Value::I64(*v),
@@ -1016,23 +1128,39 @@ fn to_protobuf_value(input: &prost_reflect::Value, value: &Value) -> prost_refle
         }
         Value::String(v) => prost_reflect::Value::String(v.to_string()),
         Value::Bytes(v) => prost_reflect::Value::Bytes(Bytes::from((**v).clone())),
-        Value::List(v) => prost_reflect::Value::List(
-            (**v)
-                .clone()
-                .into_iter()
-                .map(|x| to_protobuf_value(input, &x))
-                .collect(),
-        ),
-        Value::Map(v) => {
-            let iter = (*v.map).clone().into_iter().map(|(k, v)| {
-                let key = to_protobuf_map_key(&k);
-                (key, to_protobuf_value(input, &v))
-            });
-            prost_reflect::Value::Map(iter.collect())
+        Value::List(v) => {
+            let mut out = Vec::with_capacity(v.len());
+            for x in (**v).iter() {
+                out.push(to_protobuf_value(input, x)?);
+            }
+            prost_reflect::Value::List(out)
         }
-        Value::Null => prost_reflect::Value::Bytes(Bytes::from(Vec::new())),
-        _ => prost_reflect::Value::Bytes(Bytes::from(Vec::new())),
-    }
+        Value::Map(v) => {
+            let mut out = std::collections::HashMap::with_capacity(v.map.len());
+            for (k, val) in v.map.iter() {
+                out.insert(to_protobuf_map_key(k), to_protobuf_value(input, val)?);
+            }
+            prost_reflect::Value::Map(out)
+        }
+        // Neither a null nor an unrecognised CEL value has a protobuf form for an arbitrary
+        // field. Writing empty bytes instead stored a wrong value, and for any non-bytes field
+        // it panics inside `set_field`, which validates the value against the field. The JVM
+        // reference hands the result straight to `Builder.setField`, which rejects both (a
+        // ClassCastException, or a NullPointerException for a null), so failing is what matches
+        // - and an error beats a panic either way.
+        Value::Null => {
+            return Err(SerdeError::Rule(
+                "cannot write a null to this protobuf field; a rule clears a field by returning \
+                 null only where the field is a value-type message"
+                    .to_string(),
+            ));
+        }
+        other => {
+            return Err(SerdeError::Rule(format!(
+                "cannot write {other:?} to this protobuf field"
+            )));
+        }
+    })
 }
 
 fn to_protobuf_map_key(value: &Key) -> MapKey {

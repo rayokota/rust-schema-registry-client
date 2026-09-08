@@ -1,5 +1,6 @@
 use crate::rules::cel::decimal_funcs::{add_decimal_functions, add_string_overloads};
 use crate::rules::cel::timestamp_funcs::add_timestamp_functions;
+use crate::rules::cel::variant_funcs::add_variant_functions;
 use cel::Context;
 use cel::extractors::This;
 use email_address::EmailAddress;
@@ -20,6 +21,7 @@ pub fn default_context<'a>() -> Context<'a> {
     context.add_function("isUuid", is_uuid);
     add_decimal_functions(&mut context);
     add_timestamp_functions(&mut context);
+    add_variant_functions(&mut context);
     add_string_overloads(&mut context);
     context
 }

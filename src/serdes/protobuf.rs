@@ -1051,11 +1051,17 @@ async fn transform_field_with_ctx(
     let new_value = transform_field_value(ctx, fd, &value).await;
     ctx.exit_field();
     let new_value = new_value?;
-    if let Some(Kind::Condition) = ctx.rule.kind
-        && let Value::Bool(b) = new_value
-        && !b
-    {
-        return Err(SerdeError::RuleCondition(Box::new(ctx.rule.clone())));
+    if let Some(Kind::Condition) = ctx.rule.kind {
+        if let Value::Bool(b) = new_value
+            && !b
+        {
+            return Err(SerdeError::RuleCondition(Box::new(ctx.rule.clone())));
+        }
+        // A condition's result is a verdict on the value, not a replacement for it. Returning
+        // it would have the caller write the bool onto the field - which panics for any field
+        // that is not a bool. This never showed before because a protobuf CEL_FIELD condition
+        // never actually fired: every value type was a message the walk descended past.
+        return Ok(None);
     }
     Ok(Some(new_value))
 }
@@ -1075,6 +1081,25 @@ async fn transform_field_value(
             let mut result = Vec::with_capacity(items.len());
             for item in items {
                 let item = match (&nested, item) {
+                    // A repeated decimal or timestamp is a list of single *values*, not a list
+                    // of records. This arm has to precede the descend-into-message one below,
+                    // which is where a repeated value type used to go: the walk reached
+                    // value/scale one at a time, so the rule's result was never written and the
+                    // field came back unchanged with no error. Same #4538 reasoning as the
+                    // Value::Message arm further down, which a list never reached.
+                    (Some(nested), Value::Message(_)) if is_cel_leaf_message(nested) => {
+                        let new_value = transform_leaf(ctx, item).await?;
+                        if ctx.rule.kind == Some(Kind::Condition) {
+                            // The reference evaluates the rule per element and then throws the
+                            // verdict away - it collects the results into a list and tests
+                            // `Boolean.FALSE.equals(list)`, which a list never satisfies - so a
+                            // scalar condition over a repeated field always passes there. Keeping the element is what matches; the
+                            // bool must not be written into the list either way.
+                            item.clone()
+                        } else {
+                            rebuild_value_type(ctx, nested, item, new_value)?
+                        }
+                    }
                     (Some(nested), Value::Message(_)) => transform(ctx, nested, item).await?,
                     _ => transform_leaf(ctx, item).await?,
                 };
@@ -1094,12 +1119,37 @@ async fn transform_field_value(
             };
             let mut result = HashMap::new();
             for (key, entry) in entries {
-                let entry = transform(ctx, &value_kind, entry).await?;
+                // Same leaf reasoning as the list arm: a map of decimals or timestamps holds
+                // single values, so descending into value/scale would leave the rule's result
+                // unwritten and the field unchanged with no error.
+                let entry =
+                    if is_cel_leaf_message(&value_kind) && matches!(entry, Value::Message(_)) {
+                        let new_value = transform_leaf(ctx, entry).await?;
+                        if ctx.rule.kind == Some(Kind::Condition) {
+                            entry.clone()
+                        } else {
+                            rebuild_value_type(ctx, &value_kind, entry, new_value)?
+                        }
+                    } else {
+                        transform(ctx, &value_kind, entry).await?
+                    };
                 result.insert(key.clone(), entry);
             }
             Ok(Value::Map(result))
         }
         Value::Message(_) => match fd.kind().as_message() {
+            // A decimal or a timestamp is a single value to a rule, not a record to descend
+            // into. Without this the walk reached value/scale and seconds/nanos one at a
+            // time, so a rule tagged for the field never fired and the message came back
+            // unchanged with no error. Ported from the JVM client's #4538.
+            Some(nested) if is_cel_leaf_message(&nested) => {
+                let new_value = transform_leaf(ctx, value).await?;
+                if ctx.rule.kind == Some(Kind::Condition) {
+                    // A verdict on the value, not a replacement for it.
+                    return Ok(new_value);
+                }
+                rebuild_value_type(ctx, &nested, value, new_value)
+            }
             Some(nested) => transform(ctx, &nested, value).await,
             None => Ok(value.clone()),
         },
@@ -1140,11 +1190,63 @@ async fn transform_leaf(ctx: &mut RuleContext, value: &Value) -> Result<Value, S
     }
 }
 
+/// Message types a CEL rule works with as a single value rather than as a record.
+///
+/// Avro carries the same concepts as logical types on a primitive, so the field is a leaf
+/// there and a `CEL_FIELD` rule reaches it. Variant is deliberately absent: it is a record in
+/// Avro too, so skipping it is the behaviour that matches, and a variant is reached with a
+/// message-level `CEL` rule instead.
+const CEL_DECIMAL_TYPE_NAME: &str = "confluent.type.Decimal";
+const CEL_TIMESTAMP_TYPE_NAME: &str = "google.protobuf.Timestamp";
+
+fn is_cel_leaf_message(desc: &MessageDescriptor) -> bool {
+    let name = desc.full_name();
+    name == CEL_DECIMAL_TYPE_NAME || name == CEL_TIMESTAMP_TYPE_NAME
+}
+
+/// Encodes what a `CEL_FIELD` rule returned back into the field's message.
+///
+/// An identity rule hands back the message it was given; a computed rule hands back the CEL
+/// value the boundary produced. Anything else is a rule-authoring mistake and is named as one
+/// rather than written back as a default.
+fn rebuild_value_type(
+    ctx: &RuleContext,
+    desc: &MessageDescriptor,
+    original: &Value,
+    new_value: Value,
+) -> Result<Value, SerdeError> {
+    if let Value::Message(m) = &new_value
+        && m.descriptor().full_name() == desc.full_name()
+    {
+        // Already the right message, which is what an identity rule produces.
+        return Ok(new_value);
+    }
+    // The CEL layer hands decimals and timestamps back as their own messages here, so
+    // anything else means the rule returned a shape this field cannot hold.
+    if new_value == *original {
+        return Ok(new_value);
+    }
+    Err(SerdeError::Rule(format!(
+        "rule {} returned a value for a field which is a {}; expected a decimal or timestamp",
+        ctx.rule.name,
+        desc.full_name()
+    )))
+}
+
 fn get_type(fd: &FieldDescriptor) -> FieldType {
     if fd.is_map() {
         return FieldType::Map;
     }
     match fd.kind() {
+        // Report the same primitive type the Avro counterpart does, so that CEL_FIELD applies
+        // to the field and a rule written against one format ports to the other.
+        prost_reflect::Kind::Message(ref md) if is_cel_leaf_message(md) => {
+            if md.full_name() == CEL_DECIMAL_TYPE_NAME {
+                FieldType::Bytes
+            } else {
+                FieldType::Long
+            }
+        }
         prost_reflect::Kind::Message(_) => FieldType::Record,
         prost_reflect::Kind::Enum(_) => FieldType::Enum,
         prost_reflect::Kind::String => FieldType::String,
@@ -1529,7 +1631,7 @@ fn evaluate_rules(
     }
     let serde_value = SerdeValue::Protobuf(value.clone());
     for rule in &rules {
-        evaluate_validation_rule(executor, rule, &serde_value, path, violations);
+        evaluate_validation_rule(executor, rule, None, &serde_value, path, violations);
         if fail_fast && !violations.is_empty() {
             return true;
         }
@@ -2774,6 +2876,7 @@ mod tests {
         };
         CelValidator::new().execute(
             &rule,
+            None,
             &crate::serdes::serde::SerdeValue::Protobuf(prost_reflect::Value::Message(msg)),
         )
     }
@@ -3461,5 +3564,714 @@ mod tests {
 
         let valid = proto_order("ord-1234", 2, &["a", "b"], Some("12345"));
         assert!(ser.serialize(&ser_ctx, &valid).await.is_ok());
+    }
+
+    // ---- Shared protobuf value-type fixture (parity.proto) ----
+    //
+    // Originally built for a cross-client C1-C7 sweep; the sweep is recorded in
+    // ~/Documents/cel-rules-parity.md and gone, but the fixture stayed because the value-type
+    // tests below are built on it.
+
+    // Built straight from the descriptor pool rather than from prost structs: the test
+    // codegen derives serde on every generated type, and prost maps google.protobuf.Timestamp
+    // to prost_types::Timestamp, which implements neither. The file already notes this
+    // limitation for ValidationWellKnown. DynamicMessage sidesteps it entirely.
+    fn parity_pool_msg(name: &str) -> DynamicMessage {
+        let md = crate::TEST_DESCRIPTOR_POOL
+            .get_message_by_name(name)
+            .unwrap_or_else(|| panic!("{name} is compiled into the test descriptor pool"));
+        DynamicMessage::new(md)
+    }
+
+    fn parity_decimal() -> prost_reflect::Value {
+        let mut d = parity_pool_msg("confluent.type.Decimal");
+        d.set_field_by_name(
+            "value",
+            prost_reflect::Value::Bytes(vec![0x04u8, 0xd2].into()),
+        );
+        d.set_field_by_name("precision", prost_reflect::Value::U32(8));
+        d.set_field_by_name("scale", prost_reflect::Value::I32(2));
+        prost_reflect::Value::Message(d)
+    }
+
+    fn parity_variant() -> prost_reflect::Value {
+        let v = crate::serdes::variant::Variant::parse_json(r#"{"name":"alice"}"#).unwrap();
+        let mut d = parity_pool_msg("confluent.type.Variant");
+        d.set_field_by_name(
+            "metadata",
+            prost_reflect::Value::Bytes(v.metadata_bytes().to_vec().into()),
+        );
+        d.set_field_by_name(
+            "value",
+            prost_reflect::Value::Bytes(v.value_bytes().to_vec().into()),
+        );
+        prost_reflect::Value::Message(d)
+    }
+
+    fn parity_ts() -> prost_reflect::Value {
+        let mut d = parity_pool_msg("google.protobuf.Timestamp");
+        d.set_field_by_name("seconds", prost_reflect::Value::I64(1_700_000_000));
+        d.set_field_by_name("nanos", prost_reflect::Value::I32(123_000_000));
+        prost_reflect::Value::Message(d)
+    }
+
+    fn parity_record(name: &str) -> DynamicMessage {
+        let mut m = parity_pool_msg(name);
+        m.set_field_by_name("amount", parity_decimal());
+        m.set_field_by_name("ts", parity_ts());
+        m.set_field_by_name("data", parity_variant());
+        m.set_field_by_name("plain", prost_reflect::Value::String("hi".to_string()));
+        m
+    }
+
+    fn parity_plain() -> DynamicMessage {
+        parity_record("parity.ParityPlain")
+    }
+
+    fn parity_field_ctx(expr: &str, kind: Kind, tags: Option<Vec<String>>) -> RuleContext {
+        let rule = Rule {
+            name: "r".to_string(),
+            doc: None,
+            kind: Some(kind),
+            mode: Some(Mode::Write),
+            r#type: "CEL_FIELD".to_string(),
+            tags,
+            params: None,
+            expr: Some(expr.to_string()),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        RuleContext::new(
+            None,
+            SerializationContext {
+                topic: "test".to_string(),
+                serde_type: SerdeType::Value,
+                serde_format: SerdeFormat::Protobuf,
+                headers: None,
+            },
+            None,
+            None,
+            None,
+            "test-value".to_string(),
+            Mode::Write,
+            rule.clone(),
+            0,
+            vec![rule],
+            None,
+            None,
+        )
+    }
+
+    /// A *repeated* value-type field is a list of single values, not a list of records.
+    ///
+    /// The list arm of the walk descended into each element as a message, so the walk reached
+    /// value/scale one at a time, the rule tagged for the field never fired, and the field came
+    /// back **unchanged with no error** - a silent no-op. #4538 gave the scalar case its leaf
+    /// handling; a list never reached it. The reference answers
+    /// `[2.11, 3.22]`.
+    fn c9_containers(first: i64, inner: i64) -> DynamicMessage {
+        // Two's-complement, not magnitude: a leading byte with the high bit set reads back
+        // NEGATIVE, so 222 (0xDE) would go in as -34 and every assertion below would be
+        // measuring the wrong input - `decimals.add(-0.34, 1.00)` is 0.66, which looks
+        // indistinguishable from a client dropping a byte.
+        let dec = |unscaled: i64| {
+            let dd = crate::TEST_DESCRIPTOR_POOL
+                .get_message_by_name("confluent.type.Decimal")
+                .unwrap();
+            let mut d = DynamicMessage::new(dd);
+            let mut raw: Vec<u8> = unscaled
+                .to_be_bytes()
+                .iter()
+                .skip_while(|b| **b == 0)
+                .copied()
+                .collect();
+            if raw.first().is_some_and(|b| b & 0x80 != 0) {
+                raw.insert(0, 0);
+            }
+            d.set_field_by_name("value", prost_reflect::Value::Bytes(raw.into()));
+            d.set_field_by_name("precision", prost_reflect::Value::U32(8));
+            d.set_field_by_name("scale", prost_reflect::Value::I32(2));
+            d
+        };
+        let md = crate::TEST_DESCRIPTOR_POOL
+            .get_message_by_name("parity.ValueTypeContainers")
+            .unwrap();
+        let mut m = DynamicMessage::new(md);
+        m.set_field_by_name("label", prost_reflect::Value::String("hi".to_string()));
+        m.set_field_by_name(
+            "amounts",
+            prost_reflect::Value::List(vec![
+                prost_reflect::Value::Message(dec(first)),
+                prost_reflect::Value::Message(dec(222)),
+            ]),
+        );
+        let nd = crate::TEST_DESCRIPTOR_POOL
+            .get_message_by_name("parity.ValueTypeNested")
+            .unwrap();
+        let mut n = DynamicMessage::new(nd);
+        n.set_field_by_name("inner", prost_reflect::Value::Message(dec(inner)));
+        m.set_field_by_name("nested", prost_reflect::Value::Message(n));
+        m
+    }
+
+    async fn c9_run(expr: &str, kind: Kind) -> Result<Vec<String>, SerdeError> {
+        let mut ctx = parity_field_ctx(expr, kind, Some(vec!["AMOUNTS".to_string()]));
+        ctx.rule_registry = Some(RuleRegistry::new());
+        if let Some(r) = &ctx.rule_registry {
+            r.register_executor(CelFieldExecutor::new());
+        }
+        let msg = c9_containers(111, 444);
+        let desc = msg.descriptor();
+        let out = transform(&mut ctx, &desc, &prost_reflect::Value::Message(msg)).await?;
+        let prost_reflect::Value::Message(m) = out else {
+            panic!("expected a message")
+        };
+        Ok(m.get_field_by_name("amounts")
+            .and_then(|l| {
+                l.as_list().map(|xs| {
+                    xs.iter()
+                        .map(|v| {
+                            let prost_reflect::Value::Message(d) = v else {
+                                return "?".to_string();
+                            };
+                            let bytes = d
+                                .get_field_by_name("value")
+                                .and_then(|b| b.as_bytes().map(|x| x.to_vec()))
+                                .unwrap_or_default();
+                            let mut n: i128 = 0;
+                            for b in &bytes {
+                                n = (n << 8) | (*b as i128);
+                            }
+                            if bytes.first().is_some_and(|b| b & 0x80 != 0) {
+                                n -= 1i128 << (8 * bytes.len());
+                            }
+                            n.to_string()
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn repeated_decimal_transform_rebuilds_every_element() {
+        let got = c9_run(
+            r#"decimals.add(decimal(value), decimal("1.00"))"#,
+            Kind::Transform,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, vec!["211", "322"], "2.11 and 3.22 at scale 2");
+    }
+
+    /// The must-pass twin: an identity rule hands back the message it was given, and the
+    /// per-element path has to accept that as readily as a computed decimal.
+    #[tokio::test]
+    async fn repeated_decimal_identity_transform_round_trips() {
+        let got = c9_run("value", Kind::Transform).await.unwrap();
+        assert_eq!(got, vec!["111", "222"]);
+    }
+
+    /// A scalar condition over a repeated field passes even when it is false for every element:
+    /// the reference collects the per-element verdicts into a list and tests
+    /// `Boolean.FALSE.equals(list)`, which a list never satisfies.
+    /// The verdict must not be written into the list either.
+    #[tokio::test]
+    async fn repeated_decimal_condition_verdict_is_discarded() {
+        let got = c9_run(
+            r#"decimals.gt(decimal(value), decimal("100.00"))"#,
+            Kind::Condition,
+        )
+        .await
+        .expect("a false condition over a repeated field must not fail");
+        assert_eq!(
+            got,
+            vec!["111", "222"],
+            "a condition must not touch the elements"
+        );
+    }
+
+    fn amount_map_decimal(unscaled: i64, scale: i32) -> DynamicMessage {
+        let dd = crate::TEST_DESCRIPTOR_POOL
+            .get_message_by_name("confluent.type.Decimal")
+            .unwrap();
+        let mut d = DynamicMessage::new(dd);
+        let mut raw: Vec<u8> = unscaled
+            .to_be_bytes()
+            .iter()
+            .skip_while(|b| **b == 0)
+            .copied()
+            .collect();
+        if raw.first().is_some_and(|b| b & 0x80 != 0) {
+            raw.insert(0, 0);
+        }
+        d.set_field_by_name("value", prost_reflect::Value::Bytes(raw.into()));
+        d.set_field_by_name("precision", prost_reflect::Value::U32(8));
+        d.set_field_by_name("scale", prost_reflect::Value::I32(scale));
+        d
+    }
+
+    async fn amount_map_run(expr: &str, kind: Kind) -> Result<Vec<(String, String)>, SerdeError> {
+        amount_map_run_tags(expr, kind, Some(vec!["AMOUNTMAP".to_string()])).await
+    }
+
+    async fn amount_map_run_tags(
+        expr: &str,
+        kind: Kind,
+        tags: Option<Vec<String>>,
+    ) -> Result<Vec<(String, String)>, SerdeError> {
+        let mut ctx = parity_field_ctx(expr, kind, tags);
+        ctx.rule_registry = Some(RuleRegistry::new());
+        if let Some(r) = &ctx.rule_registry {
+            r.register_executor(CelFieldExecutor::new());
+        }
+        let md = crate::TEST_DESCRIPTOR_POOL
+            .get_message_by_name("parity.ValueTypeContainers")
+            .unwrap();
+        let mut m = DynamicMessage::new(md);
+        let mut map = HashMap::new();
+        map.insert(
+            prost_reflect::MapKey::String("a".to_string()),
+            prost_reflect::Value::Message(amount_map_decimal(210, 2)),
+        );
+        m.set_field_by_name("amount_map", prost_reflect::Value::Map(map));
+        let desc = m.descriptor();
+        let out = transform(&mut ctx, &desc, &prost_reflect::Value::Message(m)).await?;
+        let prost_reflect::Value::Message(m) = out else {
+            panic!("expected a message")
+        };
+        let mut got: Vec<(String, String)> = m
+            .get_field_by_name("amount_map")
+            .and_then(|v| {
+                v.as_map().map(|entries| {
+                    entries
+                        .iter()
+                        .map(|(k, v)| {
+                            let key = match k {
+                                prost_reflect::MapKey::String(s) => s.clone(),
+                                other => format!("{other:?}"),
+                            };
+                            let prost_reflect::Value::Message(d) = v else {
+                                return (key, "?".to_string());
+                            };
+                            let bytes = d
+                                .get_field_by_name("value")
+                                .and_then(|b| b.as_bytes().map(|x| x.to_vec()))
+                                .unwrap_or_default();
+                            let mut n: i128 = 0;
+                            for b in &bytes {
+                                n = (n << 8) | (*b as i128);
+                            }
+                            if bytes.first().is_some_and(|b| b & 0x80 != 0) {
+                                n -= 1i128 << (8 * bytes.len());
+                            }
+                            (key, n.to_string())
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default();
+        got.sort();
+        Ok(got)
+    }
+
+    /// A `map<_, confluent.type.Decimal>` holds single values, exactly like a repeated decimal,
+    /// so the tagged rule ought to run on the value rather than descending into value/scale.
+    /// The transform walk now handles that, but the rule still never reaches the field:
+    /// `get_type` reports a map field as `FieldType::Map`, which `CelFieldExecutor` skips as
+    /// non-primitive. The Java reference does exactly the same (`Type.MAP(false)`), so making
+    /// this fire is a cross-client contract change, not a local fix.
+    #[ignore = "blocked on a cross-client decision: a map field reports FieldType::Map, which \
+                the field executor skips - the Java reference behaves identically"]
+    #[tokio::test]
+    async fn map_decimal_transform_rebuilds_every_entry() {
+        let got = amount_map_run(
+            r#"decimals.add(decimal(value), decimal("1.00"))"#,
+            Kind::Transform,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, vec![("a".to_string(), "310".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn map_decimal_identity_transform_round_trips() {
+        let got = amount_map_run("value", Kind::Transform).await.unwrap();
+        assert_eq!(got, vec![("a".to_string(), "210".to_string())]);
+    }
+
+    // ---- Message-level CEL transforms over protobuf (C6/C7) ----------------------------
+    //
+    // The rule returns a map and the message is rebuilt from it. Before this the result fell
+    // through `to_serde_value`, whose protobuf arm turns a CEL map into a prost_reflect Map
+    // and whose catch-all turns an unrecognised value into empty bytes - so a decimal and a
+    // timestamp were not merely unwritten, they were replaced with b"".
+    //
+    // The transform has replace semantics: the map is the new message, so a field the rule
+    // does not name is dropped and a null clears its field.
+
+    fn parity_msg_transform(expr: &str, msg: DynamicMessage) -> DynamicMessage {
+        let rule = Rule {
+            name: "r".to_string(),
+            doc: None,
+            kind: Some(Kind::Transform),
+            mode: Some(Mode::Write),
+            r#type: "CEL".to_string(),
+            tags: None,
+            params: None,
+            expr: Some(expr.to_string()),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let mut ctx = RuleContext::new(
+            None,
+            SerializationContext {
+                topic: "test".to_string(),
+                serde_type: SerdeType::Value,
+                serde_format: SerdeFormat::Protobuf,
+                headers: None,
+            },
+            None,
+            None,
+            None,
+            "test-value".to_string(),
+            Mode::Write,
+            rule.clone(),
+            0,
+            vec![rule],
+            None,
+            None,
+        );
+        let input = SerdeValue::Protobuf(prost_reflect::Value::Message(msg));
+        let executor = CelExecutor::new();
+        let mut args = HashMap::new();
+        args.insert(
+            "message".to_string(),
+            executor.message_binding(&ctx, &input),
+        );
+        match executor.execute(&mut ctx, &input, &args).unwrap() {
+            SerdeValue::Protobuf(prost_reflect::Value::Message(m)) => m,
+            other => panic!("expected the message to be rebuilt, got {other:?}"),
+        }
+    }
+
+    fn parity_field_bytes(m: &DynamicMessage, field: &str, inner: &str) -> Vec<u8> {
+        let outer = m.get_field_by_name(field).expect("field present");
+        let msg = outer.as_message().expect("a message");
+        msg.get_field_by_name(inner)
+            .expect("inner field")
+            .as_bytes()
+            .expect("bytes")
+            .to_vec()
+    }
+
+    const ALL_FIELDS: &str = r#""amount": message.amount, "ts": message.ts, "data": message.data, "plain": message.plain"#;
+
+    /// An identity transform is the cheapest regression test for a write-back path: it fails
+    /// for any breakage in the plumbing, without depending on the computation.
+    #[test]
+    fn message_transform_pass_through() {
+        let out = parity_msg_transform(&format!("{{{ALL_FIELDS}}}"), parity_plain());
+
+        // 0x04D2 = 1234 unscaled, i.e. 12.34 at scale 2.
+        assert_eq!(
+            parity_field_bytes(&out, "amount", "value"),
+            vec![0x04, 0xd2]
+        );
+        let ts = out.get_field_by_name("ts").unwrap();
+        let ts = ts.as_message().unwrap();
+        assert_eq!(
+            ts.get_field_by_name("seconds").unwrap().as_i64(),
+            Some(1_700_000_000)
+        );
+        assert_eq!(
+            ts.get_field_by_name("nanos").unwrap().as_i32(),
+            Some(123_000_000)
+        );
+        assert_eq!(out.get_field_by_name("plain").unwrap().as_str(), Some("hi"));
+    }
+
+    #[test]
+    fn message_transform_computed_decimal() {
+        let out = parity_msg_transform(
+            r#"{"amount": decimals.add(decimal(message.amount), decimal("1.00")), "ts": message.ts, "data": message.data, "plain": message.plain}"#,
+            parity_plain(),
+        );
+
+        // 0x0536 = 1334, i.e. 13.34 at scale 2.
+        assert_eq!(
+            parity_field_bytes(&out, "amount", "value"),
+            vec![0x05, 0x36]
+        );
+    }
+
+    #[test]
+    fn message_transform_computed_timestamp() {
+        let out = parity_msg_transform(
+            r#"{"amount": message.amount, "ts": message.ts + duration("60s"), "data": message.data, "plain": message.plain}"#,
+            parity_plain(),
+        );
+
+        let ts = out.get_field_by_name("ts").unwrap();
+        let ts = ts.as_message().unwrap();
+        assert_eq!(
+            ts.get_field_by_name("seconds").unwrap().as_i64(),
+            Some(1_700_000_060)
+        );
+        assert_eq!(
+            ts.get_field_by_name("nanos").unwrap().as_i32(),
+            Some(123_000_000)
+        );
+    }
+
+    /// Asserted through the decoded JSON rather than the metadata bytes: metadata holds the
+    /// field names, so the two documents share it and comparing metadata would prove nothing.
+    #[test]
+    fn message_transform_computed_variant() {
+        let out = parity_msg_transform(
+            r#"{"amount": message.amount, "ts": message.ts, "data": variants.parseJson("{\"name\":\"bob\"}"), "plain": message.plain}"#,
+            parity_plain(),
+        );
+
+        let v = crate::serdes::variant::Variant::new(
+            parity_field_bytes(&out, "data", "value"),
+            parity_field_bytes(&out, "data", "metadata"),
+        );
+        assert_eq!(v.to_json().unwrap(), r#"{"name":"bob"}"#);
+    }
+
+    /// Replace semantics, and the consequence most likely to surprise: a rule naming only the
+    /// field it changes discards everything else. Intended, but silent on protobuf - proto3
+    /// has no required fields, so nothing catches it.
+    #[test]
+    fn message_transform_drops_unnamed_fields() {
+        let out = parity_msg_transform(r#"{"plain": "changed"}"#, parity_plain());
+
+        assert_eq!(
+            out.get_field_by_name("plain").unwrap().as_str(),
+            Some("changed")
+        );
+        assert!(!out.has_field_by_name("amount"));
+        assert!(!out.has_field_by_name("ts"));
+        assert!(!out.has_field_by_name("data"));
+    }
+
+    /// The idiom for preserving absence across a transform that echoes a field is
+    /// `has(x) ? x : null`; without a null arm there would be no way to express it.
+    #[test]
+    fn message_transform_null_clears_a_field() {
+        let out = parity_msg_transform(
+            r#"{"amount": null, "ts": message.ts, "data": message.data, "plain": message.plain}"#,
+            parity_plain(),
+        );
+
+        assert!(!out.has_field_by_name("amount"));
+        assert!(out.has_field_by_name("ts"));
+    }
+
+    /// A CONDITION answers with a bool, which must never reach the rebuild.
+    #[test]
+    fn message_transform_leaves_conditions_alone() {
+        let result = eval_cel_rule(
+            &parity_plain(),
+            r#"decimals.gt(message.amount, decimal("10.00"))"#,
+        );
+        assert!(answered(&result, true));
+    }
+
+    // ---- CEL_FIELD over protobuf value types (C4/C5) -----------------------------------
+    //
+    // Avro carries decimal and timestamp as logical types on a primitive, so the field is a
+    // leaf and a field rule reaches it. Protobuf carries them as messages, so the walk used to
+    // descend *past* the field and transform value/scale or seconds/nanos one at a time -
+    // meaning a rule tagged for the field never fired at all, and the message came back
+    // unchanged with no error.
+    //
+    // Port of the JVM client's #4538. Variant is deliberately not a leaf.
+
+    fn vt_message() -> DynamicMessage {
+        let mut m = parity_pool_msg("parity.ParityPlain");
+        m.set_field_by_name("amount", parity_decimal());
+        m.set_field_by_name("ts", parity_ts());
+        m.set_field_by_name("data", parity_variant());
+        m.set_field_by_name("plain", prost_reflect::Value::String("hi".to_string()));
+        m
+    }
+
+    async fn vt_run(expr: &str, kind: Kind, tag: &str) -> Result<DynamicMessage, SerdeError> {
+        let rule = Rule {
+            name: "r".to_string(),
+            doc: None,
+            kind: Some(kind),
+            mode: Some(Mode::Write),
+            r#type: "CEL_FIELD".to_string(),
+            tags: Some(vec![tag.to_string()]),
+            params: None,
+            expr: Some(expr.to_string()),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let mut ctx = RuleContext::new(
+            None,
+            SerializationContext {
+                topic: "test".to_string(),
+                serde_type: SerdeType::Value,
+                serde_format: SerdeFormat::Protobuf,
+                headers: None,
+            },
+            None,
+            None,
+            None,
+            "test-value".to_string(),
+            Mode::Write,
+            rule.clone(),
+            0,
+            vec![rule],
+            None,
+            Some(RuleRegistry::new()),
+        );
+        if let Some(r) = &ctx.rule_registry {
+            r.register_executor(CelFieldExecutor::new());
+        }
+        let msg = vt_message();
+        let desc = msg.descriptor();
+        match transform(&mut ctx, &desc, &prost_reflect::Value::Message(msg)).await? {
+            prost_reflect::Value::Message(m) => Ok(m),
+            other => panic!("expected the message back, got {other:?}"),
+        }
+    }
+
+    fn vt_field_bytes(m: &DynamicMessage, field: &str, inner: &str) -> Vec<u8> {
+        let outer = m.get_field_by_name(field).expect("field present");
+        let msg = outer.as_message().expect("a message");
+        msg.get_field_by_name(inner)
+            .expect("inner field")
+            .as_bytes()
+            .expect("bytes")
+            .to_vec()
+    }
+
+    /// The declared type is what makes CEL_FIELD apply at all: a Record is skipped outright.
+    #[test]
+    fn value_type_field_types_match_avro() {
+        let desc = parity_pool_msg("parity.ParityPlain").descriptor();
+        let ty = |name: &str| get_type(&desc.get_field_by_name(name).unwrap());
+
+        assert_eq!(ty("amount"), FieldType::Bytes);
+        assert_eq!(ty("ts"), FieldType::Long);
+        // Variant stays a record, as in Avro - not a leaf.
+        assert_eq!(ty("data"), FieldType::Record);
+    }
+
+    /// C4. Before the port this reported nothing because the rule never ran.
+    #[tokio::test]
+    async fn value_type_decimal_condition_fires() {
+        vt_run(
+            r#"decimals.gt(decimal(value), decimal("10.00"))"#,
+            Kind::Condition,
+            "AMOUNT",
+        )
+        .await
+        .expect("the condition should pass");
+    }
+
+    /// The must-fail twin. Without it the test above would also pass if no rule ran at all -
+    /// which is exactly how the defect hid.
+    #[tokio::test]
+    async fn value_type_decimal_condition_fails() {
+        let result = vt_run(
+            r#"decimals.gt(decimal(value), decimal("1000.00"))"#,
+            Kind::Condition,
+            "AMOUNT",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "expected a violation; the rule did not fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn value_type_timestamp_condition_fires() {
+        vt_run(
+            r#"value > timestamp("2000-01-01T00:00:00Z")"#,
+            Kind::Condition,
+            "TS",
+        )
+        .await
+        .expect("the condition should pass");
+    }
+
+    #[tokio::test]
+    async fn value_type_timestamp_condition_fails() {
+        let result = vt_run(
+            r#"value > timestamp("2050-01-01T00:00:00Z")"#,
+            Kind::Condition,
+            "TS",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "expected a violation; the rule did not fire"
+        );
+    }
+
+    /// C5.
+    #[tokio::test]
+    async fn value_type_decimal_transform() {
+        let out = vt_run(
+            r#"decimals.add(decimal(value), decimal("1.00"))"#,
+            Kind::Transform,
+            "AMOUNT",
+        )
+        .await
+        .unwrap();
+
+        // 0x0536 = 1334, i.e. 13.34 at scale 2.
+        assert_eq!(vt_field_bytes(&out, "amount", "value"), vec![0x05, 0x36]);
+    }
+
+    #[tokio::test]
+    async fn value_type_timestamp_transform() {
+        let out = vt_run(r#"value + duration("60s")"#, Kind::Transform, "TS")
+            .await
+            .unwrap();
+
+        let ts = out.get_field_by_name("ts").unwrap();
+        let ts = ts.as_message().unwrap();
+        assert_eq!(
+            ts.get_field_by_name("seconds").unwrap().as_i64(),
+            Some(1_700_000_060)
+        );
+        assert_eq!(
+            ts.get_field_by_name("nanos").unwrap().as_i32(),
+            Some(123_000_000)
+        );
+    }
+
+    /// The pass-through: the encode must invert the decode exactly.
+    #[tokio::test]
+    async fn value_type_identity_transform() {
+        let out = vt_run("value", Kind::Transform, "AMOUNT").await.unwrap();
+
+        assert_eq!(vt_field_bytes(&out, "amount", "value"), vec![0x04, 0xd2]);
+    }
+
+    /// Variant is a record in both formats, so a field rule must not reach it. The rule below
+    /// would raise if it ran, so a clean return means it was skipped.
+    #[tokio::test]
+    async fn value_type_variant_is_still_skipped() {
+        let out = vt_run(
+            r#"variants.type(value) == "not-a-type""#,
+            Kind::Condition,
+            "DATA",
+        )
+        .await
+        .expect("a variant field must be skipped, not evaluated");
+
+        assert!(!vt_field_bytes(&out, "data", "metadata").is_empty());
     }
 }
