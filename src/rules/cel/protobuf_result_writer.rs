@@ -51,6 +51,7 @@ fn fill(
     desc: &MessageDescriptor,
     map: &cel::objects::Map,
 ) -> Result<(), SerdeError> {
+    check_single_oneof_member(desc, map)?;
     for (key, value) in map.map.iter() {
         let Key::String(name) = key else {
             continue;
@@ -68,6 +69,53 @@ fn fill(
         }
         let converted = to_field_value(&fd, value)?;
         out.set_field(&fd, converted);
+    }
+    Ok(())
+}
+
+/// Rejects a result that names more than one member of the same `oneof`.
+///
+/// Setting a oneof member clears its siblings, and the result is a hash map, so applying such a
+/// result would keep whichever member the iteration order happened to visit last - the active
+/// oneof value would vary between runs. The JVM client rebuilds through protobuf JSON, which
+/// refuses two members of one oneof outright, so refuse it here too.
+///
+/// A `null` is excluded because it clears its field rather than setting it, and a proto3
+/// `optional` field sits in a synthetic oneof of exactly one member, so it can never collide.
+fn check_single_oneof_member(
+    desc: &MessageDescriptor,
+    map: &cel::objects::Map,
+) -> Result<(), SerdeError> {
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (key, value) in map.map.iter() {
+        if matches!(value, Value::Null) {
+            continue;
+        }
+        let Key::String(name) = key else {
+            continue;
+        };
+        let Some(fd) = find_field(desc, name) else {
+            continue;
+        };
+        let Some(oneof) = fd.containing_oneof() else {
+            continue;
+        };
+        if let Some(first) = seen.insert(oneof.full_name().to_string(), fd.name().to_string())
+            && first != fd.name()
+        {
+            // Name both members in a stable order so the error does not vary with hash order.
+            let (a, b) = if first.as_str() < fd.name() {
+                (first, fd.name().to_string())
+            } else {
+                (fd.name().to_string(), first)
+            };
+            return Err(SerdeError::Rule(format!(
+                "result sets more than one member of oneof {}: {} and {}",
+                oneof.full_name(),
+                a,
+                b
+            )));
+        }
     }
     Ok(())
 }
@@ -487,8 +535,64 @@ fn as_f64(value: &Value) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{as_i64, as_u64, float_to_int};
+    use super::{as_i64, as_u64, check_single_oneof_member, float_to_int};
     use cel::Value;
+    use cel::objects::{Key, Map};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    #[test]
+    fn rejects_a_result_naming_two_members_of_one_oneof() {
+        // Setting a oneof member clears its siblings, and the result is a hash map, so applying
+        // both would keep whichever the iteration order visited last. The JVM client's protobuf
+        // JSON rebuild refuses this outright, so it has to be an error here rather than a coin
+        // flip. Reachable because the binding materialises every field, defaults included.
+        let desc = crate::TEST_DESCRIPTOR_POOL
+            .get_message_by_name("test.Author")
+            .unwrap();
+        let both: HashMap<Key, Value> = HashMap::from([
+            (
+                Key::String(Arc::new("oneof_string".to_string())),
+                Value::String(Arc::new("x".to_string())),
+            ),
+            (
+                Key::String(Arc::new("oneof_message".to_string())),
+                Value::Map(Map {
+                    map: Arc::new(HashMap::new()),
+                }),
+            ),
+        ]);
+        let err = check_single_oneof_member(
+            &desc,
+            &Map {
+                map: Arc::new(both),
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("pii_oneof"), "{msg}");
+        // Stable regardless of hash order: both members are named, sorted.
+        assert!(
+            msg.contains("oneof_message") && msg.contains("oneof_string"),
+            "{msg}"
+        );
+
+        // One member alone is fine, and a null sibling clears rather than sets.
+        let one: HashMap<Key, Value> = HashMap::from([
+            (
+                Key::String(Arc::new("oneof_string".to_string())),
+                Value::String(Arc::new("x".to_string())),
+            ),
+            (
+                Key::String(Arc::new("oneof_message".to_string())),
+                Value::Null,
+            ),
+        ]);
+        assert!(
+            check_single_oneof_member(&desc, &Map { map: Arc::new(one) }).is_ok(),
+            "a null sibling must not count as a second member"
+        );
+    }
 
     #[test]
     fn unsigned_conversion_covers_the_whole_u64_domain() {
