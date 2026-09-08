@@ -139,21 +139,37 @@ fn find_field(desc: &MessageDescriptor, name: &str) -> Option<FieldDescriptor> {
 
 fn to_field_value(fd: &FieldDescriptor, value: &Value) -> Result<prost_reflect::Value, SerdeError> {
     if fd.is_list() {
+        // A shape mismatch is a mistake in the rule, not an instruction to empty the field.
+        // Coercing it to an empty list would let `{"items": 1}` silently delete every element.
+        // `JsonFormat.mergeRepeatedField` rejects a non-array, so reject it here too.
         let Value::List(items) = value else {
-            return Ok(prost_reflect::Value::List(Vec::new()));
+            return Err(SerdeError::Rule(format!(
+                "expected a list for repeated field {}",
+                fd.full_name()
+            )));
         };
         let mut out = Vec::with_capacity(items.len());
         for item in items.iter() {
+            // A repeated field cannot hold a null, and dropping one would silently shorten the
+            // list. `JsonFormat.mergeRepeatedField`: "Repeated field elements cannot be null".
             if matches!(item, Value::Null) {
-                continue;
+                return Err(SerdeError::Rule(format!(
+                    "repeated field {} cannot contain a null element",
+                    fd.full_name()
+                )));
             }
             out.push(scalar_or_message(fd, item)?);
         }
         return Ok(prost_reflect::Value::List(out));
     }
     if fd.is_map() {
+        // As for a repeated field: `JsonFormat.mergeMapField` rejects a non-object rather than
+        // treating it as an instruction to clear the map.
         let Value::Map(entries) = value else {
-            return Ok(prost_reflect::Value::Map(Default::default()));
+            return Err(SerdeError::Rule(format!(
+                "expected a map for field {}",
+                fd.full_name()
+            )));
         };
         let value_fd = fd
             .kind()
@@ -167,8 +183,13 @@ fn to_field_value(fd: &FieldDescriptor, value: &Value) -> Result<prost_reflect::
             .ok_or_else(|| SerdeError::Rule("map field has no key type".to_string()))?;
         let mut out = std::collections::HashMap::new();
         for (k, v) in entries.map.iter() {
+            // `JsonFormat.mergeMapField`: "Map value cannot be null." Skipping the entry would
+            // silently drop a key the rule named.
             if matches!(v, Value::Null) {
-                continue;
+                return Err(SerdeError::Rule(format!(
+                    "map field {} cannot contain a null value",
+                    fd.full_name()
+                )));
             }
             out.insert(map_key(&key_fd, k)?, scalar_or_message(&value_fd, v)?);
         }
@@ -545,7 +566,7 @@ fn as_f64(value: &Value) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{as_i64, as_u64, check_result_keys, float_to_int};
+    use super::{as_i64, as_u64, check_result_keys, float_to_int, to_field_value};
     use cel::Value;
     use cel::objects::{Key, Map};
     use std::collections::HashMap;
@@ -560,6 +581,39 @@ mod tests {
                     .collect::<HashMap<Key, Value>>(),
             ),
         }
+    }
+
+    #[test]
+    fn rejects_a_wrong_shape_or_null_element_instead_of_clearing() {
+        // Coercion here is destructive: an empty list or map replaces the field's contents, so a
+        // mistyped result would silently delete data. Every case below is one the JVM client's
+        // protobuf JSON rebuild rejects.
+        let desc = crate::TEST_DESCRIPTOR_POOL
+            .get_message_by_name("parity.ValueTypeContainers")
+            .unwrap();
+        let amounts = desc.get_field_by_name("amounts").unwrap();
+        let amount_map = desc.get_field_by_name("amount_map").unwrap();
+
+        // JsonFormat.mergeRepeatedField: "Expected an array for ..."
+        let err = to_field_value(&amounts, &Value::Int(1)).unwrap_err();
+        assert!(err.to_string().contains("expected a list"), "{err}");
+
+        // JsonFormat.mergeRepeatedField: "Repeated field elements cannot be null"
+        let err = to_field_value(&amounts, &Value::List(Arc::new(vec![Value::Null]))).unwrap_err();
+        assert!(err.to_string().contains("null element"), "{err}");
+
+        // JsonFormat.mergeMapField: "Expect a map object but found: ..."
+        let err = to_field_value(&amount_map, &Value::Int(1)).unwrap_err();
+        assert!(err.to_string().contains("expected a map"), "{err}");
+
+        // JsonFormat.mergeMapField: "Map value cannot be null."
+        let err =
+            to_field_value(&amount_map, &Value::Map(keys(vec![("a", Value::Null)]))).unwrap_err();
+        assert!(err.to_string().contains("null value"), "{err}");
+
+        // An empty list or map is still a legitimate way to clear the field.
+        assert!(to_field_value(&amounts, &Value::List(Arc::new(vec![]))).is_ok());
+        assert!(to_field_value(&amount_map, &Value::Map(keys(vec![]))).is_ok());
     }
 
     #[test]
