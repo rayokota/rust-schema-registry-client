@@ -15,10 +15,11 @@
 //! The JSONPath subset used by `variants.path(v, path)` - a port of the Java/Python/Go
 //! VariantPath. Supports `$`, `$.field`, `$.field.subfield`, `$[i]`, `$["quoted key"]` /
 //! `$['quoted key']`. Resolution failures (missing field, out-of-bounds index, type
-//! mismatch) return `Ok(None)`; malformed paths return `Err`. Identifier names follow
-//! `[A-Za-z_][A-Za-z0-9_]*`; use the quoted form for other keys. Negative indices are
-//! rejected. Quoted-key escapes recognize only `\\` and backslash+quote (option B); any
-//! other escape is a parse error.
+//! mismatch) return `Ok(None)`; malformed paths return `Err`. Dotted identifiers start with a
+//! Unicode alphabetic character or `_`, then Unicode alphanumeric characters or `_`, matching
+//! Java's `Character.isLetter`/`isLetterOrDigit`; use the quoted form for other keys. Negative
+//! indices are rejected. Quoted-key escapes recognize only `\\` and backslash+quote (option B);
+//! any other escape is a parse error.
 
 use crate::serdes::variant::{Type, Variant};
 

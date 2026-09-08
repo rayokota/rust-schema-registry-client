@@ -57,6 +57,11 @@ const BASIC_TYPE_MASK: u8 = 0x3;
 const BASIC_TYPE_BITS: u8 = 2;
 const TYPE_INFO_MASK: u8 = 0x3F;
 const MAX_SHORT_STR_SIZE: usize = 0x3F;
+
+/// Maximum object/array nesting accepted by `parse_json`, matching the default limit Jackson
+/// applies in the Java reference. Recursive descent would otherwise overflow the stack on deeply
+/// nested input, which aborts the process instead of returning an error.
+const MAX_JSON_NESTING_DEPTH: usize = 1000;
 const VERSION: u8 = 1;
 const VERSION_MASK: u8 = 0x0F;
 const U32_SIZE: usize = 4;
@@ -721,6 +726,15 @@ fn check_index(pos: usize, length: usize) -> Result<(), VariantError> {
     }
 }
 
+fn check_nesting_depth(depth: usize) -> Result<(), VariantError> {
+    if depth > MAX_JSON_NESTING_DEPTH {
+        return Err(VariantError::Json(format!(
+            "JSON nesting exceeds maximum depth of {MAX_JSON_NESTING_DEPTH}"
+        )));
+    }
+    Ok(())
+}
+
 fn read_unsigned_le(data: &[u8], pos: usize, num_bytes: usize) -> Result<usize, VariantError> {
     check_index(pos, data.len())?;
     check_index(pos + num_bytes - 1, data.len())?;
@@ -1104,6 +1118,13 @@ impl Builder {
     }
 
     fn append_decimal(&mut self, unscaled: &BigInt, scale: i32) -> Result<(), VariantError> {
+        // The encoding stores the scale in a single unsigned byte, so a negative scale would
+        // wrap (-1 becomes 255) and change the value on decode.
+        if scale < 0 {
+            return Err(VariantError::Json(
+                "decimal scale must be non-negative".to_string(),
+            ));
+        }
         let num_digits = unscaled.magnitude().to_string().len();
         let (code, width) = if scale <= 9 && num_digits <= 9 {
             (T_DECIMAL4, 4usize)
@@ -1703,7 +1724,7 @@ fn build_from_json(json: &str) -> Result<(Vec<u8>, Vec<u8>), VariantError> {
     };
     let mut builder = Builder::default();
     parser.skip_ws();
-    parser.parse_value(&mut builder)?;
+    parser.parse_value(&mut builder, 0)?;
     parser.skip_ws();
     if parser.i != parser.bytes.len() {
         return Err(VariantError::Json(
@@ -1754,16 +1775,16 @@ impl<'a> JsonReader<'a> {
         }
     }
 
-    fn parse_value(&mut self, out: &mut Builder) -> Result<(), VariantError> {
+    fn parse_value(&mut self, out: &mut Builder, depth: usize) -> Result<(), VariantError> {
         self.skip_ws();
         match self.peek() {
             Some(b'{') => {
                 self.i += 1;
-                self.parse_object(out)
+                self.parse_object(out, depth + 1)
             }
             Some(b'[') => {
                 self.i += 1;
-                self.parse_array(out)
+                self.parse_array(out, depth + 1)
             }
             Some(b'"') => {
                 let s = self.parse_string()?;
@@ -1812,7 +1833,8 @@ impl<'a> JsonReader<'a> {
         }
     }
 
-    fn parse_object(&mut self, out: &mut Builder) -> Result<(), VariantError> {
+    fn parse_object(&mut self, out: &mut Builder, depth: usize) -> Result<(), VariantError> {
+        check_nesting_depth(depth)?;
         let start = out.value.len();
         let mut fields = Vec::new();
         self.skip_ws();
@@ -1836,7 +1858,7 @@ impl<'a> JsonReader<'a> {
             let id = out.add_key(&key);
             let offset = out.value.len() - start;
             fields.push(FieldEntry { key, id, offset });
-            self.parse_value(out)?;
+            self.parse_value(out, depth)?;
             self.skip_ws();
             match self.next() {
                 Some(b',') => continue,
@@ -1852,7 +1874,8 @@ impl<'a> JsonReader<'a> {
         Ok(())
     }
 
-    fn parse_array(&mut self, out: &mut Builder) -> Result<(), VariantError> {
+    fn parse_array(&mut self, out: &mut Builder, depth: usize) -> Result<(), VariantError> {
+        check_nesting_depth(depth)?;
         let start = out.value.len();
         let mut offsets = Vec::new();
         self.skip_ws();
@@ -1863,7 +1886,7 @@ impl<'a> JsonReader<'a> {
         }
         loop {
             offsets.push(out.value.len() - start);
-            self.parse_value(out)?;
+            self.parse_value(out, depth)?;
             self.skip_ws();
             match self.next() {
                 Some(b',') => continue,
@@ -2814,5 +2837,53 @@ mod tests {
             b.build().unwrap().to_json().unwrap(),
             "\"1969-12-31T23:59:59.500\""
         );
+    }
+
+    #[test]
+    fn append_decimal_rejects_negative_scale() {
+        // A negative scale would wrap when stored in the encoding's unsigned scale byte.
+        let mut b = VariantBuilder::new();
+        let err = b.append_decimal(&100i32.to_be_bytes(), -2).unwrap_err();
+        assert!(
+            matches!(&err, VariantError::Json(m) if m.contains("non-negative")),
+            "unexpected error: {err:?}"
+        );
+
+        // Scale 0 and positive scales still encode.
+        let mut b = VariantBuilder::new();
+        b.append_decimal(&100i32.to_be_bytes(), 2).unwrap();
+        assert_eq!(b.build().unwrap().to_json().unwrap(), "1.00");
+    }
+
+    #[test]
+    fn parse_json_rejects_nesting_beyond_the_depth_limit() {
+        // Runs on an explicit stack: a frame costs ~2 KiB in debug and ~380 B in release, so
+        // recursing to the limit needs ~2.1 MiB debug - more than a spawned thread's default.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                // At the limit the input still parses.
+                let ok = "[".repeat(MAX_JSON_NESTING_DEPTH) + &"]".repeat(MAX_JSON_NESTING_DEPTH);
+                assert!(Variant::parse_json(&ok).is_ok());
+
+                // One level deeper is an error rather than a stack overflow, which would abort
+                // the process instead of unwinding.
+                let deep = "[".repeat(MAX_JSON_NESTING_DEPTH + 1)
+                    + &"]".repeat(MAX_JSON_NESTING_DEPTH + 1);
+                let err = Variant::parse_json(&deep).unwrap_err();
+                assert!(
+                    matches!(&err, VariantError::Json(m) if m.contains("nesting")),
+                    "unexpected error: {err:?}"
+                );
+
+                // Objects nest through the same counter.
+                let deep_obj = "{\"a\":".repeat(MAX_JSON_NESTING_DEPTH + 1)
+                    + "1"
+                    + &"}".repeat(MAX_JSON_NESTING_DEPTH + 1);
+                assert!(Variant::parse_json(&deep_obj).is_err());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
