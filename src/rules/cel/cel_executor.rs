@@ -353,6 +353,14 @@ pub(crate) fn from_avro_value_with_schema(
     }
 }
 
+/// The fully qualified name of an Avro record schema.
+fn avro_record_full_name(rs: &apache_avro::schema::RecordSchema) -> String {
+    match rs.name.namespace() {
+        Some(ns) => format!("{ns}.{}", rs.name.name()),
+        None => rs.name.name().to_string(),
+    }
+}
+
 /// Resolves a named `Schema::Ref` to its definition in `defs`; any other schema is returned as-is.
 fn resolve_avro_ref<'a>(
     schema: &'a AvroSchema,
@@ -910,8 +918,12 @@ fn to_avro_value_with_schema(
         // Record/Map arm below never sees it. Without this it fell through to the loose
         // conversion and was written back as Avro null - the counterpart of the decimal arm
         // above, and the one shape that arm did not cover.
+        // The record has to be the variant shape, not merely any record: the Java reference
+        // gates this on the branch carrying a logical type (AvroResultWriter, RECORD case), so
+        // without a schema-side check an unrelated record would silently accept a Variant.
         (AvroSchema::Record(rs), Value::Opaque(o))
-            if o.runtime_type_name() == VARIANT_TYPE_NAME =>
+            if o.runtime_type_name() == VARIANT_TYPE_NAME
+                && avro_record_full_name(rs) == VARIANT_TYPE_NAME =>
         {
             let variant = to_variant(value)
                 .map_err(|e| SerdeError::Rule(e.to_string()))?

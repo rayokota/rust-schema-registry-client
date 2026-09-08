@@ -300,7 +300,7 @@ fn build_well_known(
             set_named(&mut out, md, "value", prost_reflect::Value::I64(v));
         }
         "google.protobuf.UInt32Value" => {
-            let v = as_i64(value).ok_or_else(err)?;
+            let v = as_u64(value).ok_or_else(err)?;
             set_named(
                 &mut out,
                 md,
@@ -309,7 +309,7 @@ fn build_well_known(
             );
         }
         "google.protobuf.UInt64Value" => {
-            let v = as_i64(value).ok_or_else(err)?;
+            let v = as_u64(value).ok_or_else(err)?;
             set_named(
                 &mut out,
                 md,
@@ -335,8 +335,14 @@ fn build_well_known(
                 "seconds",
                 prost_reflect::Value::I64(d.num_seconds()),
             );
-            let nanos = (d.num_nanoseconds().ok_or_else(err)? % 1_000_000_000) as i32;
-            set_named(&mut out, md, "nanos", prost_reflect::Value::I32(nanos));
+            // subsec_nanos, not num_nanoseconds: the latter is None beyond ~292 years, while a
+            // google.protobuf.Duration validly spans ~10,000 years.
+            set_named(
+                &mut out,
+                md,
+                "nanos",
+                prost_reflect::Value::I32(d.subsec_nanos()),
+            );
         }
         _ => return Ok(None),
     }
@@ -371,6 +377,15 @@ fn map_key(key_fd: &FieldDescriptor, key: &Key) -> Result<prost_reflect::MapKey,
             _ => None,
         }
     };
+    // Unsigned key kinds convert from Key::Uint directly: going via i64 first would reject
+    // every key above i64::MAX, so an identity transform could not round-trip them.
+    let as_uint = |k: &Key| -> Option<u64> {
+        match k {
+            Key::Uint(u) => Some(*u),
+            Key::Int(i) => u64::try_from(*i).ok(),
+            _ => None,
+        }
+    };
     Ok(match key_fd.kind() {
         Kind::Bool => match key {
             Key::Bool(b) => prost_reflect::MapKey::Bool(*b),
@@ -387,11 +402,9 @@ fn map_key(key_fd: &FieldDescriptor, key: &Key) -> Result<prost_reflect::MapKey,
             prost_reflect::MapKey::I64(as_int(key).ok_or_else(err)?)
         }
         Kind::Uint32 | Kind::Fixed32 => prost_reflect::MapKey::U32(
-            u32::try_from(as_int(key).ok_or_else(err)?).map_err(|_| err())?,
+            u32::try_from(as_uint(key).ok_or_else(err)?).map_err(|_| err())?,
         ),
-        Kind::Uint64 | Kind::Fixed64 => prost_reflect::MapKey::U64(
-            u64::try_from(as_int(key).ok_or_else(err)?).map_err(|_| err())?,
-        ),
+        Kind::Uint64 | Kind::Fixed64 => prost_reflect::MapKey::U64(as_uint(key).ok_or_else(err)?),
         _ => return Err(err()),
     })
 }
@@ -416,11 +429,9 @@ fn scalar(fd: &FieldDescriptor, value: &Value) -> Result<prost_reflect::Value, S
             prost_reflect::Value::I64(as_i64(v).ok_or_else(err)?)
         }
         (Kind::Uint32 | Kind::Fixed32, v) => {
-            prost_reflect::Value::U32(u32::try_from(as_i64(v).ok_or_else(err)?).map_err(|_| err())?)
+            prost_reflect::Value::U32(u32::try_from(as_u64(v).ok_or_else(err)?).map_err(|_| err())?)
         }
-        (Kind::Uint64 | Kind::Fixed64, v) => {
-            prost_reflect::Value::U64(u64::try_from(as_i64(v).ok_or_else(err)?).map_err(|_| err())?)
-        }
+        (Kind::Uint64 | Kind::Fixed64, v) => prost_reflect::Value::U64(as_u64(v).ok_or_else(err)?),
         (Kind::Enum(_), v) => prost_reflect::Value::EnumNumber(
             i32::try_from(as_i64(v).ok_or_else(err)?).map_err(|_| err())?,
         ),
@@ -431,19 +442,37 @@ fn scalar(fd: &FieldDescriptor, value: &Value) -> Result<prost_reflect::Value, S
 fn as_i64(value: &Value) -> Option<i64> {
     match value {
         Value::Int(i) => Some(*i),
-        // A u64 above i64::MAX has no i64 form, and `as` would wrap it to a negative. A float
-        // only converts when it is integral and in range - `as` would otherwise saturate.
+        // A u64 above i64::MAX has no i64 form, and `as` would wrap it to a negative.
         Value::UInt(u) => i64::try_from(*u).ok(),
-        Value::Float(f) => {
-            let truncated = f.trunc();
-            #[allow(clippy::float_cmp)]
-            if truncated == *f && truncated >= i64::MIN as f64 && truncated <= i64::MAX as f64 {
-                Some(truncated as i64)
-            } else {
-                None
-            }
-        }
+        Value::Float(f) => float_to_int(*f),
         _ => None,
+    }
+}
+
+/// A CEL integer as a `u64`, for the unsigned field kinds. Kept separate from [`as_i64`] because
+/// routing an unsigned value through `i64` would reject everything above `i64::MAX` - half of the
+/// protobuf `uint64` domain, which an identity transform has to round-trip.
+fn as_u64(value: &Value) -> Option<u64> {
+    match value {
+        Value::UInt(u) => Some(*u),
+        Value::Int(i) => u64::try_from(*i).ok(),
+        Value::Float(f) => u64::try_from(float_to_int(*f)?).ok(),
+        _ => None,
+    }
+}
+
+/// A float as an integer, only when it is exactly integral and inside the `i64` range.
+///
+/// The upper bound is exclusive of 2^63: `i64::MAX as f64` rounds *up* to 2^63, so comparing
+/// against it would admit 2^63 itself, which `as i64` then saturates to `i64::MAX` - silently
+/// changing the value. `-(i64::MIN as f64)` is exactly 2^63.
+fn float_to_int(f: f64) -> Option<i64> {
+    let truncated = f.trunc();
+    #[allow(clippy::float_cmp)]
+    if truncated == f && truncated >= i64::MIN as f64 && truncated < -(i64::MIN as f64) {
+        Some(truncated as i64)
+    } else {
+        None
     }
 }
 
@@ -453,5 +482,43 @@ fn as_f64(value: &Value) -> Option<f64> {
         Value::Int(i) => Some(*i as f64),
         Value::UInt(u) => Some(*u as f64),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{as_i64, as_u64, float_to_int};
+    use cel::Value;
+
+    #[test]
+    fn unsigned_conversion_covers_the_whole_u64_domain() {
+        // Above i64::MAX a uint64 has no i64 form, so routing it through as_i64 would reject
+        // half the domain and an identity transform could not round-trip it.
+        let big = u64::MAX;
+        assert_eq!(as_u64(&Value::UInt(big)), Some(big));
+        assert_eq!(as_u64(&Value::UInt(1u64 << 63)), Some(1u64 << 63));
+        assert_eq!(as_i64(&Value::UInt(big)), None);
+
+        // A non-negative signed value converts; a negative one does not.
+        assert_eq!(as_u64(&Value::Int(7)), Some(7));
+        assert_eq!(as_u64(&Value::Int(-1)), None);
+    }
+
+    #[test]
+    fn float_to_int_excludes_two_to_the_63() {
+        // `i64::MAX as f64` rounds up to 2^63, so a bound of `<= i64::MAX as f64` would admit
+        // 2^63 and then saturate it to i64::MAX - silently changing the value.
+        assert_eq!(float_to_int(9223372036854775808.0), None);
+        assert_eq!(float_to_int(-9223372036854775808.0), Some(i64::MIN));
+        assert_eq!(
+            float_to_int(9223372036854774784.0),
+            Some(9223372036854774784)
+        );
+
+        // Only exactly integral values convert.
+        assert_eq!(float_to_int(1.5), None);
+        assert_eq!(float_to_int(-3.0), Some(-3));
+        assert_eq!(float_to_int(f64::NAN), None);
+        assert_eq!(float_to_int(f64::INFINITY), None);
     }
 }
