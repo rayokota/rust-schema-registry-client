@@ -415,8 +415,11 @@ fn build_well_known(
             );
         }
         "google.protobuf.FloatValue" => {
-            let v = as_f64(value).ok_or_else(err)?;
-            set_named(&mut out, md, "value", prost_reflect::Value::F32(v as f32));
+            // Same check as a plain float field: `mergeWrapper` sets the wrapper's `value`
+            // through `parseFieldValue`, whose FLOAT case is `parseFloat` - so the wrapper gets
+            // the range check too.
+            let v = narrow_to_f32(as_f64(value).ok_or_else(err)?, md.full_name())?;
+            set_named(&mut out, md, "value", prost_reflect::Value::F32(v));
         }
         "google.protobuf.DoubleValue" => {
             let v = as_f64(value).ok_or_else(err)?;
@@ -515,19 +518,7 @@ fn scalar(fd: &FieldDescriptor, value: &Value) -> Result<prost_reflect::Value, S
         (Kind::String, Value::String(s)) => prost_reflect::Value::String(s.to_string()),
         (Kind::Bytes, Value::Bytes(b)) => prost_reflect::Value::Bytes(b.to_vec().into()),
         (Kind::Float, v) => {
-            let d = as_f64(v).ok_or_else(err)?;
-            // `JsonFormat.parseFloat` rejects a finite value outside the float range rather than
-            // letting `as f32` turn it into an infinity, and allows the same 1e-6 slack it does.
-            // NaN and the infinities pass through - it accepts those explicitly.
-            const EPSILON: f64 = 1e-6;
-            let limit = f32::MAX as f64 * (1.0 + EPSILON);
-            if d.is_finite() && (d > limit || d < -limit) {
-                return Err(SerdeError::Rule(format!(
-                    "out of range float value for field {}: {d}",
-                    fd.name()
-                )));
-            }
-            prost_reflect::Value::F32(d as f32)
+            prost_reflect::Value::F32(narrow_to_f32(as_f64(v).ok_or_else(err)?, fd.name())?)
         }
         (Kind::Double, v) => prost_reflect::Value::F64(as_f64(v).ok_or_else(err)?),
         // CEL has one 64-bit integer type, so writing to a narrower field is a conversion that
@@ -571,6 +562,23 @@ fn scalar(fd: &FieldDescriptor, value: &Value) -> Result<prost_reflect::Value, S
         }
         _ => return Err(err()),
     })
+}
+
+/// Narrows a double to a float the way `JsonFormat.parseFloat` does: a finite value outside the
+/// float range is an error rather than an infinity, with the same 1e-6 slack that method allows.
+/// NaN and the infinities pass through - it accepts those explicitly.
+///
+/// Shared by the plain float field and the `FloatValue` wrapper because Java reaches both through
+/// `parseFieldValue`; keeping one copy is what stops the two from drifting apart.
+fn narrow_to_f32(d: f64, what: &str) -> Result<f32, SerdeError> {
+    const EPSILON: f64 = 1e-6;
+    let limit = f32::MAX as f64 * (1.0 + EPSILON);
+    if d.is_finite() && (d > limit || d < -limit) {
+        return Err(SerdeError::Rule(format!(
+            "out of range float value for {what}: {d}"
+        )));
+    }
+    Ok(d as f32)
 }
 
 fn as_i64(value: &Value) -> Option<i64> {
@@ -720,6 +728,25 @@ mod tests {
         // A double field takes the full range.
         let d = desc.get_field_by_name("test_double").unwrap();
         assert!(to_field_value(&d, &Value::Float(1e39)).is_ok());
+    }
+
+    #[test]
+    fn a_float_wrapper_gets_the_same_range_check_as_a_float_field() {
+        // Java reaches both through parseFieldValue -> parseFloat, so a FloatValue must not
+        // silently store infinity where a plain float field errors.
+        let md = crate::TEST_DESCRIPTOR_POOL
+            .get_message_by_name("google.protobuf.FloatValue")
+            .unwrap();
+        let err = super::build_well_known(&md, &Value::Float(1e39)).unwrap_err();
+        assert!(err.to_string().contains("out of range float"), "{err}");
+
+        // In range and non-finite still pass, as they do for a plain field.
+        for v in [1.5f64, f64::INFINITY, f64::NAN] {
+            assert!(
+                super::build_well_known(&md, &Value::Float(v)).is_ok(),
+                "{v} should be accepted"
+            );
+        }
     }
 
     #[test]
