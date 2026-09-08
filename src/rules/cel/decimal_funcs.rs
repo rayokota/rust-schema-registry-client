@@ -226,6 +226,7 @@ fn decimals_round(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
             .ok_or_else(|| err("decimals.round: missing argument"))?,
     )?;
     let scale = require_int_scale(scale_arg(&args)?, "decimals.round")?;
+    check_scale_width(&d, scale, "decimals.round")?;
     Ok(decimal_value(
         d.with_scale_round(scale, RoundingMode::HalfUp),
     ))
@@ -276,15 +277,48 @@ fn decimal_to_string(Arguments(args): Arguments) -> Result<Value, ExecutionError
 /// magnitudes. `to_plain_string` expands the full scale into digits, so a pathological scale -
 /// `decimal(b"\x01", 1_000_000_000)` or `decimal("1e-1000000000")` - would allocate gigabytes;
 /// bound the length first and error instead. (Java's `toPlainString` has the same blow-up.)
+/// A practical ceiling on the digits a decimal result may carry. 1 MiB of them is already absurd
+/// for a rule value.
+///
+/// The JVM reference needs no such constant: `BigInteger` caps its own magnitude, so an
+/// over-large `setScale` raises an `ArithmeticException` that surfaces as a failed rule.
+/// `bigdecimal` has no cap, and an allocation failure in Rust aborts the process instead of
+/// unwinding - so the bound is what keeps the caller-visible behaviour the same.
+const MAX_DECIMAL_DIGITS: u64 = 1 << 20;
+
 fn plain_decimal_string(d: &BigDecimal) -> Result<String, ExecutionError> {
-    const MAX_LEN: u64 = 1 << 20; // 1 MiB of digits is already absurd for a rule value
     let length = d
         .digits()
         .saturating_add(d.fractional_digit_count().unsigned_abs());
-    if length > MAX_LEN {
+    if length > MAX_DECIMAL_DIGITS {
         return Err(err("string: decimal is too large to format"));
     }
     Ok(d.to_plain_string())
+}
+
+/// Rejects a target scale whose zero-padded result would exceed [`MAX_DECIMAL_DIGITS`].
+///
+/// Only widening needs checking: rounding to a coarser scale drops digits. `decimals.trunc`
+/// never reaches a widening `with_scale_round` because it early-returns first, so only
+/// `decimals.round` needs this.
+fn check_scale_width(
+    d: &BigDecimal,
+    scale: i64,
+    function_name: &str,
+) -> Result<(), ExecutionError> {
+    let current = d.fractional_digit_count();
+    if scale <= current {
+        return Ok(());
+    }
+    let length = d
+        .digits()
+        .saturating_add(scale.saturating_sub(current).unsigned_abs());
+    if length > MAX_DECIMAL_DIGITS {
+        return Err(err(format!(
+            "{function_name}: scale {scale} would produce {length} digits"
+        )));
+    }
+    Ok(())
 }
 fn decimal_to_double(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
     match args.as_slice() {
@@ -510,6 +544,41 @@ mod tests {
     /// The bounds check accepts the full i32 range and rejects anything past it (matching Java's
     /// `Math.toIntExact`). Tested on the helper directly so the "accepted" cases don't zero-pad a
     /// BigDecimal out to billions of digits the way a real `round` at i32::MAX would.
+    #[test]
+    fn decimals_round_rejects_an_absurd_scale() {
+        // i32::MAX passes require_int_scale, and with_scale_round would then zero-pad to that
+        // many digits - gigabytes, and an allocation failure in Rust aborts the process rather
+        // than unwinding. The JVM reference gets an ArithmeticException from BigInteger's own
+        // magnitude cap, so a rule error is the matching outcome. Reaching the assertion at all
+        // is most of the point: it means nothing tried to allocate.
+        assert!(
+            Program::compile("decimals.round(decimal('1.5'), 2147483647)")
+                .unwrap()
+                .execute(&default_context())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn decimals_round_still_widens_reasonably() {
+        assert_eq!(
+            eval_str("string(decimals.round(decimal('1.5'), 10))"),
+            "1.5000000000"
+        );
+        // Coarsening is unaffected by the bound.
+        assert_eq!(
+            eval_str("string(decimals.round(decimal('1.55'), 1))"),
+            "1.6"
+        );
+        // A hugely negative scale drops digits rather than padding, so it must not be rejected.
+        assert!(
+            Program::compile("decimals.round(decimal('1.5'), -2147483648)")
+                .unwrap()
+                .execute(&default_context())
+                .is_ok()
+        );
+    }
+
     #[test]
     fn require_int_scale_boundaries() {
         use super::require_int_scale;
