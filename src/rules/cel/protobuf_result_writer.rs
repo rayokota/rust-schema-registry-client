@@ -53,10 +53,8 @@ fn fill(
 ) -> Result<(), SerdeError> {
     check_result_keys(desc, map)?;
     for (key, value) in map.map.iter() {
-        let Key::String(name) = key else {
-            continue;
-        };
-        let Some(fd) = find_field(desc, name) else {
+        let name = result_key_name(key);
+        let Some(fd) = find_field(desc, &name) else {
             // The JVM client parses with a bare `JsonFormat.parser()` - `ignoringUnknownFields`
             // is off - so `mergeMessage` throws "Cannot find field: X in message Y". Dropping
             // the key instead would be worse than merely lenient: this writer has replace
@@ -98,16 +96,14 @@ fn check_result_keys(desc: &MessageDescriptor, map: &cel::objects::Map) -> Resul
     let mut fields: HashMap<u32, String> = HashMap::new();
     let mut oneofs: HashMap<String, String> = HashMap::new();
     for (key, value) in map.map.iter() {
-        let Key::String(name) = key else {
+        let name = result_key_name(key);
+        let Some(fd) = find_field(desc, &name) else {
             continue;
         };
-        let Some(fd) = find_field(desc, name) else {
-            continue;
-        };
-        if let Some(first) = fields.insert(fd.number(), name.to_string())
-            && first != **name
+        if let Some(first) = fields.insert(fd.number(), name.clone())
+            && first != name
         {
-            let (a, b) = ordered(first, name.to_string());
+            let (a, b) = ordered(first, name);
             return Err(SerdeError::Rule(format!(
                 "result names field {} twice, as {a} and {b}",
                 fd.full_name()
@@ -133,6 +129,23 @@ fn check_result_keys(desc: &MessageDescriptor, map: &cel::objects::Map) -> Resul
 /// Two names in a stable order, so an error does not vary with hash iteration order.
 fn ordered(x: String, y: String) -> (String, String) {
     if x <= y { (x, y) } else { (y, x) }
+}
+
+/// The field name a result key stands for.
+///
+/// A CEL map key may be an int, uint or bool as well as a string, and the JVM client reaches the
+/// field the same way: `ProtobufResultWriter.convert` looks it up as `String.valueOf(key)`, and
+/// Jackson then renders the key as that same text for the protobuf JSON parse. So a non-string
+/// key is not skipped, it simply has to name a field like any other - and normally does not,
+/// which the unknown-field check then reports. Skipping it instead would drop the entry silently,
+/// and with replace semantics that deletes the field.
+fn result_key_name(key: &Key) -> String {
+    match key {
+        Key::String(s) => s.to_string(),
+        Key::Int(i) => i.to_string(),
+        Key::Uint(u) => u.to_string(),
+        Key::Bool(b) => b.to_string(),
+    }
 }
 
 /// Resolves a result key by declared name, then by JSON name: a rule may legitimately return
@@ -622,6 +635,32 @@ mod tests {
                     .map(|(k, v)| (Key::String(Arc::new(k.to_string())), v))
                     .collect::<HashMap<Key, Value>>(),
             ),
+        }
+    }
+
+    #[test]
+    fn a_non_string_key_names_a_field_by_its_text() {
+        // A CEL map key may be an int, uint or bool. The JVM client looks the field up as
+        // String.valueOf(key) and Jackson renders the same text for the JSON parse, so such a
+        // key is not skipped - it just normally names no field, which is then reported.
+        // Skipping would drop the entry silently, deleting the field under replace semantics.
+        let desc = crate::TEST_DESCRIPTOR_POOL
+            .get_message_by_name("test.TestMessage")
+            .unwrap();
+        for key in [Key::Int(1), Key::Uint(1), Key::Bool(true)] {
+            let mut out = prost_reflect::DynamicMessage::new(desc.clone());
+            let map = Map {
+                map: Arc::new(HashMap::from([(
+                    key.clone(),
+                    Value::String(Arc::new("x".to_string())),
+                )])),
+            };
+            let err = fill(&mut out, &desc, &map).unwrap_err();
+            let text = super::result_key_name(&key);
+            assert!(
+                err.to_string().contains(&text),
+                "expected the key text {text} in: {err}"
+            );
         }
     }
 
