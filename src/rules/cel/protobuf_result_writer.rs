@@ -51,7 +51,7 @@ fn fill(
     desc: &MessageDescriptor,
     map: &cel::objects::Map,
 ) -> Result<(), SerdeError> {
-    check_single_oneof_member(desc, map)?;
+    check_result_keys(desc, map)?;
     for (key, value) in map.map.iter() {
         let Key::String(name) = key else {
             continue;
@@ -73,51 +73,61 @@ fn fill(
     Ok(())
 }
 
-/// Rejects a result that names more than one member of the same `oneof`.
+/// Rejects a result whose keys do not name a single field each.
 ///
-/// Setting a oneof member clears its siblings, and the result is a hash map, so applying such a
-/// result would keep whichever member the iteration order happened to visit last - the active
-/// oneof value would vary between runs. The JVM client rebuilds through protobuf JSON, which
-/// refuses two members of one oneof outright, so refuse it here too.
+/// Two problems, both of which would otherwise resolve by hash order and so vary between runs:
 ///
-/// A `null` is excluded because it clears its field rather than setting it, and a proto3
-/// `optional` field sits in a synthetic oneof of exactly one member, so it can never collide.
-fn check_single_oneof_member(
-    desc: &MessageDescriptor,
-    map: &cel::objects::Map,
-) -> Result<(), SerdeError> {
-    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+/// - **The same field twice.** [`find_field`] accepts a field's declared name *and* its JSON
+///   name, so `total_amount` and `totalAmount` are the same field. Applying both keeps whichever
+///   was visited last. `JsonFormat.mergeField` rejects this ("Field X has already been set"), and
+///   its duplicate test precedes any null handling, so a `null` counts here.
+/// - **Two members of one `oneof`.** Setting a member clears its siblings, so applying both keeps
+///   whichever was visited last. `JsonFormat.mergeOneofField` rejects this too, but only after
+///   returning early for a null - a null is "treated as absent" there - so a null does *not*
+///   count, which also matches this writer's own rule that a null clears rather than sets.
+///
+/// A proto3 `optional` field sits in a synthetic oneof of exactly one member and so can never
+/// collide with a sibling.
+fn check_result_keys(desc: &MessageDescriptor, map: &cel::objects::Map) -> Result<(), SerdeError> {
+    use std::collections::HashMap;
+    let mut fields: HashMap<u32, String> = HashMap::new();
+    let mut oneofs: HashMap<String, String> = HashMap::new();
     for (key, value) in map.map.iter() {
-        if matches!(value, Value::Null) {
-            continue;
-        }
         let Key::String(name) = key else {
             continue;
         };
         let Some(fd) = find_field(desc, name) else {
             continue;
         };
-        let Some(oneof) = fd.containing_oneof() else {
-            continue;
-        };
-        if let Some(first) = seen.insert(oneof.full_name().to_string(), fd.name().to_string())
-            && first != fd.name()
+        if let Some(first) = fields.insert(fd.number(), name.to_string())
+            && first != **name
         {
-            // Name both members in a stable order so the error does not vary with hash order.
-            let (a, b) = if first.as_str() < fd.name() {
-                (first, fd.name().to_string())
-            } else {
-                (fd.name().to_string(), first)
-            };
+            let (a, b) = ordered(first, name.to_string());
             return Err(SerdeError::Rule(format!(
-                "result sets more than one member of oneof {}: {} and {}",
-                oneof.full_name(),
-                a,
-                b
+                "result names field {} twice, as {a} and {b}",
+                fd.full_name()
+            )));
+        }
+        if matches!(value, Value::Null) {
+            continue;
+        }
+        if let Some(oneof) = fd.containing_oneof()
+            && let Some(first) = oneofs.insert(oneof.full_name().to_string(), fd.name().to_string())
+            && first != *fd.name()
+        {
+            let (a, b) = ordered(first, fd.name().to_string());
+            return Err(SerdeError::Rule(format!(
+                "result sets more than one member of oneof {}: {a} and {b}",
+                oneof.full_name()
             )));
         }
     }
     Ok(())
+}
+
+/// Two names in a stable order, so an error does not vary with hash iteration order.
+fn ordered(x: String, y: String) -> (String, String) {
+    if x <= y { (x, y) } else { (y, x) }
 }
 
 /// Resolves a result key by declared name, then by JSON name: a rule may legitimately return
@@ -535,11 +545,65 @@ fn as_f64(value: &Value) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{as_i64, as_u64, check_single_oneof_member, float_to_int};
+    use super::{as_i64, as_u64, check_result_keys, float_to_int};
     use cel::Value;
     use cel::objects::{Key, Map};
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    fn keys(pairs: Vec<(&str, Value)>) -> Map {
+        Map {
+            map: Arc::new(
+                pairs
+                    .into_iter()
+                    .map(|(k, v)| (Key::String(Arc::new(k.to_string())), v))
+                    .collect::<HashMap<Key, Value>>(),
+            ),
+        }
+    }
+
+    #[test]
+    fn rejects_a_result_naming_one_field_under_both_spellings() {
+        // find_field accepts the declared name and the JSON name, so these are one field and
+        // applying both would keep whichever the hash order visited last. JsonFormat.mergeField
+        // rejects it ("Field X has already been set"), and its duplicate test runs before any
+        // null handling - so unlike the oneof rule, a null still counts.
+        let desc = crate::TEST_DESCRIPTOR_POOL
+            .get_message_by_name("parity.ValueTypeContainers")
+            .unwrap();
+
+        let err = check_result_keys(
+            &desc,
+            &keys(vec![
+                ("amount_map", Value::Map(keys(vec![]))),
+                ("amountMap", Value::Map(keys(vec![]))),
+            ]),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("amount_map") && msg.contains("amountMap"),
+            "{msg}"
+        );
+
+        // A null under the other spelling is still a duplicate.
+        assert!(
+            check_result_keys(
+                &desc,
+                &keys(vec![
+                    ("amount_map", Value::Map(keys(vec![]))),
+                    ("amountMap", Value::Null),
+                ])
+            )
+            .is_err(),
+            "a null alias must still count as naming the field twice"
+        );
+
+        // One spelling alone is fine.
+        assert!(
+            check_result_keys(&desc, &keys(vec![("amountMap", Value::Map(keys(vec![])))])).is_ok()
+        );
+    }
 
     #[test]
     fn rejects_a_result_naming_two_members_of_one_oneof() {
@@ -562,7 +626,7 @@ mod tests {
                 }),
             ),
         ]);
-        let err = check_single_oneof_member(
+        let err = check_result_keys(
             &desc,
             &Map {
                 map: Arc::new(both),
@@ -589,7 +653,7 @@ mod tests {
             ),
         ]);
         assert!(
-            check_single_oneof_member(&desc, &Map { map: Arc::new(one) }).is_ok(),
+            check_result_keys(&desc, &Map { map: Arc::new(one) }).is_ok(),
             "a null sibling must not count as a second member"
         );
     }
