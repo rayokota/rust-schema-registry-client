@@ -57,9 +57,14 @@ fn fill(
             continue;
         };
         let Some(fd) = find_field(desc, name) else {
-            // A key the schema does not declare has nowhere to go. Dropping it matches the JVM
-            // client, whose JSON parse ignores unknown fields.
-            continue;
+            // The JVM client parses with a bare `JsonFormat.parser()` - `ignoringUnknownFields`
+            // is off - so `mergeMessage` throws "Cannot find field: X in message Y". Dropping
+            // the key instead would be worse than merely lenient: this writer has replace
+            // semantics, so a mistyped name would silently delete the field it meant to set.
+            return Err(SerdeError::Rule(format!(
+                "result names field {name}, which {} does not declare",
+                desc.full_name()
+            )));
         };
         if matches!(value, Value::Null) {
             // An explicit null clears the field, which is how a rule preserves an absent value
@@ -496,7 +501,21 @@ fn scalar(fd: &FieldDescriptor, value: &Value) -> Result<prost_reflect::Value, S
         (Kind::Bool, Value::Bool(b)) => prost_reflect::Value::Bool(*b),
         (Kind::String, Value::String(s)) => prost_reflect::Value::String(s.to_string()),
         (Kind::Bytes, Value::Bytes(b)) => prost_reflect::Value::Bytes(b.to_vec().into()),
-        (Kind::Float, v) => prost_reflect::Value::F32(as_f64(v).ok_or_else(err)? as f32),
+        (Kind::Float, v) => {
+            let d = as_f64(v).ok_or_else(err)?;
+            // `JsonFormat.parseFloat` rejects a finite value outside the float range rather than
+            // letting `as f32` turn it into an infinity, and allows the same 1e-6 slack it does.
+            // NaN and the infinities pass through - it accepts those explicitly.
+            const EPSILON: f64 = 1e-6;
+            let limit = f32::MAX as f64 * (1.0 + EPSILON);
+            if d.is_finite() && (d > limit || d < -limit) {
+                return Err(SerdeError::Rule(format!(
+                    "out of range float value for field {}: {d}",
+                    fd.name()
+                )));
+            }
+            prost_reflect::Value::F32(d as f32)
+        }
         (Kind::Double, v) => prost_reflect::Value::F64(as_f64(v).ok_or_else(err)?),
         // CEL has one 64-bit integer type, so writing to a narrower field is a conversion that
         // can fail. Reject an out-of-range value rather than truncating it, which would write a
@@ -511,9 +530,32 @@ fn scalar(fd: &FieldDescriptor, value: &Value) -> Result<prost_reflect::Value, S
             prost_reflect::Value::U32(u32::try_from(as_u64(v).ok_or_else(err)?).map_err(|_| err())?)
         }
         (Kind::Uint64 | Kind::Fixed64, v) => prost_reflect::Value::U64(as_u64(v).ok_or_else(err)?),
-        (Kind::Enum(_), v) => prost_reflect::Value::EnumNumber(
-            i32::try_from(as_i64(v).ok_or_else(err)?).map_err(|_| err())?,
-        ),
+        (Kind::Enum(ed), v) => {
+            // `JsonFormat.parseEnum` takes a value's name as well as its number, so a rule may
+            // legitimately write "ACTIVE" rather than 1.
+            if let Value::String(name) = v {
+                let value = ed.get_value_by_name(name).ok_or_else(|| {
+                    SerdeError::Rule(format!(
+                        "invalid enum value {name} for enum type {}",
+                        ed.full_name()
+                    ))
+                })?;
+                return Ok(prost_reflect::Value::EnumNumber(value.number()));
+            }
+            let number = i32::try_from(as_i64(v).ok_or_else(err)?).map_err(|_| err())?;
+            // An open (proto3) enum carries an unknown number through, which is what
+            // findValueByNumberCreatingIfUnknown does; a closed (proto2) one rejects it, which
+            // is findValueByNumber returning null and falling through to the throw.
+            if ed.parent_file().syntax() == prost_reflect::Syntax::Proto2
+                && ed.get_value(number).is_none()
+            {
+                return Err(SerdeError::Rule(format!(
+                    "invalid enum value {number} for closed enum type {}",
+                    ed.full_name()
+                )));
+            }
+            prost_reflect::Value::EnumNumber(number)
+        }
         _ => return Err(err()),
     })
 }
@@ -566,7 +608,7 @@ fn as_f64(value: &Value) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{as_i64, as_u64, check_result_keys, float_to_int, to_field_value};
+    use super::{as_i64, as_u64, check_result_keys, fill, float_to_int, to_field_value};
     use cel::Value;
     use cel::objects::{Key, Map};
     use std::collections::HashMap;
@@ -581,6 +623,64 @@ mod tests {
                     .collect::<HashMap<Key, Value>>(),
             ),
         }
+    }
+
+    #[test]
+    fn rejects_a_key_the_schema_does_not_declare() {
+        // The JVM client parses with a bare JsonFormat.parser(), so mergeMessage throws
+        // "Cannot find field". Dropping the key would be worse than lenient here: with replace
+        // semantics a mistyped name silently deletes the field it meant to set.
+        let desc = crate::TEST_DESCRIPTOR_POOL
+            .get_message_by_name("test.TestMessage")
+            .unwrap();
+        let mut out = prost_reflect::DynamicMessage::new(desc.clone());
+        let err = fill(
+            &mut out,
+            &desc,
+            &keys(vec![(
+                "test_strng",
+                Value::String(Arc::new("x".to_string())),
+            )]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("test_strng"), "{err}");
+
+        // The correct spelling, and the JSON name, both work.
+        for name in ["test_string", "testString"] {
+            let mut out = prost_reflect::DynamicMessage::new(desc.clone());
+            assert!(
+                fill(
+                    &mut out,
+                    &desc,
+                    &keys(vec![(name, Value::String(Arc::new("x".to_string())))])
+                )
+                .is_ok(),
+                "{name} should resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_float_outside_the_float_range() {
+        // JsonFormat.parseFloat throws "Out of range float value" rather than letting the cast
+        // produce an infinity. NaN and the infinities are accepted explicitly there.
+        let desc = crate::TEST_DESCRIPTOR_POOL
+            .get_message_by_name("test.TestMessage")
+            .unwrap();
+        let f = desc.get_field_by_name("test_float").unwrap();
+
+        let err = to_field_value(&f, &Value::Float(1e39)).unwrap_err();
+        assert!(err.to_string().contains("out of range float"), "{err}");
+        assert!(to_field_value(&f, &Value::Float(-1e39)).is_err());
+
+        // In range, and the non-finite values, still pass.
+        assert!(to_field_value(&f, &Value::Float(1.5)).is_ok());
+        assert!(to_field_value(&f, &Value::Float(f64::INFINITY)).is_ok());
+        assert!(to_field_value(&f, &Value::Float(f64::NAN)).is_ok());
+
+        // A double field takes the full range.
+        let d = desc.get_field_by_name("test_double").unwrap();
+        assert!(to_field_value(&d, &Value::Float(1e39)).is_ok());
     }
 
     #[test]

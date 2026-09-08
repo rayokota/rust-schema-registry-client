@@ -183,10 +183,10 @@ impl CelExecutor {
                     Some(rebuilt) => {
                         Ok(SerdeValue::Protobuf(prost_reflect::Value::Message(rebuilt)))
                     }
-                    None => Ok(to_serde_value(msg, &result)),
+                    None => to_serde_value(msg, &result),
                 }
             }
-            _ => Ok(to_serde_value(msg, &result)),
+            _ => to_serde_value(msg, &result),
         }
     }
 
@@ -793,12 +793,12 @@ fn from_json_value(value: &serde_json::Value) -> Value {
     }
 }
 
-pub fn to_serde_value(input: &SerdeValue, value: &Value) -> SerdeValue {
-    match input {
+pub fn to_serde_value(input: &SerdeValue, value: &Value) -> Result<SerdeValue, SerdeError> {
+    Ok(match input {
         SerdeValue::Avro(v) => SerdeValue::Avro(to_avro_value(v, value)),
-        SerdeValue::Protobuf(v) => SerdeValue::Protobuf(to_protobuf_value(v, value)),
+        SerdeValue::Protobuf(v) => SerdeValue::Protobuf(to_protobuf_value(v, value)?),
         SerdeValue::Json(v) => SerdeValue::Json(to_json_value(v, value)),
-    }
+    })
 }
 
 fn to_avro_value(input: &apache_avro::types::Value, value: &Value) -> apache_avro::types::Value {
@@ -1079,23 +1079,49 @@ fn union_variant_index(
         .position(|v| !matches!(resolve_avro_ref(v, defs), AvroSchema::Null))
 }
 
-fn to_protobuf_value(input: &prost_reflect::Value, value: &Value) -> prost_reflect::Value {
-    match value {
+/// Converts a CEL result back to a protobuf value, shaped by the value the field already held.
+///
+/// Narrowing is checked. CEL has one integer type, so a field narrower than i64 needs a
+/// conversion that can fail, and `as` would silently write a different number (2^32 as an int32
+/// becomes 0). The JVM client's field write-back goes through `Builder.setField`, which rejects a
+/// value of the wrong width outright, so failing here is what matches.
+fn to_protobuf_value(
+    input: &prost_reflect::Value,
+    value: &Value,
+) -> Result<prost_reflect::Value, SerdeError> {
+    let err = || SerdeError::Rule(format!("value {value:?} does not fit the protobuf field"));
+    Ok(match value {
         Value::Bool(v) => prost_reflect::Value::Bool(*v),
         Value::Int(v) => match input {
-            prost_reflect::Value::I32(_) => prost_reflect::Value::I32(*v as i32),
+            prost_reflect::Value::I32(_) => {
+                prost_reflect::Value::I32(i32::try_from(*v).map_err(|_| err())?)
+            }
             prost_reflect::Value::I64(_) => prost_reflect::Value::I64(*v),
-            prost_reflect::Value::U32(_) => prost_reflect::Value::U32(*v as u32),
-            prost_reflect::Value::U64(_) => prost_reflect::Value::U64(*v as u64),
-            prost_reflect::Value::EnumNumber(_) => prost_reflect::Value::EnumNumber(*v as i32),
+            prost_reflect::Value::U32(_) => {
+                prost_reflect::Value::U32(u32::try_from(*v).map_err(|_| err())?)
+            }
+            prost_reflect::Value::U64(_) => {
+                prost_reflect::Value::U64(u64::try_from(*v).map_err(|_| err())?)
+            }
+            prost_reflect::Value::EnumNumber(_) => {
+                prost_reflect::Value::EnumNumber(i32::try_from(*v).map_err(|_| err())?)
+            }
             _ => prost_reflect::Value::I64(*v),
         },
         Value::UInt(v) => match input {
-            prost_reflect::Value::I32(_) => prost_reflect::Value::I32(*v as i32),
-            prost_reflect::Value::I64(_) => prost_reflect::Value::I64(*v as i64),
-            prost_reflect::Value::U32(_) => prost_reflect::Value::U32(*v as u32),
+            prost_reflect::Value::I32(_) => {
+                prost_reflect::Value::I32(i32::try_from(*v).map_err(|_| err())?)
+            }
+            prost_reflect::Value::I64(_) => {
+                prost_reflect::Value::I64(i64::try_from(*v).map_err(|_| err())?)
+            }
+            prost_reflect::Value::U32(_) => {
+                prost_reflect::Value::U32(u32::try_from(*v).map_err(|_| err())?)
+            }
             prost_reflect::Value::U64(_) => prost_reflect::Value::U64(*v),
-            prost_reflect::Value::EnumNumber(_) => prost_reflect::Value::EnumNumber(*v as i32),
+            prost_reflect::Value::EnumNumber(_) => {
+                prost_reflect::Value::EnumNumber(i32::try_from(*v).map_err(|_| err())?)
+            }
             _ => prost_reflect::Value::U64(*v),
         },
         Value::Float(v) => {
@@ -1107,23 +1133,23 @@ fn to_protobuf_value(input: &prost_reflect::Value, value: &Value) -> prost_refle
         }
         Value::String(v) => prost_reflect::Value::String(v.to_string()),
         Value::Bytes(v) => prost_reflect::Value::Bytes(Bytes::from((**v).clone())),
-        Value::List(v) => prost_reflect::Value::List(
-            (**v)
-                .clone()
-                .into_iter()
-                .map(|x| to_protobuf_value(input, &x))
-                .collect(),
-        ),
+        Value::List(v) => {
+            let mut out = Vec::with_capacity(v.len());
+            for x in (**v).iter() {
+                out.push(to_protobuf_value(input, x)?);
+            }
+            prost_reflect::Value::List(out)
+        }
         Value::Map(v) => {
-            let iter = (*v.map).clone().into_iter().map(|(k, v)| {
-                let key = to_protobuf_map_key(&k);
-                (key, to_protobuf_value(input, &v))
-            });
-            prost_reflect::Value::Map(iter.collect())
+            let mut out = std::collections::HashMap::with_capacity(v.map.len());
+            for (k, val) in v.map.iter() {
+                out.insert(to_protobuf_map_key(k), to_protobuf_value(input, val)?);
+            }
+            prost_reflect::Value::Map(out)
         }
         Value::Null => prost_reflect::Value::Bytes(Bytes::from(Vec::new())),
         _ => prost_reflect::Value::Bytes(Bytes::from(Vec::new())),
-    }
+    })
 }
 
 fn to_protobuf_map_key(value: &Key) -> MapKey {
