@@ -168,12 +168,37 @@ fn decimals_mod(a: Value, b: Value) -> Result<Value, ExecutionError> {
     if is_zero(&b) {
         return Err(err("decimals.mod: division by zero"));
     }
-    // Same family as add/sub - the subtraction at the end aligns - but bounded by the integral
-    // quotient, which is what has to be produced first. Not the aligned frame: the quotient is
-    // narrow whenever the magnitudes are close or the dividend is the smaller, and measured on
-    // libmpdec `1e-2147483647 mod 1e2147483647` (the dividend itself) and `1e2147483647 mod
-    // 1e2147483000` (647 quotient digits) are both free while each frame is 4.3e9 digits.
-    check_alignment_width(&a, &b, "decimals.mod")?;
+    // Bounded by the *integral quotient*, which is what has to be produced first - not by the
+    // aligned frame add/sub use. Calling `check_alignment_width` here was wrong: the quotient
+    // is narrow whenever the operands' magnitudes are close or the dividend is the smaller,
+    // and the frame then refuses values the reference accepts. `1e-2147483647 mod
+    // 1e2147483647` is the dividend itself at precision 1, scale 2147483647 on the JVM, and
+    // 68us here - against an aligned frame of 4.3e9 digits.
+    //
+    // Measured on `bigdecimal`, and the estimate below tracks it closely (predicted/actual
+    // quotient digits in brackets):
+    //
+    //   1e-2147483647 mod 1e2147483647    68us     [1 / 1]
+    //   1e2147483647  mod 1e2147483000    35us     [648 / 648]
+    //   1E40          mod 3               58us     [41 / 40]
+    //   1e10000       mod 3              1.0ms     [10001 / 10000]
+    //   1e100000      mod 3             29.5ms     [100001 / 100000]
+    //   1.5           mod 1e-100000     27.7ms     [100001 / 100001]
+    //
+    // so the cost is (slightly super-)linear in the quotient width, and 2**31 quotient digits
+    // is the case worth refusing. No `|a| < |b|` short-circuit is needed: the estimate already
+    // yields 1 there, and `a - q*b` with a zero quotient already returns the dividend at its
+    // own scale.
+    let adjusted = |d: &BigDecimal| d.digits() as i64 - 1 - d.fractional_digit_count();
+    let quotient_digits = adjusted(&a).saturating_sub(adjusted(&b)).max(0);
+    let quotient_digits = u64::try_from(quotient_digits)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    if quotient_digits > MAX_DECIMAL_DIGITS {
+        return Err(err(format!(
+            "decimals.mod: the integral quotient would need {quotient_digits} digits"
+        )));
+    }
     let q = (&a / &b).with_scale_round(0, RoundingMode::Down);
     Ok(decimal_value(a - q * b))
 }
@@ -575,6 +600,9 @@ mod tests {
             "decimals.add(decimal(\"1e-2000000000\"), decimal(\"1\"))",
             "decimals.add(decimal(\"1e2000000000\"), decimal(\"1e-2000000000\"))",
             "decimals.mod(decimal(\"1e2000000000\"), decimal(\"3\"))",
+            // The other direction: a tiny dividend against a divisor so fine that the integral
+            // quotient spans the whole gap.
+            "decimals.mod(decimal(\"1.5\"), decimal(\"1e-2000000000\"))",
         ] {
             assert!(
                 Program::compile(expr)
@@ -596,6 +624,16 @@ mod tests {
             "decimals.eq(decimals.sub(decimal(\"1e2000000000\"), decimal(\"1e2000000000\")), decimal(\"0\"))",
             "decimals.eq(decimals.add(decimal(\"12.34\"), decimal(\"1.5\")), decimal(\"13.84\"))",
             "decimals.eq(decimals.mod(decimal(\"1E40\"), decimal(\"3\")), decimal(\"1\"))",
+            // `mod` is bounded by its integral quotient, not by the aligned frame - so a
+            // dividend smaller than the divisor is free however far apart they are, and the
+            // result is the dividend itself. This is what a frame-based guard refused: the
+            // JVM gives precision 1 at scale 2000000000, and `bigdecimal` takes 68us.
+            "decimals.eq(decimals.mod(decimal(\"1e-2000000000\"), decimal(\"1e2000000000\")), \
+             decimal(\"1e-2000000000\"))",
+            // And operands whose magnitudes are close, however extreme both are: the quotient
+            // spans only the difference.
+            "decimals.eq(decimals.mod(decimal(\"1e2000000000\"), decimal(\"1e1999999999\")), \
+             decimal(\"0\"))",
         ] {
             assert_eq!(
                 eval_bool(expr),
