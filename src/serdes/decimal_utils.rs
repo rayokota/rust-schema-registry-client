@@ -31,6 +31,23 @@ pub fn to_proto_decimal(d: &BigDecimal) -> Result<ProtoDecimal, SerdeError> {
     let (unscaled, scale) = d.clone().into_bigint_and_exponent();
     let scale = i32::try_from(scale)
         .map_err(|_| SerdeError::Rule(format!("decimal scale out of int range: {scale}")))?;
+    // The coefficient goes out in base 256, and decimal <-> binary radix conversion is
+    // quadratic - `to_string()` on the line below is that conversion. Measured on the C++
+    // sibling's codec: 0.04 s at 10^4 digits, 4.2 s at 10^5 and ~420 s at 10^6, with
+    // mpdecimal's own optimised export only about 10x better and the same quadratic shape. So a
+    // value can be cheap to hold, cheap to compute with, and still unserialisable, which is a
+    // bound on *time* rather than memory and needs a number of its own. 4300 is CPython's
+    // `int_max_str_digits`, the cap it puts on string/integer conversion for exactly this
+    // reason; the Python, C++, JS and C# clients all adopt it, so every client agrees on which
+    // decimals can be written. CEL's documented decimal precision is 38 digits.
+    const MAX_COEFFICIENT_DIGITS: u64 = 4300;
+    if d.digits() > MAX_COEFFICIENT_DIGITS {
+        return Err(SerdeError::Rule(format!(
+            "decimal coefficient has {} digits, past the {MAX_COEFFICIENT_DIGITS} this client \
+             can encode into confluent.type.Decimal",
+            d.digits()
+        )));
+    }
     let precision = u32::try_from(unscaled.magnitude().to_string().len()).unwrap_or(u32::MAX);
     Ok(ProtoDecimal {
         value: unscaled.to_signed_bytes_be(),

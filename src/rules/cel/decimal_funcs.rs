@@ -118,11 +118,22 @@ fn decimals_ge(a: Value, b: Value) -> Result<bool, ExecutionError> {
 }
 
 // ---- arithmetic ----
+//
+// `add`/`sub` align their operands on the finer scale before computing a digit, so the aligned
+// frame is what has to be built - and `bigdecimal` has no cap of its own, so nothing else
+// bounds it. `mul` does not align: it adds the exponents and multiplies the coefficients, so
+// its result is as compact as its operands, and it is deliberately left unguarded. Measured on
+// libmpdec in the Python sibling, peak RSS on operands 1e2147483647 and 3: `mul`, `div`,
+// comparison, negation and `abs` all 13 MB; `add` 1738 MB, `sub` 1738 MB, `remainder` 1733 MB.
 fn decimals_add(a: Value, b: Value) -> Result<Value, ExecutionError> {
-    Ok(decimal_value(to_decimal(&a)? + to_decimal(&b)?))
+    let (a, b) = (to_decimal(&a)?, to_decimal(&b)?);
+    check_alignment_width(&a, &b, "decimals.add")?;
+    Ok(decimal_value(a + b))
 }
 fn decimals_sub(a: Value, b: Value) -> Result<Value, ExecutionError> {
-    Ok(decimal_value(to_decimal(&a)? - to_decimal(&b)?))
+    let (a, b) = (to_decimal(&a)?, to_decimal(&b)?);
+    check_alignment_width(&a, &b, "decimals.sub")?;
+    Ok(decimal_value(a - b))
 }
 fn decimals_mul(a: Value, b: Value) -> Result<Value, ExecutionError> {
     Ok(decimal_value(to_decimal(&a)? * to_decimal(&b)?))
@@ -157,6 +168,12 @@ fn decimals_mod(a: Value, b: Value) -> Result<Value, ExecutionError> {
     if is_zero(&b) {
         return Err(err("decimals.mod: division by zero"));
     }
+    // Same family as add/sub - the subtraction at the end aligns - but bounded by the integral
+    // quotient, which is what has to be produced first. Not the aligned frame: the quotient is
+    // narrow whenever the magnitudes are close or the dividend is the smaller, and measured on
+    // libmpdec `1e-2147483647 mod 1e2147483647` (the dividend itself) and `1e2147483647 mod
+    // 1e2147483000` (647 quotient digits) are both free while each frame is 4.3e9 digits.
+    check_alignment_width(&a, &b, "decimals.mod")?;
     let q = (&a / &b).with_scale_round(0, RoundingMode::Down);
     Ok(decimal_value(a - q * b))
 }
@@ -246,15 +263,19 @@ fn decimals_trunc(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
     }
     Ok(decimal_value(d.with_scale_round(scale, RoundingMode::Down)))
 }
+// floor/ceil target scale 0 without going through `decimals_round`, so they carry the width
+// bound separately. Scale 0 is a *widening* whenever the value's own scale is negative - a
+// large positive exponent - and `floor(decimal("1e20000000"))` is then a 20000001-digit
+// coefficient, reachable from a rule that names no scale at all.
 fn decimals_floor(a: Value) -> Result<Value, ExecutionError> {
-    Ok(decimal_value(
-        to_decimal(&a)?.with_scale_round(0, RoundingMode::Floor),
-    ))
+    let d = to_decimal(&a)?;
+    check_scale_width(&d, 0, "decimals.floor")?;
+    Ok(decimal_value(d.with_scale_round(0, RoundingMode::Floor)))
 }
 fn decimals_ceil(a: Value) -> Result<Value, ExecutionError> {
-    Ok(decimal_value(
-        to_decimal(&a)?.with_scale_round(0, RoundingMode::Ceiling),
-    ))
+    let d = to_decimal(&a)?;
+    check_scale_width(&d, 0, "decimals.ceil")?;
+    Ok(decimal_value(d.with_scale_round(0, RoundingMode::Ceiling)))
 }
 
 // ---- stdlib conversions extended to Decimal ----
@@ -294,6 +315,38 @@ fn plain_decimal_string(d: &BigDecimal) -> Result<String, ExecutionError> {
         return Err(err("string: decimal is too large to format"));
     }
     Ok(d.to_plain_string())
+}
+
+/// Rejects two operands whose aligned frame would exceed [`MAX_DECIMAL_DIGITS`].
+///
+/// Addition and subtraction expand the narrower operand into the wider one's frame, so the
+/// frame carries the smaller scale's exponent and spans both magnitudes. No exemption for a
+/// zero operand: aligning a zero at an extreme scale with `1` still expands the *one* into the
+/// zero's scale.
+fn check_alignment_width(
+    a: &BigDecimal,
+    b: &BigDecimal,
+    function_name: &str,
+) -> Result<(), ExecutionError> {
+    let scale = a.fractional_digit_count().max(b.fractional_digit_count());
+    let widest = [a, b]
+        .iter()
+        .map(|d| {
+            d.digits().saturating_add(
+                scale
+                    .saturating_sub(d.fractional_digit_count())
+                    .unsigned_abs(),
+            )
+        })
+        .max()
+        .unwrap_or(0);
+    let length = widest.saturating_add(1);
+    if length > MAX_DECIMAL_DIGITS {
+        return Err(err(format!(
+            "{function_name}: aligning the operands would need {length} digits"
+        )));
+    }
+    Ok(())
 }
 
 /// Rejects a target scale whose zero-padded result would exceed [`MAX_DECIMAL_DIGITS`].
@@ -505,6 +558,83 @@ mod tests {
                 .execute(&default_context())
                 .is_err()
         );
+    }
+
+    /// Alignment is the arithmetic width risk, and the only one: `add`/`sub` expand the
+    /// narrower operand into the wider one's frame, `mod` has to produce the integral quotient
+    /// first, and `mul`/`div`/comparison do neither. Measured on libmpdec in the Python
+    /// sibling, peak RSS on operands 1e2147483647 and 3: `mul`, `div`, `<`, `==`, `min`, `neg`,
+    /// `abs` all 13 MB; `add` 1738 MB, `sub` 1738 MB, `remainder` 1733 MB. `bigdecimal` has no
+    /// cap of its own, and an allocation failure in Rust aborts the process rather than
+    /// unwinding, so the bound is what keeps the caller-visible behaviour a failed rule.
+    #[test]
+    fn alignment_width_errors_instead_of_allocating() {
+        for expr in [
+            "decimals.add(decimal(\"1e2000000000\"), decimal(\"1\"))",
+            "decimals.sub(decimal(\"1e2000000000\"), decimal(\"1\"))",
+            "decimals.add(decimal(\"1e-2000000000\"), decimal(\"1\"))",
+            "decimals.add(decimal(\"1e2000000000\"), decimal(\"1e-2000000000\"))",
+            "decimals.mod(decimal(\"1e2000000000\"), decimal(\"3\"))",
+        ] {
+            assert!(
+                Program::compile(expr)
+                    .unwrap()
+                    .execute(&default_context())
+                    .is_err(),
+                "{expr} must be refused on width"
+            );
+        }
+    }
+
+    /// The must-fail twin. `mul` is unguarded at any width, comparison never aligns, and
+    /// alignment that stays narrow is accepted however extreme both operands are.
+    #[test]
+    fn the_cheap_operations_stay_unguarded() {
+        for expr in [
+            "decimals.eq(decimals.mul(decimal(\"1e2000000000\"), decimal(\"1e-2000000000\")), decimal(\"1\"))",
+            "decimals.lt(decimal(\"1e-2000000000\"), decimal(\"1e2000000000\"))",
+            "decimals.eq(decimals.sub(decimal(\"1e2000000000\"), decimal(\"1e2000000000\")), decimal(\"0\"))",
+            "decimals.eq(decimals.add(decimal(\"12.34\"), decimal(\"1.5\")), decimal(\"13.84\"))",
+            "decimals.eq(decimals.mod(decimal(\"1E40\"), decimal(\"3\")), decimal(\"1\"))",
+        ] {
+            assert_eq!(
+                eval_bool(expr),
+                true,
+                "{expr} must stay unbounded and answer"
+            );
+        }
+    }
+
+    /// `floor`/`ceil` target scale 0 without going through `decimals_round`, so they carry the
+    /// bound separately - and scale 0 is a *widening* whenever the value's own scale is
+    /// negative. Coarsening stays free: rounding to a coarser scale drops digits rather than
+    /// adding them, which is why `check_scale_width` early-returns there.
+    #[test]
+    fn the_one_argument_rounding_family_is_bounded_too() {
+        for expr in [
+            "decimals.round(decimal(\"1e20000000\"))",
+            "decimals.floor(decimal(\"1e20000000\"))",
+            "decimals.ceil(decimal(\"1e20000000\"))",
+        ] {
+            assert!(
+                Program::compile(expr)
+                    .unwrap()
+                    .execute(&default_context())
+                    .is_err(),
+                "{expr} must be refused on width"
+            );
+        }
+        // Coarsening is free at any distance, so these answer.
+        for expr in [
+            "decimals.eq(decimals.round(decimal(\"1e-20000000\")), decimal(\"0\"))",
+            "decimals.eq(decimals.floor(decimal(\"1e-20000000\")), decimal(\"0\"))",
+            "decimals.eq(decimals.ceil(decimal(\"1e-20000000\")), decimal(\"1\"))",
+            "decimals.eq(decimals.trunc(decimal(\"1e-20000000\")), decimal(\"0\"))",
+            "decimals.eq(decimals.round(decimal(\"2.5\")), decimal(\"3\"))",
+            "decimals.eq(decimals.floor(decimal(\"-1.5\")), decimal(\"-2\"))",
+        ] {
+            assert_eq!(eval_bool(expr), true, "{expr} must answer");
+        }
     }
 
     /// A scale outside i32 range must error rather than silently narrow. CEL int is i64, but
