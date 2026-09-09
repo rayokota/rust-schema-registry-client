@@ -189,11 +189,16 @@ fn decimals_mod(a: Value, b: Value) -> Result<Value, ExecutionError> {
     // is the case worth refusing. No `|a| < |b|` short-circuit is needed: the estimate already
     // yields 1 there, and `a - q*b` with a zero quotient already returns the dividend at its
     // own scale.
+    // A zero dividend has a quotient of zero whatever the scales, and its adjusted exponent
+    // says nothing useful - a zero keeps the scale it was built with, so `0E+2e9 mod 1E-2e9`
+    // estimated 4e9 digits for a result that is just zero. The JDK returns 0 at precision 1.
     let adjusted = |d: &BigDecimal| d.digits() as i64 - 1 - d.fractional_digit_count();
-    let quotient_digits = adjusted(&a).saturating_sub(adjusted(&b)).max(0);
-    let quotient_digits = u64::try_from(quotient_digits)
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
+    let quotient_digits = if is_zero(&a) {
+        1
+    } else {
+        let span = adjusted(&a).saturating_sub(adjusted(&b)).max(0);
+        u64::try_from(span).unwrap_or(u64::MAX).saturating_add(1)
+    };
     if quotient_digits > MAX_DECIMAL_DIGITS {
         return Err(err(format!(
             "decimals.mod: the integral quotient would need {quotient_digits} digits"
@@ -354,9 +359,18 @@ fn check_alignment_width(
     function_name: &str,
 ) -> Result<(), ExecutionError> {
     let scale = a.fractional_digit_count().max(b.fractional_digit_count());
+    // A zero operand contributes one digit whatever the distance: expanding a zero appends
+    // none. That decides several cases outright, because alignment expands only the operand
+    // whose scale is coarser. Measured on libmpdec, with the JDK agreeing on every row:
+    // `0E+2e9 + 0E-2e9`, `0E+2e9 + 1` and `0E+2e9 mod 1E-2e9` are free at one digit, while
+    // `0E-2e9 + 1` is 1601 MB and 2e9+1 digits (`ArithmeticException` there). Only the last
+    // must be refused, and the difference is purely which operand expands.
     let widest = [a, b]
         .iter()
         .map(|d| {
+            if is_zero(d) {
+                return 1;
+            }
             d.digits().saturating_add(
                 scale
                     .saturating_sub(d.fractional_digit_count())
@@ -612,6 +626,42 @@ mod tests {
                 "{expr} must be refused on width"
             );
         }
+    }
+
+    /// Expanding a *zero* is free, so the aligned frame is set by the operands that actually
+    /// have digits - several of these turn on which operand expands rather than on how far
+    /// apart the scales are. A zero also keeps whatever scale it was built with, so its
+    /// adjusted exponent says nothing about the cost, which is what an earlier estimate got
+    /// wrong. Every row measured on libmpdec and on the JDK, which agree:
+    ///
+    ///   0E+2e9 + 0E-2e9      free, 1 digit           precision 1
+    ///   0E+2e9 + 1           free, 1 digit           precision 1, scale 0 (the zero expands)
+    ///   0E+2e9 mod 1E-2e9    free, 1 digit           precision 1
+    ///   1 + 0E-2e9           1601 MB, 2e9+1 digits   ArithmeticException (the *one* expands)
+    #[test]
+    fn expanding_a_zero_operand_is_free() {
+        for expr in [
+            "decimals.eq(decimals.add(decimal(\"0E+2000000000\"), decimal(\"0E-2000000000\")), \
+             decimal(\"0\"))",
+            "decimals.eq(decimals.sub(decimal(\"0E+2000000000\"), decimal(\"0E-2000000000\")), \
+             decimal(\"0\"))",
+            "decimals.eq(decimals.add(decimal(\"0E+2000000000\"), decimal(\"1\")), decimal(\"1\"))",
+            "decimals.eq(decimals.mod(decimal(\"0E+2000000000\"), decimal(\"1E-2000000000\")), \
+             decimal(\"0\"))",
+            "decimals.eq(decimals.mod(decimal(\"0E-2000000000\"), decimal(\"1E+2000000000\")), \
+             decimal(\"0\"))",
+            "decimals.eq(decimals.mod(decimal(\"0\"), decimal(\"3\")), decimal(\"0\"))",
+        ] {
+            assert_eq!(eval_bool(expr), true, "{expr} must be free and answer");
+        }
+        // The row that must still be refused: here the *one* expands into the zero's scale, so
+        // a blanket zero exemption would have let it through.
+        assert!(
+            Program::compile("decimals.add(decimal(\"1\"), decimal(\"0E-2000000000\"))")
+                .unwrap()
+                .execute(&default_context())
+                .is_err()
+        );
     }
 
     /// The must-fail twin. `mul` is unguarded at any width, comparison never aligns, and
