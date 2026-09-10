@@ -195,7 +195,19 @@ fn apply_preferred_scale_if_exact(
         // zero at scale 0, so the negative-scale direction was unreachable: `0 / 3.00` is
         // scale -2 there. Invisible in the plain form - each of these writes as "0" - but a
         // different `scale` field on the wire.
-        return Ok(BigDecimal::new(BigInt::from(0), preferred_scale));
+        //
+        // Clamped, because the reference clamps: `zeroValueOf(saturateLong(preferredScale))`.
+        // Two operand scales at opposite ends of the int32 range differ by more than int32
+        // holds - a zero at scale i32::MAX over a value at scale i32::MIN has a preferred
+        // scale of 4_294_967_295 - and `bigdecimal`'s scale is an i64, so nothing else stops
+        // it. Measured: the reference answers a zero at i32::MAX for that pair, which encodes
+        // fine, where this returned a value no `confluent.type.Decimal` can carry and only
+        // failed later, at `decimal_parts`. Saturating here keeps every scale this client
+        // produces inside the domain `require_int_scale` declares for the ones it accepts.
+        return Ok(BigDecimal::new(
+            BigInt::from(0),
+            preferred_scale.clamp(i64::from(i32::MIN), i64::from(i32::MAX)),
+        ));
     }
     let minimal = value.normalized();
     // `normalized()` reports a *negative* scale where one applies (500 is scale -2), which is
@@ -1166,6 +1178,42 @@ mod tests {
         ] {
             let got = scale_of(decimals_sqrt(dec(a)).expect("sqrt"));
             assert_eq!(got, want, "sqrt({a})");
+        }
+    }
+
+    /// ...and that scale saturates into the int32 range rather than escaping it, which is the
+    /// other half of the reference's zero exemption: `zeroValueOf(saturateLong(...))`.
+    ///
+    /// Two operand scales at opposite ends of the int32 range differ by more than int32 holds,
+    /// and this client's scale is an i64, so the preferred scale reached 4_294_967_295 - a
+    /// value no `confluent.type.Decimal` can carry, which surfaced only later at
+    /// `decimal_parts`. Measured on the reference: that pair is a zero at scale i32::MAX, and
+    /// the same pair with a *non-zero* dividend is `ArithmeticException: Underflow` instead.
+    ///
+    /// Only the zero path is clamped. For a non-zero result the exponent range is delegated to
+    /// `bigdecimal` and bounded at the wire, per decimals.md §4a - so `1e-i32::MAX / 1e i32::MAX`
+    /// still computes here and still fails to encode, which is that section's stated design.
+    #[test]
+    fn a_zeros_preferred_scale_saturates_into_int32() {
+        use bigdecimal::num_bigint::BigInt;
+        let zero_at = |scale: i64| decimal_value(BigDecimal::new(BigInt::from(0), scale));
+        let one_at = |scale: i64| decimal_value(BigDecimal::new(BigInt::from(1), scale));
+
+        // Preferred scale 4_294_967_295, saturated to i32::MAX.
+        let q = decimals_div(zero_at(2147483647), one_at(-2147483648)).expect("div");
+        assert_eq!(scale_of(q), i64::from(i32::MAX));
+
+        // ...and the other direction, saturated to i32::MIN.
+        let r = decimals_div(zero_at(-2147483648), one_at(2147483647)).expect("div");
+        assert_eq!(scale_of(r), i64::from(i32::MIN));
+
+        // Every scale the zero path can now produce is encodable.
+        for (a, b) in [(2147483647i64, -2147483648i64), (-2147483648, 2147483647)] {
+            let v = decimals_div(zero_at(a), one_at(b)).expect("div");
+            assert!(
+                i32::try_from(scale_of(v)).is_ok(),
+                "scale escaped int32 for {a} / {b}"
+            );
         }
     }
 
