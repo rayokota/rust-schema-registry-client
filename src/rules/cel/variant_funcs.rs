@@ -40,20 +40,14 @@ pub const VARIANT_TYPE_NAME: &str = "confluent.type.Variant";
 pub struct CelVariant(pub Variant);
 
 impl PartialEq for CelVariant {
-    /// Identity semantics, matching Java, C#, Python, JavaScript and C++, none of which give a
-    /// variant a value-equality operator.
-    ///
-    /// A variant is a dynamically typed container, so comparing encodings is not value
-    /// equality: it reports `12.34 != 12.340` (different scale) and `int8(1) != int16(1)`
-    /// (different width), and can separate identical documents whose metadata dictionaries
-    /// differ. Real value equality needs a decode and a specification for cross-width integers,
-    /// decimal scale, int/double comparison and object key order - which `==` does not do.
-    ///
-    /// So this is true only when both sides are the same value: a `true` is never wrong, while
-    /// equal values reached separately compare false. Compare values with `variants.as` or
-    /// `variants.toJson` instead.
+    /// Equality is over the encoding: the metadata bytes and the standalone value bytes. The
+    /// same comparison a `confluent.type.Variant` gets in the other six clients, so a variant
+    /// read from a field and one built by `variants.parseJson` answer the same way. It is bytes
+    /// rather than `std::ptr::eq`, which was here before: a `CelVariant` lives behind an `Arc`
+    /// whose clone is a different pointer.
     fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(self, other)
+        self.0.metadata_bytes() == other.0.metadata_bytes()
+            && self.0.standalone_value_bytes() == other.0.standalone_value_bytes()
     }
 }
 impl Eq for CelVariant {}
@@ -476,6 +470,68 @@ mod tests {
     /// fields are empty — carries no metadata, so there is nothing to read. It reads as CEL null
     /// and every accessor propagates that, rather than `Variant::new` accepting it and an
     /// accessor later indexing into a buffer that was never populated.
+    /// Sound but incomplete: equal bytes mean equal values, but one value has many encodings,
+    /// so an int and a double are unequal however alike they read.
+    #[test]
+    fn variant_equality_is_over_the_encoding() {
+        let cases: [(&str, bool); 11] = [
+            (
+                r#"variants.parseJson("1") == variants.parseJson("1")"#,
+                true,
+            ),
+            (
+                r#"variants.parseJson("1") != variants.parseJson("1")"#,
+                false,
+            ),
+            (
+                r#"variants.parseJson("{}") == variants.parseJson("{}")"#,
+                true,
+            ),
+            (
+                r#"variants.parseJson('{"a":1}') == variants.parseJson('{"a":1}')"#,
+                true,
+            ),
+            (
+                r#"variants.parseJson("1") == variants.parseJson("2")"#,
+                false,
+            ),
+            // Incomplete, as documented: an int and a double are two encodings.
+            (
+                r#"variants.parseJson("1") == variants.parseJson("1.0")"#,
+                false,
+            ),
+            // Containers recurse with the same equality.
+            (
+                r#"[variants.parseJson("1")] == [variants.parseJson("1")]"#,
+                true,
+            ),
+            (
+                r#"[variants.parseJson("1")] == [variants.parseJson("2")]"#,
+                false,
+            ),
+            // Navigation: the same position in an identical parent.
+            (
+                r#"variants.field(variants.parseJson('{"a":1}'), "a") == variants.field(variants.parseJson('{"a":1}'), "a")"#,
+                true,
+            ),
+            // A field holding 1 is not the standalone variant 1: it carries its parent's
+            // metadata dictionary, which is part of the comparison.
+            (
+                r#"variants.field(variants.parseJson('{"a":1}'), "a") == variants.parseJson("1")"#,
+                false,
+            ),
+            // And the whole document, reached two ways, is the same variant.
+            ("variants.parseJson(this) == variants.parseJson(this)", true),
+        ];
+        for (expr, expected) in cases {
+            assert_eq!(
+                eval_bool(expr, doc_string()),
+                expected,
+                "expr {expr} should be {expected}"
+            );
+        }
+    }
+
     #[test]
     fn absent_variant_reads_as_null() {
         let absent = variant_map(Vec::new(), Vec::new());

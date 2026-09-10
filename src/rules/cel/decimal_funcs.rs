@@ -79,6 +79,15 @@ pub fn to_decimal(v: &Value) -> Result<BigDecimal, ExecutionError> {
     }
 }
 
+/// `|a| < |b|`, without aligning the operands.
+///
+/// `BigDecimal`'s own comparison short-circuits on magnitude (measured: comparing 1e-2000000000
+/// with 1e2000000000 is free), so this is just `abs` on both sides - stated as a helper because
+/// the *reason* it is cheap is what makes the remainder's zero-quotient case cheap.
+fn magnitude_lt(a: &BigDecimal, b: &BigDecimal) -> bool {
+    a.abs() < b.abs()
+}
+
 fn is_zero(d: &BigDecimal) -> bool {
     d.sign() == Sign::NoSign
 }
@@ -118,11 +127,22 @@ fn decimals_ge(a: Value, b: Value) -> Result<bool, ExecutionError> {
 }
 
 // ---- arithmetic ----
+//
+// `add`/`sub` align their operands on the finer scale before computing a digit, so the aligned
+// frame is what has to be built - and `bigdecimal` has no cap of its own, so nothing else
+// bounds it. `mul` does not align: it adds the exponents and multiplies the coefficients, so
+// its result is as compact as its operands, and it is deliberately left unguarded. Measured on
+// libmpdec in the Python sibling, peak RSS on operands 1e2147483647 and 3: `mul`, `div`,
+// comparison, negation and `abs` all 13 MB; `add` 1738 MB, `sub` 1738 MB, `remainder` 1733 MB.
 fn decimals_add(a: Value, b: Value) -> Result<Value, ExecutionError> {
-    Ok(decimal_value(to_decimal(&a)? + to_decimal(&b)?))
+    let (a, b) = (to_decimal(&a)?, to_decimal(&b)?);
+    check_alignment_width(&a, &b, "decimals.add")?;
+    Ok(decimal_value(a + b))
 }
 fn decimals_sub(a: Value, b: Value) -> Result<Value, ExecutionError> {
-    Ok(decimal_value(to_decimal(&a)? - to_decimal(&b)?))
+    let (a, b) = (to_decimal(&a)?, to_decimal(&b)?);
+    check_alignment_width(&a, &b, "decimals.sub")?;
+    Ok(decimal_value(a - b))
 }
 fn decimals_mul(a: Value, b: Value) -> Result<Value, ExecutionError> {
     Ok(decimal_value(to_decimal(&a)? * to_decimal(&b)?))
@@ -157,8 +177,102 @@ fn decimals_mod(a: Value, b: Value) -> Result<Value, ExecutionError> {
     if is_zero(&b) {
         return Err(err("decimals.mod: division by zero"));
     }
-    let q = (&a / &b).with_scale_round(0, RoundingMode::Down);
-    Ok(decimal_value(a - q * b))
+    // Bounded by the *integral quotient*, which is what has to be produced first - not by the
+    // aligned frame add/sub use. Calling `check_alignment_width` here was wrong: the quotient
+    // is narrow whenever the operands' magnitudes are close or the dividend is the smaller,
+    // and the frame then refuses values the reference accepts. `1e-2147483647 mod
+    // 1e2147483647` is the dividend itself at precision 1, scale 2147483647 on the JVM, and
+    // 68us here - against an aligned frame of 4.3e9 digits.
+    //
+    // Measured on `bigdecimal`, and the estimate below tracks it closely (predicted/actual
+    // quotient digits in brackets):
+    //
+    //   1e-2147483647 mod 1e2147483647    68us     [1 / 1]
+    //   1e2147483647  mod 1e2147483000    35us     [648 / 648]
+    //   1E40          mod 3               58us     [41 / 40]
+    //   1e10000       mod 3              1.0ms     [10001 / 10000]
+    //   1e100000      mod 3             29.5ms     [100001 / 100000]
+    //   1.5           mod 1e-100000     27.7ms     [100001 / 100001]
+    //
+    // so the cost is (slightly super-)linear in the quotient width, and 2**31 quotient digits
+    // is the case worth refusing. No `|a| < |b|` short-circuit is needed: the estimate already
+    // yields 1 there, and `a - q*b` with a zero quotient already returns the dividend at its
+    // own scale.
+    // A zero dividend has a quotient of zero whatever the scales, and its adjusted exponent
+    // says nothing useful - a zero keeps the scale it was built with, so `0E+2e9 mod 1E-2e9`
+    // estimated 4e9 digits for a result that is just zero. The JDK returns 0 at precision 1.
+    // Saturating, because `bigdecimal` accepts a scale this arithmetic cannot hold: the JVM caps
+    // a scale at int32 ("Too many nonzero exponent digits" past that), while `10e9223372036854775807`
+    // parses here with scale -i64::MAX, and subtracting it overflowed - a debug panic, or a
+    // wrapped estimate in release. Saturating leaves the decision to the width logic below, which
+    // is where it belongs: `1 mod 10e9223372036854775807` then estimates 1 digit and the
+    // magnitude shortcut returns the dividend, while the reverse refuses on quotient width.
+    let adjusted = |d: &BigDecimal| {
+        i64::try_from(d.digits())
+            .unwrap_or(i64::MAX)
+            .saturating_sub(1)
+            .saturating_sub(d.fractional_digit_count())
+    };
+    let quotient_digits = if is_zero(&a) {
+        1
+    } else {
+        let span = adjusted(&a).saturating_sub(adjusted(&b)).max(0);
+        u64::try_from(span).unwrap_or(u64::MAX).saturating_add(1)
+    };
+    if quotient_digits > MAX_DECIMAL_DIGITS {
+        return Err(err(format!(
+            "decimals.mod: the integral quotient would need {quotient_digits} digits"
+        )));
+    }
+    // Computed on the unscaled integers, not through `&a / &b`. `bigdecimal`'s division
+    // rounds to its default 100-digit precision, so truncating that quotient gave a *wrong
+    // remainder* past 100 digits - silently:
+    //
+    //   1e99   mod 3 -> 1                          (correct)
+    //   1e100  mod 3 -> 1                          (correct)
+    //   1e101  mod 3 -> 10                         WRONG
+    //   1e200  mod 3 -> 1 followed by 99 zeros     WRONG
+    //   1e10000 mod 3 -> a 10000-digit number      WRONG
+    //
+    // The reference gives 1 for every one of them (10^k mod 3 is 1 for all k), and so do the
+    // other clients, whose remainders are exact: libmpdec's `mpd_qrem` in Python and C++,
+    // apd's `Rem` in Go, decimal.js's `mod` in the unbounded context in JS, and `BigInteger %`
+    // in C#. The earlier test only reached 1E40 - 41 digits - so it never crossed the
+    // threshold.
+    //
+    // Integer arithmetic makes it exact: align both coefficients on the finer scale and take
+    // `A % B`, which truncates toward zero and so carries the dividend's sign, exactly as
+    // BigDecimal.remainder and SQL MOD do.
+    if magnitude_lt(&a, &b) {
+        // |a| < |b| means an integral quotient of zero and a remainder of `a` itself. Settled
+        // on magnitudes, so no power of ten is built - which is what keeps
+        // `1e-2147483647 mod 1e2147483647` free, the case the aligned frame would refuse.
+        return Ok(decimal_value(a));
+    }
+    let (a_int, a_scale) = a.clone().into_bigint_and_exponent();
+    let (b_int, b_scale) = b.clone().into_bigint_and_exponent();
+    let scale = a_scale.max(b_scale);
+    // Aligning builds 10^|a_scale - b_scale|, so that gap has to be bounded too - the quotient
+    // estimate above does not imply it. The |a| < |b| shortcut above has already taken the
+    // far-apart cases that matter in practice.
+    let gap = a_scale.abs_diff(b_scale);
+    if gap > MAX_DECIMAL_DIGITS {
+        return Err(err(format!(
+            "decimals.mod: aligning the operands would need {gap} digits"
+        )));
+    }
+    let pow = |n: u64| BigInt::from(10u8).pow(u32::try_from(n).unwrap_or(u32::MAX));
+    let a_aligned = if scale > a_scale {
+        a_int * pow((scale - a_scale) as u64)
+    } else {
+        a_int
+    };
+    let b_aligned = if scale > b_scale {
+        b_int * pow((scale - b_scale) as u64)
+    } else {
+        b_int
+    };
+    Ok(decimal_value(BigDecimal::new(a_aligned % b_aligned, scale)))
 }
 
 // ---- min / max ----
@@ -246,15 +360,19 @@ fn decimals_trunc(Arguments(args): Arguments) -> Result<Value, ExecutionError> {
     }
     Ok(decimal_value(d.with_scale_round(scale, RoundingMode::Down)))
 }
+// floor/ceil target scale 0 without going through `decimals_round`, so they carry the width
+// bound separately. Scale 0 is a *widening* whenever the value's own scale is negative - a
+// large positive exponent - and `floor(decimal("1e20000000"))` is then a 20000001-digit
+// coefficient, reachable from a rule that names no scale at all.
 fn decimals_floor(a: Value) -> Result<Value, ExecutionError> {
-    Ok(decimal_value(
-        to_decimal(&a)?.with_scale_round(0, RoundingMode::Floor),
-    ))
+    let d = to_decimal(&a)?;
+    check_scale_width(&d, 0, "decimals.floor")?;
+    Ok(decimal_value(d.with_scale_round(0, RoundingMode::Floor)))
 }
 fn decimals_ceil(a: Value) -> Result<Value, ExecutionError> {
-    Ok(decimal_value(
-        to_decimal(&a)?.with_scale_round(0, RoundingMode::Ceiling),
-    ))
+    let d = to_decimal(&a)?;
+    check_scale_width(&d, 0, "decimals.ceil")?;
+    Ok(decimal_value(d.with_scale_round(0, RoundingMode::Ceiling)))
 }
 
 // ---- stdlib conversions extended to Decimal ----
@@ -296,6 +414,47 @@ fn plain_decimal_string(d: &BigDecimal) -> Result<String, ExecutionError> {
     Ok(d.to_plain_string())
 }
 
+/// Rejects two operands whose aligned frame would exceed [`MAX_DECIMAL_DIGITS`].
+///
+/// Addition and subtraction expand the narrower operand into the wider one's frame, so the
+/// frame carries the smaller scale's exponent and spans both magnitudes. No exemption for a
+/// zero operand: aligning a zero at an extreme scale with `1` still expands the *one* into the
+/// zero's scale.
+fn check_alignment_width(
+    a: &BigDecimal,
+    b: &BigDecimal,
+    function_name: &str,
+) -> Result<(), ExecutionError> {
+    let scale = a.fractional_digit_count().max(b.fractional_digit_count());
+    // A zero operand contributes one digit whatever the distance: expanding a zero appends
+    // none. That decides several cases outright, because alignment expands only the operand
+    // whose scale is coarser. Measured on libmpdec, with the JDK agreeing on every row:
+    // `0E+2e9 + 0E-2e9`, `0E+2e9 + 1` and `0E+2e9 mod 1E-2e9` are free at one digit, while
+    // `0E-2e9 + 1` is 1601 MB and 2e9+1 digits (`ArithmeticException` there). Only the last
+    // must be refused, and the difference is purely which operand expands.
+    let widest = [a, b]
+        .iter()
+        .map(|d| {
+            if is_zero(d) {
+                return 1;
+            }
+            d.digits().saturating_add(
+                scale
+                    .saturating_sub(d.fractional_digit_count())
+                    .unsigned_abs(),
+            )
+        })
+        .max()
+        .unwrap_or(0);
+    let length = widest.saturating_add(1);
+    if length > MAX_DECIMAL_DIGITS {
+        return Err(err(format!(
+            "{function_name}: aligning the operands would need {length} digits"
+        )));
+    }
+    Ok(())
+}
+
 /// Rejects a target scale whose zero-padded result would exceed [`MAX_DECIMAL_DIGITS`].
 ///
 /// Only widening needs checking: rounding to a coarser scale drops digits. `decimals.trunc`
@@ -306,6 +465,15 @@ fn check_scale_width(
     scale: i64,
     function_name: &str,
 ) -> Result<(), ExecutionError> {
+    // A zero is one digit at any scale, so rescaling it expands nothing - and `bigdecimal`
+    // agrees in fact, not just in principle: measured, `zero.with_scale_round(2147483647)`
+    // takes 84 ns and yields one digit. Without this the estimate read the target scale and
+    // refused `decimals.round(decimal("0"), 2147483647)`, which the reference holds at
+    // precision 1 (`new BigDecimal(BigInteger.ZERO, 2147483647)`) and every other client in
+    // the family accepts.
+    if is_zero(d) {
+        return Ok(());
+    }
     let current = d.fractional_digit_count();
     if scale <= current {
         return Ok(());
@@ -375,6 +543,15 @@ mod tests {
 
     fn eval_bool(expr: &str) -> bool {
         matches!(eval(expr), Value::Bool(true))
+    }
+
+    /// The error text, for the cases where refusing is the behaviour under test.
+    fn eval_err(expr: &str) -> String {
+        let program = Program::compile(expr).expect("compile");
+        match program.execute(&default_context()) {
+            Ok(v) => panic!("expected an error, got {v:?}"),
+            Err(e) => e.to_string(),
+        }
     }
 
     #[test]
@@ -505,6 +682,218 @@ mod tests {
                 .execute(&default_context())
                 .is_err()
         );
+    }
+
+    /// Alignment is the arithmetic width risk, and the only one: `add`/`sub` expand the
+    /// narrower operand into the wider one's frame, `mod` has to produce the integral quotient
+    /// first, and `mul`/`div`/comparison do neither. Measured on libmpdec in the Python
+    /// sibling, peak RSS on operands 1e2147483647 and 3: `mul`, `div`, `<`, `==`, `min`, `neg`,
+    /// `abs` all 13 MB; `add` 1738 MB, `sub` 1738 MB, `remainder` 1733 MB. `bigdecimal` has no
+    /// cap of its own, and an allocation failure in Rust aborts the process rather than
+    /// unwinding, so the bound is what keeps the caller-visible behaviour a failed rule.
+    #[test]
+    fn alignment_width_errors_instead_of_allocating() {
+        for expr in [
+            "decimals.add(decimal(\"1e2000000000\"), decimal(\"1\"))",
+            "decimals.sub(decimal(\"1e2000000000\"), decimal(\"1\"))",
+            "decimals.add(decimal(\"1e-2000000000\"), decimal(\"1\"))",
+            "decimals.add(decimal(\"1e2000000000\"), decimal(\"1e-2000000000\"))",
+            "decimals.mod(decimal(\"1e2000000000\"), decimal(\"3\"))",
+            // The other direction: a tiny dividend against a divisor so fine that the integral
+            // quotient spans the whole gap.
+            "decimals.mod(decimal(\"1.5\"), decimal(\"1e-2000000000\"))",
+        ] {
+            assert!(
+                Program::compile(expr)
+                    .unwrap()
+                    .execute(&default_context())
+                    .is_err(),
+                "{expr} must be refused on width"
+            );
+        }
+    }
+
+    /// `decimals.mod` must be **exact**, at any width.
+    ///
+    /// It was computed as `(&a / &b).with_scale_round(0, Down)` and `bigdecimal`'s division
+    /// rounds to its default 100-digit precision, so past 100 digits the integral quotient was
+    /// approximate and the remainder silently wrong:
+    ///
+    ///   1e99    mod 3 -> 1                       (correct)
+    ///   1e100   mod 3 -> 1                       (correct)
+    ///   1e101   mod 3 -> 10                      WRONG
+    ///   1e200   mod 3 -> 1 and 99 zeros          WRONG
+    ///   1e10000 mod 3 -> a 10000-digit number    WRONG
+    ///
+    /// Measured on the JDK, `new BigDecimal("1e" + k).remainder(new BigDecimal("3"))` is 1 for
+    /// every k - 10^k mod 3 is 1 for all k - and the other five clients are exact too. The
+    /// previous test stopped at 1E40, 41 digits, so it never crossed the threshold; these
+    /// straddle it deliberately.
+    /// `bigdecimal` accepts a scale the quotient-width estimate cannot hold. The JVM caps a
+    /// scale at int32 - `new BigDecimal("10e9223372036854775807")` raises "Too many nonzero
+    /// exponent digits" - while it parses here with scale -i64::MAX, and the adjusted-exponent
+    /// subtraction overflowed: a panic in debug, a wrapped estimate in release. Saturating
+    /// hands the case to the width logic, which answers both directions correctly.
+    #[test]
+    fn an_extreme_parsed_exponent_does_not_overflow_the_quotient_estimate() {
+        let huge = "10e9223372036854775807";
+        // |a| < |b|, so the remainder is the dividend - the magnitude shortcut reaches it only
+        // because the estimate no longer overflows on the way there.
+        assert_eq!(
+            eval_str(&format!(
+                "string(decimals.mod(decimal(\"1\"), decimal(\"{huge}\")))"
+            )),
+            "1"
+        );
+        // The reverse genuinely needs an astronomical quotient, and is refused as one.
+        let err = eval_err(&format!(
+            "decimals.mod(decimal(\"{huge}\"), decimal(\"1\"))"
+        ));
+        assert!(
+            err.contains("integral quotient would need"),
+            "unexpected error: {err}"
+        );
+        // The mirrored sign of the exponent does not overflow either.
+        let tiny = "10e-9223372036854775807";
+        let err = eval_err(&format!(
+            "decimals.mod(decimal(\"1\"), decimal(\"{tiny}\"))"
+        ));
+        assert!(err.contains("would need"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn mod_is_exact_past_the_division_precision() {
+        for k in [1u32, 10, 50, 99, 100, 101, 200, 1000, 10000] {
+            let expr = format!("string(decimals.mod(decimal(\"1e{k}\"), decimal(\"3\"))) == \"1\"");
+            assert_eq!(eval_bool(&expr), true, "1e{k} mod 3 must be exactly 1");
+        }
+        // A few more where the quotient is wide and the answer is not 1.
+        for (expr, want) in [
+            (
+                "string(decimals.mod(decimal(\"1e200\"), decimal(\"7\")))",
+                "2",
+            ),
+            (
+                "string(decimals.mod(decimal(\"1e500\"), decimal(\"9\")))",
+                "1",
+            ),
+            (
+                "string(decimals.mod(decimal(\"12.34\"), decimal(\"1.5\")))",
+                "0.34",
+            ),
+            (
+                "string(decimals.mod(decimal(\"-1e101\"), decimal(\"3\")))",
+                "-1",
+            ),
+        ] {
+            assert_eq!(eval_str(expr), want, "{expr}");
+        }
+    }
+
+    /// Expanding a *zero* is free, so the aligned frame is set by the operands that actually
+    /// have digits - several of these turn on which operand expands rather than on how far
+    /// apart the scales are. A zero also keeps whatever scale it was built with, so its
+    /// adjusted exponent says nothing about the cost, which is what an earlier estimate got
+    /// wrong. Every row measured on libmpdec and on the JDK, which agree:
+    ///
+    ///   0E+2e9 + 0E-2e9      free, 1 digit           precision 1
+    ///   0E+2e9 + 1           free, 1 digit           precision 1, scale 0 (the zero expands)
+    ///   0E+2e9 mod 1E-2e9    free, 1 digit           precision 1
+    ///   1 + 0E-2e9           1601 MB, 2e9+1 digits   ArithmeticException (the *one* expands)
+
+    #[test]
+    fn expanding_a_zero_operand_is_free() {
+        for expr in [
+            "decimals.eq(decimals.add(decimal(\"0E+2000000000\"), decimal(\"0E-2000000000\")), \
+             decimal(\"0\"))",
+            "decimals.eq(decimals.sub(decimal(\"0E+2000000000\"), decimal(\"0E-2000000000\")), \
+             decimal(\"0\"))",
+            "decimals.eq(decimals.add(decimal(\"0E+2000000000\"), decimal(\"1\")), decimal(\"1\"))",
+            "decimals.eq(decimals.mod(decimal(\"0E+2000000000\"), decimal(\"1E-2000000000\")), \
+             decimal(\"0\"))",
+            "decimals.eq(decimals.mod(decimal(\"0E-2000000000\"), decimal(\"1E+2000000000\")), \
+             decimal(\"0\"))",
+            "decimals.eq(decimals.mod(decimal(\"0\"), decimal(\"3\")), decimal(\"0\"))",
+        ] {
+            assert_eq!(eval_bool(expr), true, "{expr} must be free and answer");
+        }
+        // The row that must still be refused: here the *one* expands into the zero's scale, so
+        // a blanket zero exemption would have let it through.
+        assert!(
+            Program::compile("decimals.add(decimal(\"1\"), decimal(\"0E-2000000000\"))")
+                .unwrap()
+                .execute(&default_context())
+                .is_err()
+        );
+    }
+
+    /// The must-fail twin. `mul` is unguarded at any width, comparison never aligns, and
+    /// alignment that stays narrow is accepted however extreme both operands are.
+    #[test]
+    fn the_cheap_operations_stay_unguarded() {
+        for expr in [
+            "decimals.eq(decimals.mul(decimal(\"1e2000000000\"), decimal(\"1e-2000000000\")), decimal(\"1\"))",
+            "decimals.lt(decimal(\"1e-2000000000\"), decimal(\"1e2000000000\"))",
+            "decimals.eq(decimals.sub(decimal(\"1e2000000000\"), decimal(\"1e2000000000\")), decimal(\"0\"))",
+            "decimals.eq(decimals.add(decimal(\"12.34\"), decimal(\"1.5\")), decimal(\"13.84\"))",
+            "decimals.eq(decimals.mod(decimal(\"1E40\"), decimal(\"3\")), decimal(\"1\"))",
+            // `mod` is bounded by its integral quotient, not by the aligned frame - so a
+            // dividend smaller than the divisor is free however far apart they are, and the
+            // result is the dividend itself. This is what a frame-based guard refused: the
+            // JVM gives precision 1 at scale 2000000000, and `bigdecimal` takes 68us.
+            "decimals.eq(decimals.mod(decimal(\"1e-2000000000\"), decimal(\"1e2000000000\")), \
+             decimal(\"1e-2000000000\"))",
+            // And operands whose magnitudes are close, however extreme both are: the quotient
+            // spans only the difference.
+            "decimals.eq(decimals.mod(decimal(\"1e2000000000\"), decimal(\"1e1999999999\")), \
+             decimal(\"0\"))",
+        ] {
+            assert_eq!(
+                eval_bool(expr),
+                true,
+                "{expr} must stay unbounded and answer"
+            );
+        }
+    }
+
+    /// `floor`/`ceil` target scale 0 without going through `decimals_round`, so they carry the
+    /// bound separately - and scale 0 is a *widening* whenever the value's own scale is
+    /// negative. Coarsening stays free: rounding to a coarser scale drops digits rather than
+    /// adding them, which is why `check_scale_width` early-returns there.
+    #[test]
+    fn the_one_argument_rounding_family_is_bounded_too() {
+        for expr in [
+            "decimals.round(decimal(\"1e20000000\"))",
+            "decimals.floor(decimal(\"1e20000000\"))",
+            "decimals.ceil(decimal(\"1e20000000\"))",
+        ] {
+            assert!(
+                Program::compile(expr)
+                    .unwrap()
+                    .execute(&default_context())
+                    .is_err(),
+                "{expr} must be refused on width"
+            );
+        }
+        // Coarsening is free at any distance, so these answer.
+        for expr in [
+            "decimals.eq(decimals.round(decimal(\"1e-20000000\")), decimal(\"0\"))",
+            "decimals.eq(decimals.floor(decimal(\"1e-20000000\")), decimal(\"0\"))",
+            "decimals.eq(decimals.ceil(decimal(\"1e-20000000\")), decimal(\"1\"))",
+            "decimals.eq(decimals.trunc(decimal(\"1e-20000000\")), decimal(\"0\"))",
+            "decimals.eq(decimals.round(decimal(\"2.5\")), decimal(\"3\"))",
+            // A zero rescales to any target for free - measured 84 ns at 2^31 in `bigdecimal`,
+            // and the reference holds it at precision 1. The width estimate read the target
+            // scale and refused these.
+            "decimals.eq(decimals.round(decimal(\"0\"), 2147483647), decimal(\"0\"))",
+            "decimals.eq(decimals.round(decimal(\"0\"), 20000000), decimal(\"0\"))",
+            "decimals.eq(decimals.trunc(decimal(\"0\"), 2147483647), decimal(\"0\"))",
+            "decimals.eq(decimals.floor(decimal(b\"\", 2147483647)), decimal(\"0\"))",
+            "decimals.eq(decimals.ceil(decimal(b\"\", 2147483647)), decimal(\"0\"))",
+            "decimals.eq(decimals.floor(decimal(\"-1.5\")), decimal(\"-2\"))",
+        ] {
+            assert_eq!(eval_bool(expr), true, "{expr} must answer");
+        }
     }
 
     /// A scale outside i32 range must error rather than silently narrow. CEL int is i64, but
