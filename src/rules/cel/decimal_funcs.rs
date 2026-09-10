@@ -211,8 +211,20 @@ fn apply_preferred_scale_if_exact(
     }
     let minimal = value.normalized();
     // `normalized()` reports a *negative* scale where one applies (500 is scale -2), which is
-    // what makes this max correct for a negative preferred scale rather than clamping at 0.
-    let target = preferred_scale.max(minimal.fractional_digit_count());
+    // what makes the max below correct for a negative preferred scale rather than clamping it
+    // at 0.
+    let minimal_scale = minimal.fractional_digit_count();
+    // The preferred scale does not override the context precision. The reference pads toward
+    // it only while the result still fits in `mc.precision` significant digits, and stops
+    // short otherwise. Measured: `1.<40 zeros> / 1` is scale 37 there, not the preferred 40,
+    // because 38 digits is the ceiling; `1.<100 zeros> / 8` is scale 38, because 0.125 already
+    // spends 3 of the 38 on digits that are not padding. Without this the padding ran to the
+    // raw preferred scale - 101 significant digits for `1.<100 zeros> / 1`.
+    let headroom = i64::try_from(DIV_PRECISION).unwrap_or(i64::MAX)
+        - i64::try_from(minimal.digits()).unwrap_or(i64::MAX);
+    let target = preferred_scale
+        .min(minimal_scale.saturating_add(headroom))
+        .max(minimal_scale);
     check_scale_width(&minimal, target, function_name)?;
     Ok(minimal.with_scale(target))
 }
@@ -1179,6 +1191,67 @@ mod tests {
             let got = scale_of(decimals_sqrt(dec(a)).expect("sqrt"));
             assert_eq!(got, want, "sqrt({a})");
         }
+    }
+
+    /// The preferred scale does not override the 38-digit context precision. The reference
+    /// pads toward the preferred scale only while the result still fits in `mc.precision`
+    /// significant digits and stops short otherwise, so the target is
+    /// `min(preferred, minimal_scale + (38 - minimal_precision))`, floored at the minimal
+    /// scale. Without the cap the padding ran to the raw preferred scale - 101 significant
+    /// digits for `1.<100 zeros> / 1`, and 51 for `sqrt(1.<100 zeros>)`.
+    ///
+    /// Note the cap is on *precision*, not on scale: 0.5 spends one digit before the padding
+    /// starts and so reaches scale 38, where 1 reaches only 37.
+    #[test]
+    fn the_preferred_scale_cannot_exceed_the_context_precision() {
+        let z = |n: usize| "0".repeat(n);
+        for (dividend_zeros, divisor, want) in [
+            // 37 zeros is exactly 38 significant digits: the last reachable preferred scale.
+            (37usize, "1", format!("1.{}", z(37))),
+            // 40 and 100 would need 41 and 101 digits; both stop at 37.
+            (40, "1", format!("1.{}", z(37))),
+            (100, "1", format!("1.{}", z(37))),
+            (100, "2", format!("0.5{}", z(37))),
+            (100, "8", format!("0.125{}", z(35))),
+        ] {
+            let expr = format!(
+                "string(decimals.div(decimal(\"1.{}\"), decimal(\"{divisor}\")))",
+                z(dividend_zeros)
+            );
+            assert_eq!(
+                eval_str(&expr),
+                want,
+                "1.<{dividend_zeros} zeros> / {divisor}"
+            );
+        }
+        // sqrt: preferred 20 fits, 37 is exactly the ceiling, 50 does not fit.
+        for (radicand_zeros, want) in [
+            (40usize, format!("1.{}", z(20))),
+            (74, format!("1.{}", z(37))),
+            (100, format!("1.{}", z(37))),
+        ] {
+            let expr = format!(
+                "string(decimals.sqrt(decimal(\"1.{}\")))",
+                z(radicand_zeros)
+            );
+            assert_eq!(eval_str(&expr), want, "sqrt(1.<{radicand_zeros} zeros>)");
+        }
+    }
+
+    /// A zero is exempt from that cap: it is one digit at any scale, so it keeps the full
+    /// preferred scale. Measured on the reference: `0.<100 zeros> / 1` is scale 100 at
+    /// precision 1.
+    #[test]
+    fn a_zero_is_exempt_from_the_precision_cap() {
+        let zero = format!("0.{}", "0".repeat(100));
+        assert_eq!(
+            scale_of(decimals_div(dec(&zero), dec("1")).expect("div")),
+            100
+        );
+        assert_eq!(
+            scale_of(decimals_div(dec(&zero), dec("3.0")).expect("div")),
+            99
+        );
     }
 
     /// ...and that scale saturates into the int32 range rather than escaping it, which is the
