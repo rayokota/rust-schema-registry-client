@@ -405,6 +405,16 @@ fn decimal_to_string(Arguments(args): Arguments) -> Result<Value, ExecutionError
 const MAX_DECIMAL_DIGITS: u64 = 1 << 20;
 
 fn plain_decimal_string(d: &BigDecimal) -> Result<String, ExecutionError> {
+    // A zero at a negative scale is "0", not "0" followed by that many zeros.
+    // `to_plain_string` pads a zero out like any other coefficient, so `string(decimal("0E+3"))`
+    // gave "0000". `BigDecimal.toPlainString` has this case in exactly this branch
+    // ("if (this.scale < 0) { if (signum() == 0) return "0"; ... }") and only here: measured on
+    // the JVM, a zero at a *positive* scale keeps its fractional zeros ("0.00" stays "0.00")
+    // and a non-zero coefficient still pads (123 at scale -1 is "1230"). Checked before the
+    // width bound below, since such a zero is cheap to render however extreme its scale.
+    if is_zero(d) && d.fractional_digit_count() < 0 {
+        return Ok("0".to_string());
+    }
     let length = d
         .digits()
         .saturating_add(d.fractional_digit_count().unsigned_abs());
@@ -761,6 +771,29 @@ mod tests {
         assert!(err.contains("would need"), "unexpected error: {err}");
     }
 
+    /// A zero at a negative scale renders as "0", not as "0" followed by that many zeros.
+    /// `to_plain_string` pads a zero out like any other coefficient, so `string(decimal("0E+3"))`
+    /// answered "0000" where the reference, Python, JS and C++ all give "0" - measured. Go and
+    /// C# had the same defect. `BigDecimal.toPlainString` special-cases zero in the
+    /// negative-scale branch and only there, so the neighbours must keep their zeros.
+    #[test]
+    fn a_zero_at_a_negative_scale_renders_as_zero() {
+        for (expr, want) in [
+            // The fix.
+            (r#"string(decimal("0E+3"))"#, "0"),
+            (r#"string(decimal("0E+1"))"#, "0"),
+            (r#"string(decimals.round(decimal("1.23"), -3))"#, "0"),
+            // The neighbours, which must not change: a zero at a *positive* scale keeps its
+            // fractional zeros, and a non-zero coefficient still pads.
+            (r#"string(decimal("0.00"))"#, "0.00"),
+            (r#"string(decimal("0"))"#, "0"),
+            (r#"string(decimal("1E+1"))"#, "10"),
+            (r#"string(decimals.round(decimal("1.23"), 2))"#, "1.23"),
+        ] {
+            assert_eq!(eval_str(expr), want, "{expr}");
+        }
+    }
+
     #[test]
     fn mod_is_exact_past_the_division_precision() {
         for k in [1u32, 10, 50, 99, 100, 101, 200, 1000, 10000] {
@@ -1041,5 +1074,3 @@ mod tests {
         matches!(program.execute(&ctx).expect("execute"), Value::Bool(true))
     }
 }
-
-
