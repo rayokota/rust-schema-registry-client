@@ -154,22 +154,55 @@ fn decimals_div(a: Value, b: Value) -> Result<Value, ExecutionError> {
     }
     let prec = NonZeroU64::new(DIV_PRECISION).unwrap();
     let quotient = (&a / &b).with_precision_round(prec, RoundingMode::HalfUp);
-    Ok(decimal_value(strip_if_exact(quotient, |q| {
-        (q * &b).cmp(&a)
-    })))
+    let preferred = a
+        .fractional_digit_count()
+        .saturating_sub(b.fractional_digit_count());
+    Ok(decimal_value(apply_preferred_scale_if_exact(
+        quotient,
+        preferred,
+        |q| (q * &b).cmp(&a),
+        "decimals.div",
+    )?))
 }
 
-/// `with_precision_round` pads an exact/short result out to 38 significant digits, but Java's
-/// `divide`/`sqrt` with a `MathContext` (and Python/JS) return the natural value (`1/8` -> `0.125`,
-/// `sqrt(144)` -> `12`). Strip that padding only when the result is exact: an *inexact* 38-digit
-/// result can legitimately end in a significant `0` (e.g. `1/99`) that must be kept. `is_exact`
+/// `with_precision_round` pads an exact/short result out to 38 significant digits, which the
+/// reference's `divide`/`sqrt` with a `MathContext` do not. What they return instead is the
+/// result at its **preferred** scale: `dividend.scale - divisor.scale` for divide, and
+/// `scale / 2` truncated toward zero for sqrt. Trailing zeros are stripped down to that scale
+/// and padded back up to it, but never stripped below it.
+///
+/// This used to call `normalized()`, which strips every trailing zero unconditionally - the
+/// opposite end of the same range. It is right whenever the preferred scale happens to be the
+/// minimal one (`1/8` -> `0.125`, `sqrt(144)` -> `12`, and every pair of equal operand scales,
+/// since those give a preferred scale of 0), and wrong otherwise: `6.0/3` answered `2` against
+/// the reference's `2.0`, and `sqrt(4.00)` answered `2` against `2.0`.
+///
+/// Applied only when the result is exact. An *inexact* 38-digit result can legitimately end in
+/// a significant `0` - `1/99` is `0.010101…010` - so it is returned untouched. `is_exact`
 /// reconstructs the input from the rounded result and reports whether it matches numerically.
-fn strip_if_exact(value: BigDecimal, is_exact: impl Fn(&BigDecimal) -> Ordering) -> BigDecimal {
-    if is_exact(&value) == Ordering::Equal {
-        value.normalized()
-    } else {
-        value
+fn apply_preferred_scale_if_exact(
+    value: BigDecimal,
+    preferred_scale: i64,
+    is_exact: impl Fn(&BigDecimal) -> Ordering,
+    function_name: &str,
+) -> Result<BigDecimal, ExecutionError> {
+    if is_exact(&value) != Ordering::Equal {
+        return Ok(value);
     }
+    if is_zero(&value) {
+        // A zero takes the preferred scale outright, in *both* directions, because the
+        // reference returns `zeroValueOf(preferredScale)` for it. `normalized()` puts every
+        // zero at scale 0, so the negative-scale direction was unreachable: `0 / 3.00` is
+        // scale -2 there. Invisible in the plain form - each of these writes as "0" - but a
+        // different `scale` field on the wire.
+        return Ok(BigDecimal::new(BigInt::from(0), preferred_scale));
+    }
+    let minimal = value.normalized();
+    // `normalized()` reports a *negative* scale where one applies (500 is scale -2), which is
+    // what makes this max correct for a negative preferred scale rather than clamping at 0.
+    let target = preferred_scale.max(minimal.fractional_digit_count());
+    check_scale_width(&minimal, target, function_name)?;
+    Ok(minimal.with_scale(target))
 }
 fn decimals_mod(a: Value, b: Value) -> Result<Value, ExecutionError> {
     // Java BigDecimal.remainder / SQL MOD: a - trunc(a / b) * b.
@@ -304,13 +337,20 @@ fn decimals_sqrt(a: Value) -> Result<Value, ExecutionError> {
     // Same 38-digit HALF_UP context as division; bigdecimal's bare `sqrt` would otherwise use a
     // 100-digit default and diverge from Python/JS on `string(sqrt(x))`.
     let prec = NonZeroU64::new(DIV_PRECISION).unwrap();
-    // As in `div`, strip padding only for a perfect square (`sqrt(144)` -> `12`, not `12.000...`).
-    d.sqrt()
-        .map(|r| {
-            let rounded = r.with_precision_round(prec, RoundingMode::HalfUp);
-            decimal_value(strip_if_exact(rounded, |root| (root * root).cmp(&d)))
-        })
-        .ok_or_else(|| err("decimals.sqrt: square root of negative number"))
+    // As in `div`, the padding is replaced by the preferred scale for an exact root. Integer
+    // division truncates toward zero in Rust, which is what the reference's `scale / 2` does:
+    // the scale -3 of `250E+3` halves to -1, not down to the floor's -2.
+    let preferred = d.fractional_digit_count() / 2;
+    let root = d
+        .sqrt()
+        .ok_or_else(|| err("decimals.sqrt: square root of negative number"))?
+        .with_precision_round(prec, RoundingMode::HalfUp);
+    Ok(decimal_value(apply_preferred_scale_if_exact(
+        root,
+        preferred,
+        |root| (root * root).cmp(&d),
+        "decimals.sqrt",
+    )?))
 }
 
 // ---- rounding (round/trunc take an optional scale; floor/ceil are scale 0) ----
@@ -543,8 +583,11 @@ pub fn add_decimal_functions(ctx: &mut Context) {
 
 #[cfg(test)]
 mod tests {
+    use super::{CelDecimal, decimal_value, decimals_div, decimals_sqrt};
     use crate::rules::cel::cel_lib::default_context;
+    use bigdecimal::BigDecimal;
     use cel::{Program, Value};
+    use std::str::FromStr;
 
     fn eval(expr: &str) -> Value {
         let program = Program::compile(expr).expect("compile");
@@ -659,8 +702,9 @@ mod tests {
             eval_str("string(decimals.div(decimal(\"10\"), decimal(\"3\")))"),
             "3.3333333333333333333333333333333333333"
         );
-        // An exact div/sqrt is the natural value, not padded to 38 digits (Java `divide`/`sqrt`
-        // with a MathContext, and Python/JS, all leave `1/8` as `0.125` and `sqrt(144)` as `12`).
+        // An exact div/sqrt is not padded to 38 digits; it carries the reference's preferred
+        // scale. For each of these that scale *is* the minimal one, so they read as "natural":
+        // `1/8` has a preferred scale of 0 and a minimal 3, `100/1` and `sqrt(144)` both 0.
         assert_eq!(
             eval_str("string(decimals.div(decimal(\"1\"), decimal(\"8\")))"),
             "0.125"
@@ -1023,6 +1067,105 @@ mod tests {
         match eval(expr) {
             Value::String(s) => s.to_string(),
             other => panic!("expected string, got {other:?}"),
+        }
+    }
+
+    /// The scale of a decimal-valued CEL result, read off the binding's own output.
+    ///
+    /// The plain form hides it: a zero writes as "0" at every non-positive scale and 500 as
+    /// "500" whether its scale is -2 or -1. The scale is a field of the
+    /// `confluent.type.Decimal` encoding, so it is what has to be asserted. This client's
+    /// Decimal is a CEL *opaque* rather than a message, so a rule cannot select `.scale` off
+    /// it the way the C++ and JS clients can - hence the downcast.
+    fn scale_of(v: Value) -> i64 {
+        match v {
+            Value::Opaque(o) => o
+                .downcast_ref::<CelDecimal>()
+                .expect("a Decimal")
+                .0
+                .fractional_digit_count(),
+            other => panic!("expected a Decimal, got {other:?}"),
+        }
+    }
+
+    fn dec(lit: &str) -> Value {
+        decimal_value(BigDecimal::from_str(lit).expect("a decimal literal"))
+    }
+
+    /// An exact div/sqrt result carries the reference's *preferred* scale rather than the
+    /// result's own minimal scale: `dividend.scale - divisor.scale` for divide, `scale / 2`
+    /// truncated toward zero for sqrt. Trailing zeros are stripped down to it and padded back
+    /// up to it, never stripped below.
+    ///
+    /// `normalized()` used to be called here instead, which strips every trailing zero. That
+    /// agrees with the reference whenever the preferred scale happens to be the minimal one -
+    /// including for every pair of *equal* operand scales, whose preferred scale is 0, which
+    /// is why `10.0/2.0` -> "5" looked like evidence for it. Mismatched scales separate them.
+    #[test]
+    fn exact_div_and_sqrt_carry_the_preferred_scale() {
+        for (a, b, want) in [
+            ("10.0", "2.0", "5"),
+            ("10.0", "2", "5.0"),
+            ("6.0", "3", "2.0"),
+            ("10.00", "2", "5.00"),
+            ("1.000", "0.1", "10.00"),
+            ("-6.0", "3", "-2.0"),
+            ("6.0", "-3", "-2.0"),
+            // ...but never below the exact quotient's own scale: 10/4 is 2.5 at a preferred 0.
+            ("10", "4", "2.5"),
+            ("100.0", "0.5", "200"),
+            ("1000", "10", "100"),
+        ] {
+            let expr = format!("string(decimals.div(decimal(\"{a}\"), decimal(\"{b}\")))");
+            assert_eq!(eval_str(&expr), want, "{expr}");
+        }
+        for (a, want) in [
+            ("4.00", "2.0"),
+            ("100.0000", "10.00"),
+            ("0.0001", "0.01"),
+            // Odd scale: 1 halves to 0 and 3 to 1. Before the fix these came back stripped -
+            // "4" for sqrt(16.000), where the reference gives "4.0".
+            ("9.0", "3"),
+            ("400.0", "20"),
+            ("16.000", "4.0"),
+        ] {
+            let expr = format!("string(decimals.sqrt(decimal(\"{a}\")))");
+            assert_eq!(eval_str(&expr), want, "{expr}");
+        }
+    }
+
+    /// The scale itself, for the cases the plain form above cannot distinguish.
+    #[test]
+    fn the_preferred_scale_is_the_scale_not_the_rendering() {
+        // A zero takes the preferred scale outright, in *both* directions, because the
+        // reference returns `zeroValueOf(preferredScale)`. `normalized()` puts every zero at
+        // scale 0, so the negative-scale direction was unreachable.
+        for (a, b, want) in [
+            ("0.00", "3", 2),
+            ("0.000", "3", 3),
+            ("0", "3.00", -2),
+            ("0.00", "3.0000", -2),
+            ("100.0", "0.5", 0),
+            ("100", "1E+2", 2),
+            ("6.0", "3", 1),
+        ] {
+            let got = scale_of(decimals_div(dec(a), dec(b)).expect("div"));
+            assert_eq!(got, want, "div({a}, {b})");
+        }
+        for (a, want) in [
+            ("0", 0),
+            ("0.0", 0),
+            ("0.00", 1),
+            ("0.000", 1),
+            ("9.0", 0),
+            ("16.000", 1),
+            ("4E+2", -1),
+            ("1E+4", -2),
+            // Scale -3 halves toward zero to -1, not down to the floor's -2.
+            ("250E+3", -1),
+        ] {
+            let got = scale_of(decimals_sqrt(dec(a)).expect("sqrt"));
+            assert_eq!(got, want, "sqrt({a})");
         }
     }
 
