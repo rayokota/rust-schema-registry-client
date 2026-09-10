@@ -201,7 +201,18 @@ fn decimals_mod(a: Value, b: Value) -> Result<Value, ExecutionError> {
     // A zero dividend has a quotient of zero whatever the scales, and its adjusted exponent
     // says nothing useful - a zero keeps the scale it was built with, so `0E+2e9 mod 1E-2e9`
     // estimated 4e9 digits for a result that is just zero. The JDK returns 0 at precision 1.
-    let adjusted = |d: &BigDecimal| d.digits() as i64 - 1 - d.fractional_digit_count();
+    // Saturating, because `bigdecimal` accepts a scale this arithmetic cannot hold: the JVM caps
+    // a scale at int32 ("Too many nonzero exponent digits" past that), while `10e9223372036854775807`
+    // parses here with scale -i64::MAX, and subtracting it overflowed - a debug panic, or a
+    // wrapped estimate in release. Saturating leaves the decision to the width logic below, which
+    // is where it belongs: `1 mod 10e9223372036854775807` then estimates 1 digit and the
+    // magnitude shortcut returns the dividend, while the reverse refuses on quotient width.
+    let adjusted = |d: &BigDecimal| {
+        i64::try_from(d.digits())
+            .unwrap_or(i64::MAX)
+            .saturating_sub(1)
+            .saturating_sub(d.fractional_digit_count())
+    };
     let quotient_digits = if is_zero(&a) {
         1
     } else {
@@ -534,6 +545,15 @@ mod tests {
         matches!(eval(expr), Value::Bool(true))
     }
 
+    /// The error text, for the cases where refusing is the behaviour under test.
+    fn eval_err(expr: &str) -> String {
+        let program = Program::compile(expr).expect("compile");
+        match program.execute(&default_context()) {
+            Ok(v) => panic!("expected an error, got {v:?}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
     #[test]
     fn namespaced_comparison_dispatches() {
         assert!(eval_bool(
@@ -709,6 +729,38 @@ mod tests {
     /// every k - 10^k mod 3 is 1 for all k - and the other five clients are exact too. The
     /// previous test stopped at 1E40, 41 digits, so it never crossed the threshold; these
     /// straddle it deliberately.
+    /// `bigdecimal` accepts a scale the quotient-width estimate cannot hold. The JVM caps a
+    /// scale at int32 - `new BigDecimal("10e9223372036854775807")` raises "Too many nonzero
+    /// exponent digits" - while it parses here with scale -i64::MAX, and the adjusted-exponent
+    /// subtraction overflowed: a panic in debug, a wrapped estimate in release. Saturating
+    /// hands the case to the width logic, which answers both directions correctly.
+    #[test]
+    fn an_extreme_parsed_exponent_does_not_overflow_the_quotient_estimate() {
+        let huge = "10e9223372036854775807";
+        // |a| < |b|, so the remainder is the dividend - the magnitude shortcut reaches it only
+        // because the estimate no longer overflows on the way there.
+        assert_eq!(
+            eval_str(&format!(
+                "string(decimals.mod(decimal(\"1\"), decimal(\"{huge}\")))"
+            )),
+            "1"
+        );
+        // The reverse genuinely needs an astronomical quotient, and is refused as one.
+        let err = eval_err(&format!(
+            "decimals.mod(decimal(\"{huge}\"), decimal(\"1\"))"
+        ));
+        assert!(
+            err.contains("integral quotient would need"),
+            "unexpected error: {err}"
+        );
+        // The mirrored sign of the exponent does not overflow either.
+        let tiny = "10e-9223372036854775807";
+        let err = eval_err(&format!(
+            "decimals.mod(decimal(\"1\"), decimal(\"{tiny}\"))"
+        ));
+        assert!(err.contains("would need"), "unexpected error: {err}");
+    }
+
     #[test]
     fn mod_is_exact_past_the_division_precision() {
         for k in [1u32, 10, 50, 99, 100, 101, 200, 1000, 10000] {
