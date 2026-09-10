@@ -638,6 +638,7 @@ mod tests {
     ///   0E+2e9 + 1           free, 1 digit           precision 1, scale 0 (the zero expands)
     ///   0E+2e9 mod 1E-2e9    free, 1 digit           precision 1
     ///   1 + 0E-2e9           1601 MB, 2e9+1 digits   ArithmeticException (the *one* expands)
+
     #[test]
     fn expanding_a_zero_operand_is_free() {
         for expr in [

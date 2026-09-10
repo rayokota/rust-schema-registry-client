@@ -27,6 +27,7 @@ use prost_reflect::{DynamicMessage, FieldDescriptor, Kind, MessageDescriptor, Re
 
 use crate::rules::cel::decimal_funcs::{DECIMAL_TYPE_NAME, to_decimal};
 use crate::rules::cel::variant_funcs::{VARIANT_TYPE_NAME, to_variant};
+use crate::serdes::decimal_utils::decimal_parts;
 use crate::serdes::serde::SerdeError;
 
 const TIMESTAMP_TYPE_NAME: &str = "google.protobuf.Timestamp";
@@ -255,26 +256,31 @@ fn build_message(md: &MessageDescriptor, value: &Value) -> Result<DynamicMessage
         // scale and the Avro writer re-quantizes to it, a protobuf confluent.type.Decimal
         // carries its own scale field - so there is nothing to quantize against.
         let decimal = to_decimal(value).map_err(|e| SerdeError::Rule(e.to_string()))?;
-        let (unscaled, exponent) = decimal.into_bigint_and_exponent();
+        // Through decimal_parts, the single definition, rather than repeating the arithmetic
+        // here. This block had its own copy - so the coefficient-width guard lived on
+        // `to_proto_decimal`, which nothing outside its unit tests calls, while the path a
+        // *rule* takes had none. The reference's DecimalUtils.fromBigDecimal carries the digit
+        // count, so leaving precision at its default would also have an identity transform
+        // rewrite the field to 0. confluent.type.Decimal.precision is uint32.
+        let parts = decimal_parts(&decimal)?;
         let mut out = DynamicMessage::new(md.clone());
         set_named(
             &mut out,
             md,
             "value",
-            prost_reflect::Value::Bytes(unscaled.to_signed_bytes_be().into()),
+            prost_reflect::Value::Bytes(parts.value.into()),
         );
-        let scale = i32::try_from(exponent)
-            .map_err(|_| SerdeError::Rule(format!("decimal scale out of int range: {exponent}")))?;
-        set_named(&mut out, md, "scale", prost_reflect::Value::I32(scale));
-        // The reference DecimalUtils.fromBigDecimal carries the digit count, so leaving this at
-        // its default would have an identity transform rewrite the field's precision to 0.
-        // confluent.type.Decimal.precision is uint32.
-        let precision = u32::try_from(unscaled.magnitude().to_string().len()).unwrap_or(u32::MAX);
+        set_named(
+            &mut out,
+            md,
+            "scale",
+            prost_reflect::Value::I32(parts.scale),
+        );
         set_named(
             &mut out,
             md,
             "precision",
-            prost_reflect::Value::U32(precision),
+            prost_reflect::Value::U32(parts.precision),
         );
         return Ok(out);
     }
@@ -643,6 +649,56 @@ mod tests {
                     .map(|(k, v)| (Key::String(Arc::new(k.to_string())), v))
                     .collect::<HashMap<Key, Value>>(),
             ),
+        }
+    }
+
+    /// The coefficient-width guard has to sit on the path a *rule* takes.
+    ///
+    /// It was added to `serdes::decimal_utils::to_proto_decimal`, which turns out to have no
+    /// caller outside its own unit tests - `build_message` here carried a second copy of the
+    /// same arithmetic, unguarded. So a rule could emit a coefficient of any width and pay the
+    /// quadratic base-256 conversion the guard exists to prevent. The two now share
+    /// `decimal_parts`, and this exercises `write_back_value_type`, the production entry point.
+    ///
+    /// 4300 is CPython's `int_max_str_digits`, adopted across the family so every client agrees
+    /// on which decimals can be written; CEL's documented decimal precision is 38 digits.
+    #[test]
+    fn the_coefficient_guard_covers_the_rule_write_back_path() {
+        use bigdecimal::BigDecimal;
+        use std::str::FromStr;
+
+        let desc = crate::DESCRIPTOR_POOL
+            .get_message_by_name("confluent.type.Decimal")
+            .expect("decimal.proto is compiled into the descriptor pool");
+
+        // Past the ceiling: refused, and the error names the limit.
+        let wide = BigDecimal::from_str(&"9".repeat(5000)).unwrap();
+        let err = super::write_back_value_type(
+            &desc,
+            &crate::rules::cel::decimal_funcs::decimal_value(wide),
+        )
+        .expect("a Decimal descriptor is handled")
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("4300"),
+            "expected the 4300-digit limit in: {err}"
+        );
+
+        // Just inside it: written, with the digit count as precision.
+        for digits in [1usize, 38, 4300] {
+            let d = BigDecimal::from_str(&"9".repeat(digits)).unwrap();
+            let out = super::write_back_value_type(
+                &desc,
+                &crate::rules::cel::decimal_funcs::decimal_value(d),
+            )
+            .expect("handled")
+            .expect("should write");
+            let precision = out
+                .get_field_by_name("precision")
+                .expect("precision field")
+                .as_u32()
+                .expect("uint32");
+            assert_eq!(precision as usize, digits, "precision for {digits} digits");
         }
     }
 
