@@ -337,9 +337,21 @@ fn variant_as(a: &Value, b: &Value, null_on_error: bool) -> Result<Value, Execut
                 "nanos"
             };
             let raw = vv.get_long().map_err(conv)?;
-            from_epoch(raw, unit)
-                .map(Value::Timestamp)
-                .map_err(|e| err(format!("variants.as: {e}")))
+            // A variant timestamp spans the whole int64 range while a CEL timestamp is
+            // 0001-9999, so an out-of-range value is reachable from data. `from_epoch`
+            // already refuses it - every error it can return here is a range error, the
+            // unit being fixed by us - but the refusal has to go through `null_on_error`
+            // like a type mismatch: `variants.as` errors and names the range,
+            // `variants.tryAs` answers CEL null so a rule can guard. Propagating the error
+            // regardless made `tryAs` error too, leaving no way to handle such a value.
+            match from_epoch(raw, unit) {
+                Ok(ts) => Ok(Value::Timestamp(ts)),
+                Err(_) if null_on_error => Ok(Value::Null),
+                Err(_) => Err(err(format!(
+                    "variants.as: timestamp {raw} is outside \
+                     0001-01-01T00:00:00Z..9999-12-31T23:59:59.999999999Z"
+                ))),
+            }
         }),
         "bytes" => (vt == Type::Binary).then(|| {
             vv.get_binary()
@@ -528,6 +540,58 @@ mod tests {
                 eval_bool(expr, doc_string()),
                 expected,
                 "expr {expr} should be {expected}"
+            );
+        }
+    }
+
+    /// A variant timestamp spans the whole int64 range while a CEL timestamp is 0001-9999, so
+    /// an out-of-range value is reachable from data. `from_epoch` already refused it, but the
+    /// refusal escaped `variants.tryAs` as an error too, leaving a rule no way to handle such a
+    /// value. Routed through `null_on_error` now, matching the reference's split.
+    #[test]
+    fn variant_as_timestamp_is_range_checked() {
+        use crate::serdes::variant::VariantBuilder;
+
+        const MAX_MICROS: i64 = 253402300799 * 1_000_000 + 999_999;
+        const MIN_MICROS: i64 = -62135596800 * 1_000_000;
+
+        let bind = |micros: i64| {
+            let mut b = VariantBuilder::new();
+            b.append_timestamp_tz(micros).unwrap();
+            variant_value(b.build().unwrap())
+        };
+
+        for micros in [0i64, MAX_MICROS, MIN_MICROS] {
+            assert!(
+                eval_bool(
+                    r#"variants.as(this, "timestamp") == variants.as(this, "timestamp")"#,
+                    bind(micros)
+                ),
+                "{micros} should be in range"
+            );
+            // tryAs answers a timestamp, not null - otherwise the guard below proves nothing.
+            assert!(
+                !eval_bool(r#"variants.tryAs(this, "timestamp") == null"#, bind(micros)),
+                "{micros} tryAs should not be null"
+            );
+        }
+
+        for micros in [i64::MAX, i64::MIN, MAX_MICROS + 1_000_000] {
+            let program =
+                Program::compile(r#"variants.as(this, "timestamp") != null"#).expect("compile");
+            let mut ctx = default_context();
+            ctx.add_variable_from_value("this", bind(micros));
+            let err = program
+                .execute(&ctx)
+                .expect_err("should refuse")
+                .to_string();
+            assert!(
+                err.contains("is outside 0001-01-01T00:00:00Z"),
+                "should name the range, got {err}"
+            );
+            assert!(
+                eval_bool(r#"variants.tryAs(this, "timestamp") == null"#, bind(micros)),
+                "{micros} tryAs should answer null"
             );
         }
     }
