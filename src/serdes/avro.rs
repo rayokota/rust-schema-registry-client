@@ -769,7 +769,19 @@ async fn transform(
                 if ctx.rule.kind == Some(Kind::Condition) {
                     return Ok(result);
                 }
-                return Ok(Value::Union(*index, Box::new(result)));
+                // Which branch the result belongs to follows from the value, not from the
+                // branch it arrived on - the reference keeps no branch at all and resolves it
+                // from the datum. The writer validates against `variants()[index]`, so a rule
+                // that changes the value's type is rejected under the old index. Keep the
+                // arriving branch while it still accepts the result, so two structurally
+                // identical variants are never swapped.
+                let index = match union.variants().get(*index as usize) {
+                    Some(variant) if result.validate(variant) => *index,
+                    _ => resolve_union(union, &result)
+                        .map(|(i, _)| i as u32)
+                        .unwrap_or(*index),
+                };
+                return Ok(Value::Union(index, Box::new(result)));
             }
             // Not wrapped in a union: fall back to matching structurally.
             let subschema = resolve_union(union, message);
@@ -1999,6 +2011,78 @@ mod tests {
         ser.serialize(&ser_ctx, Record(fields)).await
     }
 
+    const NULLABLE_STR_SCHEMA: &str = r#"
+    {
+        "type": "record",
+        "name": "test",
+        "fields": [
+            {"name": "strField", "type": ["null", "string"]}
+        ]
+    }
+    "#;
+
+    /// As [`serialize_with_cel_field_condition`], but a transform rule, round-tripped so the
+    /// assertion sees the branch that actually reached the wire.
+    async fn serialize_with_cel_field_transform(
+        schema_str: &str,
+        expr: &str,
+        fields: Vec<(String, Value)>,
+    ) -> Result<NamedValue, SerdeError> {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            true,
+            false,
+            HashMap::new(),
+        );
+        let rule = Rule {
+            name: "test-cel-field".to_string(),
+            doc: None,
+            kind: Some(Kind::Transform),
+            mode: Some(Mode::Write),
+            r#type: "CEL_FIELD".to_string(),
+            tags: None,
+            params: None,
+            expr: Some(expr.to_string()),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let schema = Schema {
+            schema_type: Some("AVRO".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(RuleSet {
+                migration_rules: None,
+                domain_rules: Some(vec![rule]),
+                encoding_rules: None,
+                enable_at: None,
+            })),
+            schema: schema_str.to_string(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+        let rule_registry = RuleRegistry::new();
+        rule_registry.register_executor(CelFieldExecutor::new());
+        let ser =
+            AvroSerializer::new(&client, None, Some(rule_registry.clone()), ser_conf).unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Avro,
+            headers: None,
+        };
+        let bytes = ser.serialize(&ser_ctx, Record(fields)).await?;
+        let deser =
+            AvroDeserializer::new(&client, Some(rule_registry), DeserializerConfig::default())
+                .unwrap();
+        deser.deserialize(&ser_ctx, &bytes).await
+    }
+
     #[tokio::test]
     async fn test_cel_field_decimal_transform_requantizes() {
         // 12.34 * 2.0 = 24.680 (scale 3); the schema is scale 2, so the field rule's result must
@@ -2126,6 +2210,80 @@ mod tests {
         )
         .await;
         assert!(r.is_ok(), "a true condition on a nullable field must pass");
+    }
+
+    const INT_OR_STR_SCHEMA: &str = r#"
+    {
+        "type": "record",
+        "name": "test",
+        "fields": [
+            {"name": "strField", "type": ["int", "string"]}
+        ]
+    }
+    "#;
+
+    /// A rule that changes the value's type moves it off a branch that cannot hold it. The
+    /// reference keeps no branch at all, so the string lands on the string branch; keeping
+    /// index 0 makes the writer reject the record instead.
+    #[tokio::test]
+    async fn test_cel_field_transform_re_resolves_a_changed_branch() {
+        let got = serialize_with_cel_field_transform(
+            INT_OR_STR_SCHEMA,
+            "name == 'strField' ; 'moved'",
+            vec![(
+                "strField".to_string(),
+                Value::Union(0, Box::new(Value::Int(1))),
+            )],
+        )
+        .await;
+        let fields = match got.map(|v| v.value) {
+            Ok(Record(fields)) => fields,
+            other => panic!("the transform failed: {other:?}"),
+        };
+        let (_, v) = fields.iter().find(|(n, _)| n == "strField").unwrap();
+        assert_eq!(
+            *v,
+            Value::Union(1, Box::new(Value::String("moved".to_string())))
+        );
+    }
+
+    /// A `CEL_FIELD` transform that fills, or clears, a null union branch must move the value
+    /// to the branch it now belongs to. Re-wrapping under the branch it arrived on produced
+    /// `Union(null_index, String)`, which the writer rejects outright.
+    #[tokio::test]
+    async fn test_cel_field_transform_moves_a_null_branch() {
+        for (name, input, expr, want) in [
+            (
+                "fills the null branch",
+                Value::Union(0, Box::new(Value::Null)),
+                "name == 'strField' ; 'recovered'",
+                Value::Union(1, Box::new(Value::String("recovered".to_string()))),
+            ),
+            (
+                "clears the value branch",
+                Value::Union(1, Box::new(Value::String("a".to_string()))),
+                "name == 'strField' ; null",
+                Value::Union(0, Box::new(Value::Null)),
+            ),
+            (
+                "leaves a present value on its own branch",
+                Value::Union(1, Box::new(Value::String("a".to_string()))),
+                "name == 'strField' ; value + '!'",
+                Value::Union(1, Box::new(Value::String("a!".to_string()))),
+            ),
+        ] {
+            let got = serialize_with_cel_field_transform(
+                NULLABLE_STR_SCHEMA,
+                expr,
+                vec![("strField".to_string(), input)],
+            )
+            .await;
+            let Ok(Record(fields)) = got.map(|v| v.value) else {
+                panic!("{name}: the transform failed");
+            };
+            let (_, v) = fields.iter().find(|(n, _)| n == "strField").unwrap();
+            assert_eq!(*v, want, "{name}");
+        }
     }
 
     #[tokio::test]
