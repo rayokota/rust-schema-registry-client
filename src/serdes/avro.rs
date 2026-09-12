@@ -877,6 +877,11 @@ async fn transform_field_with_ctx(
         name,
         field_type,
         get_inline_tags(field_schema),
+        // The record this field belongs to, which for a nested one is not the target schema.
+        Some(SerdeSchema::Avro((
+            apache_avro::Schema::Record(schema.clone()),
+            named_schemas.to_vec(),
+        ))),
         // A field rule only runs on a primitive value, which never references a named type, so
         // the field's leaf schema is enough (no `named` list needed) to resolve a decimal's scale
         // or a timestamp's unit for the `value` binding and the result write-back.
@@ -1662,6 +1667,102 @@ mod tests {
     /// Driven end to end through the serializer, not through the executor alone: whether the
     /// record the executor produces is one apache-avro will actually encode is the question, and
     /// an executor-level test cannot see it. Before the fix the omitted field was simply left out
+    const MULTI_BRANCH_SCHEMA: &str = r#"
+    {
+        "type": "record",
+        "name": "U",
+        "fields": [{"name": "u", "type": ["string", "int"]}]
+    }
+    "#;
+
+    /// A message-level result lands on the union branch that *accepts* it, not on the first
+    /// non-null one.
+    ///
+    /// `union_variant_index` took the first non-null branch unconditionally - right for the
+    /// `[null, T]` nullable shape, wrong wherever the union offers a choice. An int result for
+    /// `["string", "int"]` went to the string branch and the writer refused the record with
+    /// "Value does not match schema", where the reference writes it to the int branch.
+    #[tokio::test]
+    async fn test_cel_message_result_picks_the_accepting_union_branch() {
+        for (name, expr, want) in [
+            (
+                "int takes the int branch",
+                r#"{"u": 7}"#,
+                Value::Union(1, Box::new(Value::Int(7))),
+            ),
+            (
+                "string still takes the string branch",
+                r#"{"u": "kept"}"#,
+                Value::Union(0, Box::new(Value::String("kept".to_string()))),
+            ),
+        ] {
+            let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+            let client = MockSchemaRegistryClient::new(client_conf);
+            let ser_conf = SerializerConfig::new(
+                false,
+                Some(SchemaSelector::LatestVersion),
+                true,
+                false,
+                HashMap::new(),
+            );
+            let rule = Rule {
+                name: "r".to_string(),
+                doc: None,
+                kind: Some(Kind::Transform),
+                mode: Some(Mode::Write),
+                r#type: "CEL".to_string(),
+                tags: None,
+                params: None,
+                expr: Some(expr.to_string()),
+                on_success: None,
+                on_failure: None,
+                disabled: None,
+            };
+            let schema = Schema {
+                schema_type: Some("AVRO".to_string()),
+                references: None,
+                metadata: None,
+                rule_set: Some(Box::new(RuleSet {
+                    migration_rules: None,
+                    domain_rules: Some(vec![rule]),
+                    encoding_rules: None,
+                    enable_at: None,
+                })),
+                schema: MULTI_BRANCH_SCHEMA.to_string(),
+            };
+            client
+                .register_schema("test-value", &schema, false)
+                .await
+                .unwrap();
+            let rule_registry = RuleRegistry::new();
+            rule_registry.register_executor(CelExecutor::new());
+            let ser =
+                AvroSerializer::new(&client, None, Some(rule_registry.clone()), ser_conf).unwrap();
+            let ser_ctx = SerializationContext {
+                topic: "test".to_string(),
+                serde_type: SerdeType::Value,
+                serde_format: SerdeFormat::Avro,
+                headers: None,
+            };
+            let obj = Record(vec![(
+                "u".to_string(),
+                Value::Union(0, Box::new(Value::String("a".to_string()))),
+            )]);
+            let bytes = ser
+                .serialize(&ser_ctx, obj)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let deser =
+                AvroDeserializer::new(&client, Some(rule_registry), DeserializerConfig::default())
+                    .unwrap();
+            let Record(fields) = deser.deserialize(&ser_ctx, &bytes).await.unwrap().value else {
+                panic!("{name}: expected a record");
+            };
+            let (_, v) = fields.iter().find(|(n, _)| n == "u").unwrap();
+            assert_eq!(*v, want, "{name}");
+        }
+    }
+
     /// and the writer rejected the record with "Value does not match schema", naming nothing.
     #[tokio::test]
     async fn test_cel_message_transform_unnamed_field_takes_its_default() {
@@ -1933,6 +2034,87 @@ mod tests {
             headers: None,
         };
         ser.serialize(&ser_ctx, Record(fields)).await
+    }
+
+    const NESTED_SCHEMA: &str = r#"
+    {
+        "type": "record",
+        "name": "Outer",
+        "fields": [
+            {"name": "inner", "type": {
+                "type": "record", "name": "Inner",
+                "fields": [
+                    {"name": "amount",
+                     "type": {"type":"bytes","logicalType":"decimal","precision":12,"scale":4}},
+                    {"name": "label", "type": "string", "confluent:tags": ["LABEL"]}
+                ]}}
+        ]
+    }
+    "#;
+
+    /// A value inside a *nested* record reaches a rule the way a root-level one does.
+    ///
+    /// `message_binding` converted against `parsed_target`, which describes only the root, so a
+    /// nested record matched none of its fields and its decimals stayed unscaled: `12.3400`
+    /// arrived as `123400`. The reference reads the schema off the record it was handed.
+    #[tokio::test]
+    async fn test_nested_record_reaches_a_rule_at_its_schema_scale() {
+        // 0x01E208 = 123400 unscaled, i.e. 12.3400 at scale 4.
+        let unscaled = || Value::Decimal(vec![0x01u8, 0xE2, 0x08].into());
+        let label_after =
+            |schema: &'static str, expr: &'static str, fields: Vec<(String, Value)>| async move {
+                let got = serialize_with_cel_field_transform(schema, expr, fields).await;
+                let Ok(Record(fields)) = got.map(|v| v.value) else {
+                    panic!("the transform failed");
+                };
+                fields.iter().find(|(n, _)| n == "inner").map_or_else(
+                    || match &fields.iter().find(|(n, _)| n == "label").unwrap().1 {
+                        Value::String(s) => s.clone(),
+                        other => panic!("label = {other:?}"),
+                    },
+                    |(_, v)| match v {
+                        Value::Record(inner) => {
+                            match &inner.iter().find(|(n, _)| n == "label").unwrap().1 {
+                                Value::String(s) => s.clone(),
+                                other => panic!("inner.label = {other:?}"),
+                            }
+                        }
+                        other => panic!("inner = {other:?}"),
+                    },
+                )
+            };
+
+        let inner = Value::Record(vec![
+            ("amount".to_string(), unscaled()),
+            ("label".to_string(), Value::String("usd".to_string())),
+        ]);
+        assert_eq!(
+            label_after(
+                NESTED_SCHEMA,
+                "name == 'label' ; string(message.amount)",
+                vec![("inner".to_string(), inner)]
+            )
+            .await,
+            "12.3400",
+            "a nested sibling decimal must arrive at its declared scale"
+        );
+
+        // The control that localises it: the same field on the root record always worked.
+        const FLAT_SCHEMA: &str = r#"{"type":"record","name":"Flat","fields":[
+            {"name":"amount","type":{"type":"bytes","logicalType":"decimal","precision":12,"scale":4}},
+            {"name":"label","type":"string","confluent:tags":["LABEL"]}]}"#;
+        assert_eq!(
+            label_after(
+                FLAT_SCHEMA,
+                "name == 'label' ; string(message.amount)",
+                vec![
+                    ("amount".to_string(), unscaled()),
+                    ("label".to_string(), Value::String("usd".to_string())),
+                ]
+            )
+            .await,
+            "12.3400"
+        );
     }
 
     const DECIMAL_SCHEMA: &str = r#"
