@@ -918,7 +918,6 @@ async fn transform_field_with_ctx(
         get_inline_tags(prop_schema),
         // JSON has no unscaled-decimal / bare-epoch logical types to reconstruct.
         None,
-        None,
     );
     if let Some(value) = message.get(prop_name) {
         let new_value = transform(

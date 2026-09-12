@@ -66,16 +66,20 @@ impl CelExecutor {
         // schema the message conforms to. `has()`-presence dropping is a protobuf concern, so
         // Avro never needed it.
         if let SerdeValue::Avro(v) = msg {
-            // The record this value actually is, which for a nested one is not the target
-            // schema; only the field context knows it. Falling back to the target keeps a
-            // message-level rule, which has no field context, converting against the root.
-            let containing = ctx
-                .current_field()
-                .and_then(|f| f.containing_schema.clone());
-            let schema = containing.as_ref().or(ctx.parsed_target.as_ref());
-            return match schema {
+            return match ctx.parsed_target.as_ref() {
                 Some(SerdeSchema::Avro((schema, named))) => {
-                    from_avro_value_with_schema(v, schema, &avro_definitions(schema, named))
+                    let defs = avro_definitions(schema, named);
+                    // The record this value actually *is*, which for a nested one is not the
+                    // root. apache-avro's Value::Record carries neither its schema nor its
+                    // name, so the name comes from the field context - `record.field` - and is
+                    // resolved against the target's named schemas, the way JS does it. A
+                    // message-level rule has no field context and converts against the root.
+                    let containing = ctx
+                        .current_field()
+                        .and_then(|f| containing_record_name(&f.full_name))
+                        .and_then(|n| AvroName::new(n).ok())
+                        .and_then(|n| defs.get(&n).copied());
+                    from_avro_value_with_schema(v, containing.unwrap_or(schema), &defs)
                 }
                 _ => from_avro_value(v),
             };
@@ -369,6 +373,11 @@ fn avro_record_full_name(rs: &apache_avro::schema::RecordSchema) -> String {
 }
 
 /// Resolves a named `Schema::Ref` to its definition in `defs`; any other schema is returned as-is.
+/// The record half of a field context's `record.field` full name.
+fn containing_record_name(full_name: &str) -> Option<&str> {
+    full_name.rsplit_once('.').map(|(record, _)| record)
+}
+
 fn resolve_avro_ref<'a>(
     schema: &'a AvroSchema,
     defs: &HashMap<AvroName, &'a AvroSchema>,

@@ -877,11 +877,6 @@ async fn transform_field_with_ctx(
         name,
         field_type,
         get_inline_tags(field_schema),
-        // The record this field belongs to, which for a nested one is not the target schema.
-        Some(SerdeSchema::Avro((
-            apache_avro::Schema::Record(schema.clone()),
-            named_schemas.to_vec(),
-        ))),
         // A field rule only runs on a primitive value, which never references a named type, so
         // the field's leaf schema is enough (no `named` list needed) to resolve a decimal's scale
         // or a timestamp's unit for the `value` binding and the result write-back.
