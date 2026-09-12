@@ -192,7 +192,7 @@ impl<'a, T: Client + Sync> AvroSerializer<'a, T> {
             }
         } else {
             apache_avro::writer::datum::GenericDatumWriter::builder(&schema_tuple.0)
-                .schemata(schema_tuple.1.iter().collect())?
+                .schemata(schemata_with_root(&schema_tuple.0, &schema_tuple.1))?
                 .build()?
                 .write_value_to_vec(value)?
         };
@@ -523,7 +523,7 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
                 Value::Bytes(data.to_vec())
             } else {
                 apache_avro::reader::datum::GenericDatumReader::builder(&writer_schema)
-                    .writer_schemata(writer_named.iter().collect())?
+                    .writer_schemata(schemata_with_root(&writer_schema, &writer_named))?
                     .build()?
                     .read_value(&mut reader)?
             };
@@ -553,7 +553,7 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
                 // decimal small enough to fit in fewer bytes than its precision allows - 12.34 in
                 // a precision-8 field - whichever client wrote the bytes.
                 apache_avro::reader::datum::GenericDatumReader::builder(&writer_schema)
-                    .writer_schemata(writer_named.iter().collect())?
+                    .writer_schemata(schemata_with_root(&writer_schema, &writer_named))?
                     .build()?
                     .read_value(&mut reader)?
             };
@@ -739,6 +739,18 @@ where
         }
     }
     Ok(())
+}
+
+/// The schema list handed to apache-avro's reader/writer. `schemata` *replaces* the default
+/// root-derived resolution rather than adding to it, so the root has to be in the list or a
+/// `Schema::Ref` to a type the root itself declares - a named type used twice - stays unresolved.
+/// Entries resolve in order against the ones before them, so the root goes last, after the
+/// referenced schemas `resolve_named_schema` already emitted in dependency order.
+fn schemata_with_root<'a>(
+    root: &'a apache_avro::Schema,
+    named: &'a [apache_avro::Schema],
+) -> Vec<&'a apache_avro::Schema> {
+    named.iter().chain(std::iter::once(root)).collect()
 }
 
 #[async_recursion]
@@ -1360,6 +1372,52 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
+    async fn test_reused_named_type() {
+        // A named type used twice parses as a `Schema::Ref` for the second use, which only
+        // resolves if the root is in the schema list handed to the writer and reader.
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let schema_str = r#"
+        {
+            "type": "record",
+            "name": "test",
+            "fields": [
+                {"name": "h1", "type": {"type": "record", "name": "Helper",
+                    "fields": [{"name": "x", "type": "int"}]}},
+                {"name": "h2", "type": "Helper"}
+            ]
+        }
+        "#;
+        let schema = Schema {
+            schema_type: Some("AVRO".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: None,
+            schema: schema_str.to_string(),
+        };
+        let helper = |n| Record(vec![("x".to_string(), Value::Int(n))]);
+        let fields = vec![("h1".to_string(), helper(1)), ("h2".to_string(), helper(2))];
+        let obj = Record(fields.clone());
+        let ser =
+            AvroSerializer::new(&client, Some(&schema), None, SerializerConfig::default()).unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Avro,
+            headers: None,
+        };
+        let bytes = ser.serialize(&ser_ctx, obj).await.unwrap();
+
+        let deser = AvroDeserializer::new(&client, None, DeserializerConfig::default()).unwrap();
+        let obj2 = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        if let Record(v) = obj2.value {
+            assert_eq!(v, fields);
+        } else {
+            panic!("expected record")
+        }
+    }
+
+    #[tokio::test]
     async fn test_basic_serialization() {
         let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
         let client = MockSchemaRegistryClient::new(client_conf);
@@ -1756,6 +1814,118 @@ mod tests {
             let (_, v) = fields.iter().find(|(n, _)| n == "u").unwrap();
             assert_eq!(*v, want, "{name}");
         }
+    }
+
+    /// Runs a message-level CEL transform and reports whether the record serialized.
+    async fn message_transform_ok(schema_str: &str, expr: &str, seed: Value) -> bool {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            true,
+            false,
+            HashMap::new(),
+        );
+        let rule = Rule {
+            name: "r".to_string(),
+            doc: None,
+            kind: Some(Kind::Transform),
+            mode: Some(Mode::Write),
+            r#type: "CEL".to_string(),
+            tags: None,
+            params: None,
+            expr: Some(expr.to_string()),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let schema = Schema {
+            schema_type: Some("AVRO".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(RuleSet {
+                migration_rules: None,
+                domain_rules: Some(vec![rule]),
+                encoding_rules: None,
+                enable_at: None,
+            })),
+            schema: schema_str.to_string(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+        let reg = RuleRegistry::new();
+        reg.register_executor(CelExecutor::new());
+        let ser = AvroSerializer::new(&client, None, Some(reg), ser_conf).unwrap();
+        let ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Avro,
+            headers: None,
+        };
+        ser.serialize(&ctx, Record(vec![("u".to_string(), seed)]))
+            .await
+            .is_ok()
+    }
+
+    /// What `branch_accepts` admits, `to_avro_value_with_schema` must be able to write.
+    ///
+    /// `branch_accepts` takes a CEL uint at a float or double branch, mirroring the reference's
+    /// `value instanceof Number`. The conversion had arms for Int but not UInt, so the value fell
+    /// through to the input-shaped fallback, came out a Long, and the writer refused the record.
+    /// JS and C++ cannot have this: both convert against the resolved branch with no input value
+    /// to shape from, where Rust's fallback consults the value the field already held.
+    #[tokio::test]
+    async fn test_unsigned_result_reaches_a_float_branch() {
+        for (name, schema_str) in [
+            (
+                "float",
+                r#"{"type":"record","name":"U","fields":[{"name":"u","type":["float","string"]}]}"#,
+            ),
+            (
+                "double",
+                r#"{"type":"record","name":"U","fields":[{"name":"u","type":["double","string"]}]}"#,
+            ),
+        ] {
+            assert!(
+                message_transform_ok(
+                    schema_str,
+                    r#"{"u": 7u}"#,
+                    Value::Union(1, Box::new(Value::String("a".to_string())))
+                )
+                .await,
+                "a uint result must be writable at the {name} branch it was accepted for"
+            );
+        }
+    }
+
+    /// A string reaches a *string-backed* uuid and no other, which is the reference's rule: its
+    /// STRING case takes any CharSequence whatever the logical type, and its FIXED case has no
+    /// string arm at all. apache-avro models uuid as its own schema variant rather than a logical
+    /// annotation, so this has to be said explicitly here where the other clients get it free.
+    #[tokio::test]
+    async fn test_string_reaches_only_the_string_backed_uuid() {
+        const UUID: &str = r#"{"u": "f81d4fae-7dec-11d0-a765-00a0c91e6bf6"}"#;
+        let seed = || Value::String("f81d4fae-7dec-11d0-a765-00a0c91e6bf6".to_string());
+        assert!(
+            message_transform_ok(
+                r#"{"type":"record","name":"U","fields":[{"name":"u","type":{"type":"string","logicalType":"uuid"}}]}"#,
+                UUID,
+                seed()
+            )
+            .await
+        );
+        assert!(
+            !message_transform_ok(
+                r#"{"type":"record","name":"U","fields":[{"name":"u","type":{"type":"fixed","name":"F","size":16,"logicalType":"uuid"}}]}"#,
+                UUID,
+                seed()
+            )
+            .await,
+            "a fixed-backed uuid wants 16 bytes; the reference does not accept a string there"
+        );
     }
 
     /// and the writer rejected the record with "Value does not match schema", naming nothing.

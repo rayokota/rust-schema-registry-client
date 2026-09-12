@@ -10,6 +10,7 @@ use crate::serdes::serde::{
 };
 use apache_avro::Schema as AvroSchema;
 use apache_avro::schema::Name as AvroName;
+use apache_avro::schema::UuidSchema;
 use async_trait::async_trait;
 use bigdecimal::BigDecimal;
 use bigdecimal::RoundingMode;
@@ -1061,10 +1062,15 @@ fn to_avro_value_with_schema(
         (AvroSchema::Long, Value::UInt(v)) => Ok(AV::Long(*v as i64)),
         (AvroSchema::Float, Value::Float(v)) => Ok(AV::Float(*v as f32)),
         (AvroSchema::Float, Value::Int(v)) => Ok(AV::Float(*v as f32)),
+        (AvroSchema::Float, Value::UInt(v)) => Ok(AV::Float(*v as f32)),
         (AvroSchema::Double, Value::Float(v)) => Ok(AV::Double(*v)),
         (AvroSchema::Double, Value::Int(v)) => Ok(AV::Double(*v as f64)),
+        (AvroSchema::Double, Value::UInt(v)) => Ok(AV::Double(*v as f64)),
         (AvroSchema::Boolean, Value::Bool(v)) => Ok(AV::Boolean(*v)),
-        (AvroSchema::String | AvroSchema::Uuid(_), Value::String(v)) => {
+        // Only the *string-backed* uuid takes a string: the reference accepts a CharSequence at
+        // a STRING branch whatever its logical type, and its FIXED case has no string arm at all.
+        // A fixed- or bytes-backed uuid wants 16 bytes, which apache-avro checks and rejects.
+        (AvroSchema::String | AvroSchema::Uuid(UuidSchema::String), Value::String(v)) => {
             Ok(AV::String(v.to_string()))
         }
         (AvroSchema::Enum(e), Value::String(v)) => {
@@ -1170,7 +1176,7 @@ fn branch_accepts(
             AvroSchema::Float | AvroSchema::Double,
             Value::Float(_) | Value::Int(_) | Value::UInt(_),
         ) => true,
-        (AvroSchema::String | AvroSchema::Uuid(_), Value::String(_)) => true,
+        (AvroSchema::String | AvroSchema::Uuid(UuidSchema::String), Value::String(_)) => true,
         (AvroSchema::Enum(e), Value::String(s)) => e.symbols.iter().any(|sym| sym == s.as_str()),
         (AvroSchema::Bytes, Value::Bytes(_)) => true,
         (AvroSchema::Fixed(f), Value::Bytes(b)) => b.len() == f.size,
