@@ -283,6 +283,21 @@ fn from_avro_value(value: &apache_avro::types::Value) -> Value {
             decimal_value(BigDecimal::new(BigInt::from(d.clone()), 0))
         }
         apache_avro::types::Value::Union(_, inner) => from_avro_value(inner),
+        // Avro's remaining logical types. apache-avro hoists each into its own variant, and the
+        // trailing arm below turned every one of them into CEL null - so a rule saw a date,
+        // time, local timestamp or uuid field as absent, and an identity transform erased it.
+        // They read as the plain int, long or string they are encoded as, which is the rule C++
+        // states: only decimal and the timestamps become semantic CEL values.
+        apache_avro::types::Value::Date(v) | apache_avro::types::Value::TimeMillis(v) => {
+            Value::Int(i64::from(*v))
+        }
+        apache_avro::types::Value::TimeMicros(v)
+        | apache_avro::types::Value::LocalTimestampMillis(v)
+        | apache_avro::types::Value::LocalTimestampMicros(v)
+        | apache_avro::types::Value::LocalTimestampNanos(v) => Value::Int(*v),
+        // Canonical text, which is the string-backed form and the only one derivable without a
+        // schema; `from_avro_value_with_schema` gives the byte-backed forms their 16 bytes.
+        apache_avro::types::Value::Uuid(u) => Value::String(Arc::new(u.to_string())),
         apache_avro::types::Value::Null => Value::Null,
         _ => Value::Null,
     }
@@ -358,6 +373,10 @@ pub(crate) fn from_avro_value_with_schema(
             None => from_avro_value(inner),
         },
         // The only place the schema is load-bearing: the scale that a bare decimal lacks.
+        // A byte-backed uuid reads as its 16 bytes, which is what the writer takes back.
+        (AV::Uuid(u), AvroSchema::Uuid(UuidSchema::Bytes | UuidSchema::Fixed(_))) => {
+            Value::Bytes(Arc::new(u.as_bytes().to_vec()))
+        }
         (AV::Decimal(d), AvroSchema::Decimal(ds)) => {
             decimal_value(BigDecimal::new(BigInt::from(d.clone()), ds.scale as i64))
         }

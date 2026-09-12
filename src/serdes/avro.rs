@@ -2010,6 +2010,163 @@ mod tests {
         }
     }
 
+    /// Every Avro logical type survives an identity transform, and reaches the rule as a value.
+    ///
+    /// D49 gave the write side arms for the logical types apache-avro hoists into their own
+    /// `Schema` variants. The read side still had none: `from_avro_value`'s trailing arm turned
+    /// `Date`, `TimeMillis`, `TimeMicros`, the three local timestamps and `Uuid` into CEL **null**,
+    /// so a rule saw the field as absent and echoing it erased it. Only decimal and the three
+    /// timestamps had arms. The reference binds the library's own value (a `LocalDate`, a `UUID`)
+    /// and C++ states the rule the others follow: everything but decimal and the timestamps is
+    /// the plain int, long or string it is encoded as.
+    ///
+    /// The sibling `label` field is the discriminator - an echoed value that came back intact
+    /// would look the same whether the rule ran or not.
+    #[tokio::test]
+    async fn test_every_logical_type_survives_an_identity_transform() {
+        for (name, field, seed) in [
+            (
+                "uuid-string",
+                r#"{"type":"string","logicalType":"uuid"}"#,
+                Value::Uuid(uuid::Uuid::nil()),
+            ),
+            (
+                "uuid-fixed",
+                r#"{"type":"fixed","name":"F","size":16,"logicalType":"uuid"}"#,
+                Value::Uuid(uuid::Uuid::nil()),
+            ),
+            (
+                "uuid-bytes",
+                r#"{"type":"bytes","logicalType":"uuid"}"#,
+                Value::Uuid(uuid::Uuid::nil()),
+            ),
+            (
+                "date",
+                r#"{"type":"int","logicalType":"date"}"#,
+                Value::Date(20000),
+            ),
+            (
+                "time-millis",
+                r#"{"type":"int","logicalType":"time-millis"}"#,
+                Value::TimeMillis(123),
+            ),
+            (
+                "time-micros",
+                r#"{"type":"long","logicalType":"time-micros"}"#,
+                Value::TimeMicros(123),
+            ),
+            (
+                "local-timestamp-millis",
+                r#"{"type":"long","logicalType":"local-timestamp-millis"}"#,
+                Value::LocalTimestampMillis(123),
+            ),
+            (
+                "local-timestamp-micros",
+                r#"{"type":"long","logicalType":"local-timestamp-micros"}"#,
+                Value::LocalTimestampMicros(123),
+            ),
+            (
+                "local-timestamp-nanos",
+                r#"{"type":"long","logicalType":"local-timestamp-nanos"}"#,
+                Value::LocalTimestampNanos(123),
+            ),
+            (
+                "timestamp-millis",
+                r#"{"type":"long","logicalType":"timestamp-millis"}"#,
+                Value::TimestampMillis(123),
+            ),
+        ] {
+            let schema_str = format!(
+                r#"{{"type":"record","name":"U","fields":[{{"name":"u","type":["null",{field}]}},{{"name":"label","type":"string"}}]}}"#
+            );
+            let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+            let client = MockSchemaRegistryClient::new(client_conf);
+            let rule = Rule {
+                name: "r".to_string(),
+                doc: None,
+                kind: Some(Kind::Transform),
+                mode: Some(Mode::Write),
+                r#type: "CEL".to_string(),
+                tags: None,
+                params: None,
+                expr: Some(
+                    r#"{"u": message.u, "label": message.u == null ? "IS-NULL" : "NOT-NULL"}"#
+                        .to_string(),
+                ),
+                on_success: None,
+                on_failure: None,
+                disabled: None,
+            };
+            let schema = Schema {
+                schema_type: Some("AVRO".to_string()),
+                references: None,
+                metadata: None,
+                rule_set: Some(Box::new(RuleSet {
+                    migration_rules: None,
+                    domain_rules: Some(vec![rule]),
+                    encoding_rules: None,
+                    enable_at: None,
+                })),
+                schema: schema_str.to_string(),
+            };
+            client
+                .register_schema("test-value", &schema, false)
+                .await
+                .unwrap();
+            let reg = RuleRegistry::new();
+            reg.register_executor(CelExecutor::new());
+            let ser = AvroSerializer::new(
+                &client,
+                None,
+                Some(reg.clone()),
+                SerializerConfig::new(
+                    false,
+                    Some(SchemaSelector::LatestVersion),
+                    true,
+                    false,
+                    HashMap::new(),
+                ),
+            )
+            .unwrap();
+            let ser_ctx = SerializationContext {
+                topic: "test".to_string(),
+                serde_type: SerdeType::Value,
+                serde_format: SerdeFormat::Avro,
+                headers: None,
+            };
+            let obj = Record(vec![
+                ("u".to_string(), Value::Union(1, Box::new(seed.clone()))),
+                ("label".to_string(), Value::String("seed".to_string())),
+            ]);
+            let bytes = ser
+                .serialize(&ser_ctx, obj)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let deser =
+                AvroDeserializer::new(&client, Some(reg), DeserializerConfig::default()).unwrap();
+            let Record(fields) = deser.deserialize(&ser_ctx, &bytes).await.unwrap().value else {
+                panic!("{name}: expected a record");
+            };
+            let field_of = |n: &str| {
+                fields
+                    .iter()
+                    .find(|(k, _)| k == n)
+                    .map(|(_, v)| v.clone())
+                    .unwrap()
+            };
+            assert_eq!(
+                field_of("label"),
+                Value::String("NOT-NULL".to_string()),
+                "{name}: the field reached the rule as null"
+            );
+            assert_eq!(
+                field_of("u"),
+                Value::Union(1, Box::new(seed)),
+                "{name}: the echoed value did not survive"
+            );
+        }
+    }
+
     /// What `branch_accepts` admits, `to_avro_value_with_schema` must be able to write.
     ///
     /// `branch_accepts` takes a CEL uint at a float or double branch, mirroring the reference's
