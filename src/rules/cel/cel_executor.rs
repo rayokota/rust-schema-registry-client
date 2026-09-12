@@ -1059,10 +1059,10 @@ fn to_avro_value_with_schema(
         // Narrowing is checked, as the reference's narrowToInt is ("Value 2147483648 out of range
         // for INT field") and C++'s numericToAvro is. CEL has one integer width, so an unchecked
         // cast is the difference between a rejected transform and a silently wrong record.
-        (AvroSchema::Int, Value::Int(v)) => Ok(AV::Int(narrow_int(*v)?)),
-        (AvroSchema::Int, Value::UInt(v)) => Ok(AV::Int(narrow_int(narrow_long(*v)?)?)),
+        (AvroSchema::Int, Value::Int(v)) => Ok(AV::Int(narrow_int(i128::from(*v))?)),
+        (AvroSchema::Int, Value::UInt(v)) => Ok(AV::Int(narrow_int(i128::from(*v))?)),
         (AvroSchema::Long, Value::Int(v)) => Ok(AV::Long(*v)),
-        (AvroSchema::Long, Value::UInt(v)) => Ok(AV::Long(narrow_long(*v)?)),
+        (AvroSchema::Long, Value::UInt(v)) => Ok(AV::Long(narrow_long(i128::from(*v))?)),
         (AvroSchema::Float, Value::Float(v)) => Ok(AV::Float(*v as f32)),
         (AvroSchema::Float, Value::Int(v)) => Ok(AV::Float(*v as f32)),
         (AvroSchema::Float, Value::UInt(v)) => Ok(AV::Float(*v as f32)),
@@ -1084,6 +1084,17 @@ fn to_avro_value_with_schema(
         }
         (AvroSchema::Bytes, Value::Bytes(v)) => Ok(AV::Bytes((**v).clone())),
         (AvroSchema::Fixed(f), Value::Bytes(v)) if v.len() == f.size => {
+            Ok(AV::Fixed(f.size, (**v).clone()))
+        }
+        // The byte-backed uuids, which the reference takes at its BYTES and FIXED cases - both
+        // accept raw bytes of the declared width whatever the logical type. apache-avro wants
+        // exactly 16 either way.
+        (AvroSchema::Uuid(UuidSchema::Bytes), Value::Bytes(v)) if v.len() == 16 => {
+            Ok(AV::Bytes((**v).clone()))
+        }
+        (AvroSchema::Uuid(UuidSchema::Fixed(f)), Value::Bytes(v))
+            if f.size == 16 && v.len() == 16 =>
+        {
             Ok(AV::Fixed(f.size, (**v).clone()))
         }
         // Unions are transparent in CEL, so pick the variant matching the result's kind and
@@ -1115,7 +1126,10 @@ fn to_avro_value_with_schema(
             }
         }
         // Primitives (and anything the schema does not inform) use the loose conversion.
-        _ => Ok(to_avro_value(input, value)),
+        _ => match integer_logical(schema, value) {
+            Some(converted) => converted,
+            None => Ok(to_avro_value(input, value)),
+        },
     }
 }
 
@@ -1153,14 +1167,48 @@ fn union_variant_index(
     }
 }
 
-/// A CEL integer as an Avro `int`, or a rule error naming the value.
-fn narrow_int(v: i64) -> Result<i32, SerdeError> {
+/// A CEL integer as an Avro `int`, or a rule error naming the value. Signed and unsigned CEL
+/// integers both arrive as an i128 so that a failure names the field's width rather than an
+/// intermediate one.
+fn narrow_int(v: i128) -> Result<i32, SerdeError> {
     i32::try_from(v).map_err(|_| SerdeError::Rule(format!("Value {v} out of range for INT field")))
 }
 
-/// A CEL unsigned integer as an Avro `long`, or a rule error naming the value.
-fn narrow_long(v: u64) -> Result<i64, SerdeError> {
+/// A CEL integer as an Avro `long`, or a rule error naming the value.
+fn narrow_long(v: i128) -> Result<i64, SerdeError> {
     i64::try_from(v).map_err(|_| SerdeError::Rule(format!("Value {v} out of range for LONG field")))
+}
+
+/// Avro's integer-backed logical types written from a CEL integer, or `None` when the schema is
+/// not one of them or the value is not an integer.
+///
+/// The reference reaches these through the INT and LONG cases of `branchAccepts` and
+/// `narrowToInt`/`narrowToLong`, because there a logical type is a property of the base schema
+/// and a plain integer is accepted before the logical type is even consulted. apache-avro hoists
+/// each one into its own `Schema` variant instead, so they need matching here or a rule returning
+/// an integer for a `date` field has no arm at all.
+fn integer_logical(
+    schema: &AvroSchema,
+    value: &Value,
+) -> Option<Result<apache_avro::types::Value, SerdeError>> {
+    use apache_avro::types::Value as AV;
+    let v = match value {
+        Value::Int(v) => i128::from(*v),
+        Value::UInt(v) => i128::from(*v),
+        _ => return None,
+    };
+    Some(match schema {
+        AvroSchema::Date => narrow_int(v).map(AV::Date),
+        AvroSchema::TimeMillis => narrow_int(v).map(AV::TimeMillis),
+        AvroSchema::TimeMicros => narrow_long(v).map(AV::TimeMicros),
+        AvroSchema::TimestampMillis => narrow_long(v).map(AV::TimestampMillis),
+        AvroSchema::TimestampMicros => narrow_long(v).map(AV::TimestampMicros),
+        AvroSchema::TimestampNanos => narrow_long(v).map(AV::TimestampNanos),
+        AvroSchema::LocalTimestampMillis => narrow_long(v).map(AV::LocalTimestampMillis),
+        AvroSchema::LocalTimestampMicros => narrow_long(v).map(AV::LocalTimestampMicros),
+        AvroSchema::LocalTimestampNanos => narrow_long(v).map(AV::LocalTimestampNanos),
+        _ => return None,
+    })
 }
 
 /// Whether `value` can be written as `schema`.
@@ -1190,10 +1238,10 @@ fn branch_accepts(
         ) => true,
         (_, Value::Timestamp(_)) => false,
         (AvroSchema::Boolean, Value::Bool(_)) => true,
-        (AvroSchema::Int, Value::Int(v)) => i32::try_from(*v).is_ok(),
-        (AvroSchema::Int, Value::UInt(v)) => i32::try_from(*v).is_ok(),
+        (AvroSchema::Int, Value::Int(v)) => narrow_int(i128::from(*v)).is_ok(),
+        (AvroSchema::Int, Value::UInt(v)) => narrow_int(i128::from(*v)).is_ok(),
         (AvroSchema::Long, Value::Int(_)) => true,
-        (AvroSchema::Long, Value::UInt(v)) => i64::try_from(*v).is_ok(),
+        (AvroSchema::Long, Value::UInt(v)) => narrow_long(i128::from(*v)).is_ok(),
         // The reference's FLOAT/DOUBLE case is `value instanceof Number`, which an integer
         // satisfies too, so a widened CEL int resolves to a float branch declared ahead of a long.
         (
@@ -1204,9 +1252,12 @@ fn branch_accepts(
         (AvroSchema::Enum(e), Value::String(s)) => e.symbols.iter().any(|sym| sym == s.as_str()),
         (AvroSchema::Bytes, Value::Bytes(_)) => true,
         (AvroSchema::Fixed(f), Value::Bytes(b)) => b.len() == f.size,
+        (AvroSchema::Uuid(UuidSchema::Bytes), Value::Bytes(b)) => b.len() == 16,
+        (AvroSchema::Uuid(UuidSchema::Fixed(f)), Value::Bytes(b)) => f.size == 16 && b.len() == 16,
         (AvroSchema::Array(_), Value::List(_)) => true,
         (AvroSchema::Map(_) | AvroSchema::Record(_), Value::Map(_)) => true,
-        _ => false,
+        // Same source as the conversion's, so accept and produce cannot drift apart here.
+        _ => matches!(integer_logical(schema, value), Some(Ok(_))),
     }
 }
 

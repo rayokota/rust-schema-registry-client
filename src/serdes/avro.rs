@@ -1924,6 +1924,92 @@ mod tests {
         );
     }
 
+    /// An integer result reaches Avro's integer-backed logical types.
+    ///
+    /// The reference accepts a plain integer at a `date` or `timestamp-millis` branch before it
+    /// looks at the logical type at all - `branchAccepts` switches on the *base* type, INT or
+    /// LONG. apache-avro hoists each logical type into its own `Schema` variant, so the
+    /// schema-driven arms matched none of them: a rule returning an integer for a `date`,
+    /// `time-millis`, `timestamp-nanos` or `local-timestamp-nanos` field was refused outright,
+    /// and every one of them was unreachable inside a union.
+    #[tokio::test]
+    async fn test_integer_result_reaches_an_integer_backed_logical_type() {
+        const TYPES: [&str; 9] = [
+            r#"{"type":"int","logicalType":"date"}"#,
+            r#"{"type":"int","logicalType":"time-millis"}"#,
+            r#"{"type":"long","logicalType":"time-micros"}"#,
+            r#"{"type":"long","logicalType":"timestamp-millis"}"#,
+            r#"{"type":"long","logicalType":"timestamp-micros"}"#,
+            r#"{"type":"long","logicalType":"timestamp-nanos"}"#,
+            r#"{"type":"long","logicalType":"local-timestamp-millis"}"#,
+            r#"{"type":"long","logicalType":"local-timestamp-micros"}"#,
+            r#"{"type":"long","logicalType":"local-timestamp-nanos"}"#,
+        ];
+        for field in TYPES {
+            // Bare, then in a union where nothing else could have been selected by accident.
+            for shape in [field.to_string(), format!(r#"[{field},"string"]"#)] {
+                let schema = format!(
+                    r#"{{"type":"record","name":"U","fields":[{{"name":"u","type":{shape}}}]}}"#
+                );
+                // The seed is a string so that a union arrives on the *other* branch: the
+                // result has to move it, which is what the old code could not do.
+                let seed = if shape.starts_with('[') {
+                    Value::Union(1, Box::new(Value::String("x".to_string())))
+                } else {
+                    Value::Long(1)
+                };
+                if let Some(err) = message_transform_err(&schema, r#"{"u": 20000}"#, seed).await {
+                    panic!("{shape}: {err}");
+                }
+            }
+        }
+    }
+
+    /// The range check reaches them too, and names the width the *field* has rather than an
+    /// intermediate one - a CEL uint is checked against int, not against long first.
+    #[tokio::test]
+    async fn test_an_out_of_range_integer_names_the_fields_width() {
+        for (field, expr) in [
+            (
+                r#"{"type":"int","logicalType":"date"}"#,
+                r#"{"u": 2147483648}"#,
+            ),
+            ("\"int\"", r#"{"u": uint("18446744073709551615")}"#),
+        ] {
+            let schema = format!(
+                r#"{{"type":"record","name":"U","fields":[{{"name":"u","type":{field}}}]}}"#
+            );
+            let err = message_transform_err(&schema, expr, Value::Int(1))
+                .await
+                .unwrap_or_else(|| panic!("{field}: an out-of-range integer was accepted"));
+            assert!(err.contains("out of range for INT field"), "{field}: {err}");
+        }
+    }
+
+    /// A 16-byte result reaches a uuid backed by bytes or by fixed.
+    ///
+    /// The reference's BYTES and FIXED cases accept raw bytes of the declared width whatever the
+    /// logical type; apache-avro's `Schema::Uuid` variant took neither, so only a union with one
+    /// non-null branch worked - by falling through to the input-shaped conversion rather than by
+    /// resolving.
+    #[tokio::test]
+    async fn test_byte_result_reaches_a_byte_backed_uuid() {
+        for field in [
+            r#"{"type":"fixed","name":"F","size":16,"logicalType":"uuid"}"#,
+            r#"{"type":"bytes","logicalType":"uuid"}"#,
+        ] {
+            let schema = format!(
+                r#"{{"type":"record","name":"U","fields":[{{"name":"u","type":[{field},"string"]}}]}}"#
+            );
+            let seed = Value::Union(1, Box::new(Value::String("x".to_string())));
+            if let Some(err) =
+                message_transform_err(&schema, r#"{"u": b"0123456789abcdef"}"#, seed).await
+            {
+                panic!("{field}: {err}");
+            }
+        }
+    }
+
     /// What `branch_accepts` admits, `to_avro_value_with_schema` must be able to write.
     ///
     /// `branch_accepts` takes a CEL uint at a float or double branch, mirroring the reference's
