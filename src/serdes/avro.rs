@@ -1709,17 +1709,6 @@ mod tests {
         }
     }
 
-    /// Replace, not merge: the rule's map is the whole new record, so a field the rule does not
-    /// name takes the schema's declared default rather than the value it had on the way in.
-    ///
-    /// This case existed only on the protobuf side, and its absence hid a real defect elsewhere -
-    /// the C++ client seeded its result record from the input before applying the map, so it
-    /// merged. Every other C6/C7 case names *all* of a record's fields, which makes merge and
-    /// replace indistinguishable.
-    ///
-    /// Driven end to end through the serializer, not through the executor alone: whether the
-    /// record the executor produces is one apache-avro will actually encode is the question, and
-    /// an executor-level test cannot see it. Before the fix the omitted field was simply left out
     const MULTI_BRANCH_SCHEMA: &str = r#"
     {
         "type": "record",
@@ -1818,6 +1807,13 @@ mod tests {
 
     /// Runs a message-level CEL transform and reports whether the record serialized.
     async fn message_transform_ok(schema_str: &str, expr: &str, seed: Value) -> bool {
+        message_transform_err(schema_str, expr, seed)
+            .await
+            .is_none()
+    }
+
+    /// The same, returning the failure text so a test can pin which layer refused the record.
+    async fn message_transform_err(schema_str: &str, expr: &str, seed: Value) -> Option<String> {
         let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
         let client = MockSchemaRegistryClient::new(client_conf);
         let ser_conf = SerializerConfig::new(
@@ -1867,7 +1863,65 @@ mod tests {
         };
         ser.serialize(&ctx, Record(vec![("u".to_string(), seed)]))
             .await
-            .is_ok()
+            .err()
+            .map(|e| format!("{e:?}"))
+    }
+
+    /// An integer too wide for the field it is written to is refused, not truncated.
+    ///
+    /// The cast was `*v as i32`, and a union made it reachable without any branch accepting the
+    /// value: `branch_accepts` range-checks an int branch, but a value nothing accepted still
+    /// fell back to the first non-null branch, so 2147483648 for `["int", "string"]` was written
+    /// as -2147483648. The reference range-checks in `narrowToInt` and throws
+    /// `UnresolvedUnionException` when no branch accepts.
+    #[tokio::test]
+    async fn test_an_out_of_range_int_result_is_refused() {
+        const UNION: &str =
+            r#"{"type":"record","name":"U","fields":[{"name":"u","type":["int","string"]}]}"#;
+        const PLAIN: &str = r#"{"type":"record","name":"U","fields":[{"name":"u","type":"int"}]}"#;
+        let union_seed = || Value::Union(0, Box::new(Value::Int(1)));
+
+        assert!(
+            !message_transform_ok(UNION, r#"{"u": 2147483648}"#, union_seed()).await,
+            "an out-of-range int was written to the int branch anyway"
+        );
+        assert!(
+            !message_transform_ok(PLAIN, r#"{"u": 2147483648}"#, Value::Int(1)).await,
+            "an out-of-range int was truncated into the field"
+        );
+        // The twins: the same rule one below the boundary still serializes, so the two above
+        // cannot be passing because the transform stopped working.
+        assert!(message_transform_ok(UNION, r#"{"u": 2147483647}"#, union_seed()).await);
+        assert!(message_transform_ok(PLAIN, r#"{"u": 2147483647}"#, Value::Int(1)).await);
+    }
+
+    /// A result no branch of a multi-branch union accepts is refused rather than forced onto one.
+    ///
+    /// The reference throws `UnresolvedUnionException`; a union with a single non-null branch
+    /// keeps the old fallback, as JS does, since that branch cannot be mis-selected.
+    #[tokio::test]
+    async fn test_a_result_no_union_branch_accepts_is_refused() {
+        // Pinned on the message, not just on failure: forcing the value onto the first branch
+        // also failed, but from inside apache-avro and without naming the union.
+        let err = message_transform_err(
+            r#"{"type":"record","name":"U","fields":[{"name":"u","type":["int","boolean"]}]}"#,
+            r#"{"u": "text"}"#,
+            Value::Union(0, Box::new(Value::Int(1))),
+        )
+        .await
+        .expect("a string was forced onto a numeric branch");
+        assert!(
+            err.contains("does not match any branch of union"),
+            "refused by the writer rather than by branch resolution: {err}"
+        );
+        assert!(
+            message_transform_ok(
+                r#"{"type":"record","name":"U","fields":[{"name":"u","type":["int","string"]}]}"#,
+                r#"{"u": "text"}"#,
+                Value::Union(0, Box::new(Value::Int(1)))
+            )
+            .await
+        );
     }
 
     /// What `branch_accepts` admits, `to_avro_value_with_schema` must be able to write.
@@ -1928,6 +1982,17 @@ mod tests {
         );
     }
 
+    /// Replace, not merge: the rule's map is the whole new record, so a field the rule does not
+    /// name takes the schema's declared default rather than the value it had on the way in.
+    ///
+    /// This case existed only on the protobuf side, and its absence hid a real defect elsewhere -
+    /// the C++ client seeded its result record from the input before applying the map, so it
+    /// merged. Every other C6/C7 case names *all* of a record's fields, which makes merge and
+    /// replace indistinguishable.
+    ///
+    /// Driven end to end through the serializer, not through the executor alone: whether the
+    /// record the executor produces is one apache-avro will actually encode is the question, and
+    /// an executor-level test cannot see it. Before the fix the omitted field was simply left out
     /// and the writer rejected the record with "Value does not match schema", naming nothing.
     #[tokio::test]
     async fn test_cel_message_transform_unnamed_field_takes_its_default() {

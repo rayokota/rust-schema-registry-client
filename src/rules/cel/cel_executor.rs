@@ -373,12 +373,12 @@ fn avro_record_full_name(rs: &apache_avro::schema::RecordSchema) -> String {
     }
 }
 
-/// Resolves a named `Schema::Ref` to its definition in `defs`; any other schema is returned as-is.
 /// The record half of a field context's `record.field` full name.
 fn containing_record_name(full_name: &str) -> Option<&str> {
     full_name.rsplit_once('.').map(|(record, _)| record)
 }
 
+/// Resolves a named `Schema::Ref` to its definition in `defs`; any other schema is returned as-is.
 fn resolve_avro_ref<'a>(
     schema: &'a AvroSchema,
     defs: &HashMap<AvroName, &'a AvroSchema>,
@@ -1056,10 +1056,13 @@ fn to_avro_value_with_schema(
         // wrong the moment a union resolves to a different branch: an int result routed to an
         // `int` branch came out as a Long and the writer refused the record. These mirror
         // `branch_accepts` one for one, which is what keeps accept and produce in step.
-        (AvroSchema::Int, Value::Int(v)) => Ok(AV::Int(*v as i32)),
-        (AvroSchema::Int, Value::UInt(v)) => Ok(AV::Int(*v as i32)),
+        // Narrowing is checked, as the reference's narrowToInt is ("Value 2147483648 out of range
+        // for INT field") and C++'s numericToAvro is. CEL has one integer width, so an unchecked
+        // cast is the difference between a rejected transform and a silently wrong record.
+        (AvroSchema::Int, Value::Int(v)) => Ok(AV::Int(narrow_int(*v)?)),
+        (AvroSchema::Int, Value::UInt(v)) => Ok(AV::Int(narrow_int(narrow_long(*v)?)?)),
         (AvroSchema::Long, Value::Int(v)) => Ok(AV::Long(*v)),
-        (AvroSchema::Long, Value::UInt(v)) => Ok(AV::Long(*v as i64)),
+        (AvroSchema::Long, Value::UInt(v)) => Ok(AV::Long(narrow_long(*v)?)),
         (AvroSchema::Float, Value::Float(v)) => Ok(AV::Float(*v as f32)),
         (AvroSchema::Float, Value::Int(v)) => Ok(AV::Float(*v as f32)),
         (AvroSchema::Float, Value::UInt(v)) => Ok(AV::Float(*v as f32)),
@@ -1103,7 +1106,12 @@ fn to_avro_value_with_schema(
                         )?),
                     ))
                 }
-                None => Ok(to_avro_value(input, value)),
+                // The reference's UnresolvedUnionException. Falling back to the loose conversion
+                // here produced a bare value for a union slot, which the writer then refused
+                // without naming the branch that was wrong.
+                None => Err(SerdeError::Rule(format!(
+                    "CEL result does not match any branch of union {variants:?}"
+                ))),
             }
         }
         // Primitives (and anything the schema does not inform) use the loose conversion.
@@ -1111,15 +1119,17 @@ fn to_avro_value_with_schema(
     }
 }
 
-/// Picks the union variant a CEL result belongs to: the `null` branch for null, then the branch
-/// that accepts the value, and only failing that the first non-null branch.
+/// Picks the union variant a CEL result belongs to: the `null` branch for null, else the first
+/// branch that accepts the value.
 ///
-/// The last step was all this did, which is the right answer for the `[null, T]` nullable shape
-/// and wrong for any union offering a real choice: an int result for `["string", "int"]` took the
-/// string branch and the writer then refused the record with "Value does not match schema" - a
-/// transform the reference performs happily. The reference resolves by value
-/// (`AvroResultWriter.branchAccepts`), so this does too, keeping the old behaviour as the
-/// fallback for a value kind `branch_accepts` does not enumerate.
+/// Picking the first non-null branch was all this did, which is the right answer for the
+/// `[null, T]` nullable shape and wrong for any union offering a real choice: an int result for
+/// `["string", "int"]` took the string branch. The reference resolves by value
+/// (`AvroResultWriter.branchAccepts`) and throws `UnresolvedUnionException` when nothing accepts,
+/// so a value no branch takes returns `None` here rather than being forced onto one.
+///
+/// The single-non-null-branch case keeps the old fallback, as JS's `pickAvroWriteBranch` does:
+/// that branch cannot be mis-selected, so a genuine mismatch is left to the writer to report.
 fn union_variant_index(
     variants: &[AvroSchema],
     value: &Value,
@@ -1130,14 +1140,27 @@ fn union_variant_index(
             .iter()
             .position(|v| matches!(resolve_avro_ref(v, defs), AvroSchema::Null));
     }
-    variants
+    if let Some(i) = variants.iter().position(|v| branch_accepts(v, value, defs)) {
+        return Some(i);
+    }
+    let mut non_null = variants
         .iter()
-        .position(|v| branch_accepts(v, value, defs))
-        .or_else(|| {
-            variants
-                .iter()
-                .position(|v| !matches!(resolve_avro_ref(v, defs), AvroSchema::Null))
-        })
+        .enumerate()
+        .filter(|(_, v)| !matches!(resolve_avro_ref(v, defs), AvroSchema::Null));
+    match (non_null.next(), non_null.next()) {
+        (Some((i, _)), None) => Some(i),
+        _ => None,
+    }
+}
+
+/// A CEL integer as an Avro `int`, or a rule error naming the value.
+fn narrow_int(v: i64) -> Result<i32, SerdeError> {
+    i32::try_from(v).map_err(|_| SerdeError::Rule(format!("Value {v} out of range for INT field")))
+}
+
+/// A CEL unsigned integer as an Avro `long`, or a rule error naming the value.
+fn narrow_long(v: u64) -> Result<i64, SerdeError> {
+    i64::try_from(v).map_err(|_| SerdeError::Rule(format!("Value {v} out of range for LONG field")))
 }
 
 /// Whether `value` can be written as `schema`.
@@ -1169,7 +1192,8 @@ fn branch_accepts(
         (AvroSchema::Boolean, Value::Bool(_)) => true,
         (AvroSchema::Int, Value::Int(v)) => i32::try_from(*v).is_ok(),
         (AvroSchema::Int, Value::UInt(v)) => i32::try_from(*v).is_ok(),
-        (AvroSchema::Long, Value::Int(_) | Value::UInt(_)) => true,
+        (AvroSchema::Long, Value::Int(_)) => true,
+        (AvroSchema::Long, Value::UInt(v)) => i64::try_from(*v).is_ok(),
         // The reference's FLOAT/DOUBLE case is `value instanceof Number`, which an integer
         // satisfies too, so a widened CEL int resolves to a float branch declared ahead of a long.
         (
