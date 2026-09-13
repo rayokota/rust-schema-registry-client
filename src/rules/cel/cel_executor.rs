@@ -298,6 +298,12 @@ fn from_avro_value(value: &apache_avro::types::Value) -> Value {
         // Canonical text, which is the string-backed form and the only one derivable without a
         // schema; `from_avro_value_with_schema` gives the byte-backed forms their 16 bytes.
         apache_avro::types::Value::Uuid(u) => Value::String(Arc::new(u.to_string())),
+        // A duration is a fixed(12) with a logical type, and the reference reads it as one: Avro
+        // has no Java conversion for `duration`, so it arrives as a GenericFixed and
+        // `toCelValue` wraps it as bytes.
+        apache_avro::types::Value::Duration(d) => {
+            Value::Bytes(Arc::new(<[u8; 12]>::from(*d).to_vec()))
+        }
         apache_avro::types::Value::Null => Value::Null,
         _ => Value::Null,
     }
@@ -1116,6 +1122,12 @@ fn to_avro_value_with_schema(
         {
             Ok(AV::Fixed(f.size, (**v).clone()))
         }
+        // The reference's FIXED case takes raw bytes of the declared width whatever the logical
+        // type, and a duration is a fixed(12).
+        (AvroSchema::Duration(_), Value::Bytes(v)) if v.len() == 12 => {
+            let bytes: [u8; 12] = v[..].try_into().expect("length checked by the guard");
+            Ok(AV::Duration(apache_avro::Duration::from(bytes)))
+        }
         // Unions are transparent in CEL, so pick the variant matching the result's kind and
         // recurse into it (handles the common `[null, T]` nullable field).
         (AvroSchema::Union(u), _) => {
@@ -1273,6 +1285,7 @@ fn branch_accepts(
         (AvroSchema::Fixed(f), Value::Bytes(b)) => b.len() == f.size,
         (AvroSchema::Uuid(UuidSchema::Bytes), Value::Bytes(b)) => b.len() == 16,
         (AvroSchema::Uuid(UuidSchema::Fixed(f)), Value::Bytes(b)) => f.size == 16 && b.len() == 16,
+        (AvroSchema::Duration(_), Value::Bytes(b)) => b.len() == 12,
         (AvroSchema::Array(_), Value::List(_)) => true,
         (AvroSchema::Map(_) | AvroSchema::Record(_), Value::Map(_)) => true,
         // Same source as the conversion's, so accept and produce cannot drift apart here.

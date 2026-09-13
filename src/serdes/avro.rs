@@ -16,7 +16,7 @@ use crate::serdes::validation_rule::{
     ValidationRulesExecution, ValidationSchema, append_validation_path, evaluate_validation_rule,
     parse_validation_rules, raise_validation_violations,
 };
-use apache_avro::schema::{Name, RecordField, RecordSchema, UnionSchema};
+use apache_avro::schema::{Name, NamesRef, RecordField, RecordSchema, ResolvedSchema, UnionSchema};
 use apache_avro::types::Value;
 use async_recursion::async_recursion;
 use dashmap::DashMap;
@@ -363,7 +363,13 @@ async fn transform_fields(
     if let Some(SerdeSchema::Avro((s, named))) = ctx.parsed_target.clone()
         && let SerdeValue::Avro(v) = value
     {
-        let value = transform(ctx, &s, &named, v).await?;
+        // The names every `Schema::Ref` in the tree resolves against, built once. An
+        // unresolvable schema yields an empty map rather than an error: the walk then behaves as
+        // it did before, and the serializer reports the unresolved reference itself.
+        let resolved = ResolvedSchema::try_from(schemata_with_root(&s, &named)).ok();
+        let empty = NamesRef::new();
+        let names = resolved.as_ref().map_or(&empty, |r| r.get_names());
+        let value = transform(ctx, &s, names, v).await?;
         return Ok(SerdeValue::Avro(value));
     }
     Ok(value.clone())
@@ -757,10 +763,20 @@ fn schemata_with_root<'a>(
 async fn transform(
     ctx: &mut RuleContext,
     schema: &apache_avro::Schema,
-    named_schemas: &[apache_avro::Schema],
+    names: &NamesRef<'_>,
     message: &Value,
 ) -> Result<Value, SerdeError> {
     match schema {
+        // apache-avro leaves a named reference unresolved in the parsed tree, so a record
+        // reached through a *second* use of a named type stopped here: the walk saw no record
+        // to descend into and the leaf path found a non-primitive, so no rule ran inside it.
+        // Every other client's library resolves the name at parse time, and Go, whose does not,
+        // unwraps its `RefSchema` in the same place.
+        apache_avro::Schema::Ref { name } => {
+            if let Some(resolved) = names.get(name) {
+                return transform(ctx, resolved, names, message).await;
+            }
+        }
         apache_avro::Schema::Union(union) => {
             // A `Value::Union` carries its branch index, and that index is authoritative:
             // `resolve_union` matches structurally, and a `Value::Record` does not record
@@ -772,7 +788,7 @@ async fn transform(
                 let Some(subschema) = union.variants().get(*index as usize) else {
                     return Ok(message.clone());
                 };
-                let result = transform(ctx, subschema, named_schemas, inner).await?;
+                let result = transform(ctx, subschema, names, inner).await?;
                 // A condition's result is a verdict on the field, not a replacement for it, so
                 // it does not belong inside the union: re-wrapping hid the bare
                 // `Value::Boolean(false)` that the record-field check tests for, and every
@@ -800,14 +816,14 @@ async fn transform(
             if subschema.is_none() {
                 return Ok(message.clone());
             }
-            let result = transform(ctx, subschema.unwrap().1, named_schemas, message).await?;
+            let result = transform(ctx, subschema.unwrap().1, names, message).await?;
             return Ok(result);
         }
         apache_avro::Schema::Array(array) => {
             if let Value::Array(items) = message {
                 let mut result = Vec::with_capacity(items.len());
                 for item in items {
-                    let item = transform(ctx, &array.items, named_schemas, item).await?;
+                    let item = transform(ctx, &array.items, names, item).await?;
                     result.push(item);
                 }
                 return Ok(Value::Array(result));
@@ -817,7 +833,7 @@ async fn transform(
             if let Value::Map(values) = message {
                 let mut result: HashMap<String, Value> = HashMap::with_capacity(values.len());
                 for (key, value) in values {
-                    let value = transform(ctx, &map.types, named_schemas, value).await?;
+                    let value = transform(ctx, &map.types, names, value).await?;
                     result.insert(key.clone(), value);
                 }
                 return Ok(Value::Map(result));
@@ -827,8 +843,7 @@ async fn transform(
             if let Value::Record(fields) = message {
                 let mut result = Vec::with_capacity(fields.len());
                 for field in fields {
-                    let field =
-                        transform_field_with_ctx(ctx, record, named_schemas, field, fields).await?;
+                    let field = transform_field_with_ctx(ctx, record, names, field, fields).await?;
                     result.push(field);
                 }
                 return Ok(Value::Record(result));
@@ -867,7 +882,7 @@ async fn transform(
 async fn transform_field_with_ctx(
     ctx: &mut RuleContext,
     schema: &RecordSchema,
-    named_schemas: &[apache_avro::Schema],
+    names: &NamesRef<'_>,
     field: &(String, Value),
     message: &[(String, Value)],
 ) -> Result<(String, Value), SerdeError> {
@@ -897,7 +912,7 @@ async fn transform_field_with_ctx(
             Vec::new(),
         ))),
     );
-    let new_value = transform(ctx, &field_schema.schema, named_schemas, &field.1).await?;
+    let new_value = transform(ctx, &field_schema.schema, names, &field.1).await?;
     if let Some(Kind::Condition) = ctx.rule.kind
         && let Value::Boolean(b) = new_value
         && !b
@@ -2075,6 +2090,13 @@ mod tests {
                 r#"{"type":"long","logicalType":"timestamp-millis"}"#,
                 Value::TimestampMillis(123),
             ),
+            (
+                "duration",
+                r#"{"type":"fixed","name":"D","size":12,"logicalType":"duration"}"#,
+                Value::Duration(apache_avro::Duration::from([
+                    1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0,
+                ])),
+            ),
         ] {
             let schema_str = format!(
                 r#"{{"type":"record","name":"U","fields":[{{"name":"u","type":["null",{field}]}},{{"name":"label","type":"string"}}]}}"#
@@ -2736,6 +2758,44 @@ mod tests {
             AvroDeserializer::new(&client, Some(rule_registry), DeserializerConfig::default())
                 .unwrap();
         deser.deserialize(&ser_ctx, &bytes).await
+    }
+
+    /// A field rule reaches inside a record that arrives through a *named reference*.
+    ///
+    /// apache-avro leaves a `Schema::Ref` unresolved in the parsed tree, and the walk had no arm
+    /// for one: a record reached through a second use of a named type fell to the leaf path,
+    /// where it is not primitive, so no rule ran anywhere inside it. The first, inline use of
+    /// the same record worked, which is what made it look like a rule-matching problem rather
+    /// than a walk one. Every other client's library resolves the name at parse time; Go, whose
+    /// does not, unwraps its `RefSchema` in the same place.
+    #[tokio::test]
+    async fn test_a_field_rule_reaches_inside_a_referenced_record() {
+        let schema_str = r#"{"type":"record","name":"Outer","fields":[
+            {"name":"inline","type":{"type":"record","name":"Inner","fields":[{"name":"s","type":"string"}]}},
+            {"name":"referenced","type":"Inner"},
+            {"name":"plain","type":"string"}]}"#;
+        let inner = |v: &str| Record(vec![("s".to_string(), Value::String(v.to_string()))]);
+        let out = serialize_with_cel_field_transform(
+            schema_str,
+            "value + '!'",
+            vec![
+                ("inline".to_string(), inner("a")),
+                ("referenced".to_string(), inner("b")),
+                ("plain".to_string(), Value::String("c".to_string())),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let Record(fields) = out.value else {
+            panic!("expected a record");
+        };
+        let field_of = |n: &str| fields.iter().find(|(k, _)| k == n).unwrap().1.clone();
+        // The inline use is the control: it was already working, so a failure on both would mean
+        // the rule stopped running rather than that the reference is unreachable.
+        assert_eq!(field_of("inline"), inner("a!"));
+        assert_eq!(field_of("referenced"), inner("b!"));
+        assert_eq!(field_of("plain"), Value::String("c!".to_string()));
     }
 
     #[tokio::test]
