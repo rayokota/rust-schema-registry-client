@@ -16,7 +16,7 @@ use crate::serdes::validation_rule::{
     ValidationRulesExecution, ValidationSchema, append_validation_path, evaluate_validation_rule,
     parse_validation_rules, raise_validation_violations,
 };
-use apache_avro::schema::{Name, RecordField, RecordSchema, UnionSchema};
+use apache_avro::schema::{Name, NamesRef, RecordField, RecordSchema, ResolvedSchema, UnionSchema};
 use apache_avro::types::Value;
 use async_recursion::async_recursion;
 use dashmap::DashMap;
@@ -192,7 +192,7 @@ impl<'a, T: Client + Sync> AvroSerializer<'a, T> {
             }
         } else {
             apache_avro::writer::datum::GenericDatumWriter::builder(&schema_tuple.0)
-                .schemata(schema_tuple.1.iter().collect())?
+                .schemata(schemata_with_root(&schema_tuple.0, &schema_tuple.1))?
                 .build()?
                 .write_value_to_vec(value)?
         };
@@ -363,7 +363,13 @@ async fn transform_fields(
     if let Some(SerdeSchema::Avro((s, named))) = ctx.parsed_target.clone()
         && let SerdeValue::Avro(v) = value
     {
-        let value = transform(ctx, &s, &named, v).await?;
+        // The names every `Schema::Ref` in the tree resolves against, built once. An
+        // unresolvable schema yields an empty map rather than an error: the walk then behaves as
+        // it did before, and the serializer reports the unresolved reference itself.
+        let resolved = ResolvedSchema::try_from(schemata_with_root(&s, &named)).ok();
+        let empty = NamesRef::new();
+        let names = resolved.as_ref().map_or(&empty, |r| r.get_names());
+        let value = transform(ctx, &s, names, v).await?;
         return Ok(SerdeValue::Avro(value));
     }
     Ok(value.clone())
@@ -523,7 +529,7 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
                 Value::Bytes(data.to_vec())
             } else {
                 apache_avro::reader::datum::GenericDatumReader::builder(&writer_schema)
-                    .writer_schemata(writer_named.iter().collect())?
+                    .writer_schemata(schemata_with_root(&writer_schema, &writer_named))?
                     .build()?
                     .read_value(&mut reader)?
             };
@@ -553,7 +559,7 @@ impl<'a, T: Client + Sync> AvroDeserializer<'a, T> {
                 // decimal small enough to fit in fewer bytes than its precision allows - 12.34 in
                 // a precision-8 field - whichever client wrote the bytes.
                 apache_avro::reader::datum::GenericDatumReader::builder(&writer_schema)
-                    .writer_schemata(writer_named.iter().collect())?
+                    .writer_schemata(schemata_with_root(&writer_schema, &writer_named))?
                     .build()?
                     .read_value(&mut reader)?
             };
@@ -741,14 +747,36 @@ where
     Ok(())
 }
 
+/// The schema list handed to apache-avro's reader/writer. `schemata` *replaces* the default
+/// root-derived resolution rather than adding to it, so the root has to be in the list or a
+/// `Schema::Ref` to a type the root itself declares - a named type used twice - stays unresolved.
+/// Entries resolve in order against the ones before them, so the root goes last, after the
+/// referenced schemas `resolve_named_schema` already emitted in dependency order.
+fn schemata_with_root<'a>(
+    root: &'a apache_avro::Schema,
+    named: &'a [apache_avro::Schema],
+) -> Vec<&'a apache_avro::Schema> {
+    named.iter().chain(std::iter::once(root)).collect()
+}
+
 #[async_recursion]
 async fn transform(
     ctx: &mut RuleContext,
     schema: &apache_avro::Schema,
-    named_schemas: &[apache_avro::Schema],
+    names: &NamesRef<'_>,
     message: &Value,
 ) -> Result<Value, SerdeError> {
     match schema {
+        // apache-avro leaves a named reference unresolved in the parsed tree, so a record
+        // reached through a *second* use of a named type stopped here: the walk saw no record
+        // to descend into and the leaf path found a non-primitive, so no rule ran inside it.
+        // Every other client's library resolves the name at parse time, and Go, whose does not,
+        // unwraps its `RefSchema` in the same place.
+        apache_avro::Schema::Ref { name } => {
+            if let Some(resolved) = names.get(name) {
+                return transform(ctx, resolved, names, message).await;
+            }
+        }
         apache_avro::Schema::Union(union) => {
             // A `Value::Union` carries its branch index, and that index is authoritative:
             // `resolve_union` matches structurally, and a `Value::Record` does not record
@@ -760,7 +788,7 @@ async fn transform(
                 let Some(subschema) = union.variants().get(*index as usize) else {
                     return Ok(message.clone());
                 };
-                let result = transform(ctx, subschema, named_schemas, inner).await?;
+                let result = transform(ctx, subschema, names, inner).await?;
                 // A condition's result is a verdict on the field, not a replacement for it, so
                 // it does not belong inside the union: re-wrapping hid the bare
                 // `Value::Boolean(false)` that the record-field check tests for, and every
@@ -788,14 +816,14 @@ async fn transform(
             if subschema.is_none() {
                 return Ok(message.clone());
             }
-            let result = transform(ctx, subschema.unwrap().1, named_schemas, message).await?;
+            let result = transform(ctx, subschema.unwrap().1, names, message).await?;
             return Ok(result);
         }
         apache_avro::Schema::Array(array) => {
             if let Value::Array(items) = message {
                 let mut result = Vec::with_capacity(items.len());
                 for item in items {
-                    let item = transform(ctx, &array.items, named_schemas, item).await?;
+                    let item = transform(ctx, &array.items, names, item).await?;
                     result.push(item);
                 }
                 return Ok(Value::Array(result));
@@ -805,7 +833,7 @@ async fn transform(
             if let Value::Map(values) = message {
                 let mut result: HashMap<String, Value> = HashMap::with_capacity(values.len());
                 for (key, value) in values {
-                    let value = transform(ctx, &map.types, named_schemas, value).await?;
+                    let value = transform(ctx, &map.types, names, value).await?;
                     result.insert(key.clone(), value);
                 }
                 return Ok(Value::Map(result));
@@ -815,8 +843,7 @@ async fn transform(
             if let Value::Record(fields) = message {
                 let mut result = Vec::with_capacity(fields.len());
                 for field in fields {
-                    let field =
-                        transform_field_with_ctx(ctx, record, named_schemas, field, fields).await?;
+                    let field = transform_field_with_ctx(ctx, record, names, field, fields).await?;
                     result.push(field);
                 }
                 return Ok(Value::Record(result));
@@ -855,7 +882,7 @@ async fn transform(
 async fn transform_field_with_ctx(
     ctx: &mut RuleContext,
     schema: &RecordSchema,
-    named_schemas: &[apache_avro::Schema],
+    names: &NamesRef<'_>,
     field: &(String, Value),
     message: &[(String, Value)],
 ) -> Result<(String, Value), SerdeError> {
@@ -885,7 +912,7 @@ async fn transform_field_with_ctx(
             Vec::new(),
         ))),
     );
-    let new_value = transform(ctx, &field_schema.schema, named_schemas, &field.1).await?;
+    let new_value = transform(ctx, &field_schema.schema, names, &field.1).await?;
     if let Some(Kind::Condition) = ctx.rule.kind
         && let Value::Boolean(b) = new_value
         && !b
@@ -1360,6 +1387,52 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
+    async fn test_reused_named_type() {
+        // A named type used twice parses as a `Schema::Ref` for the second use, which only
+        // resolves if the root is in the schema list handed to the writer and reader.
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let schema_str = r#"
+        {
+            "type": "record",
+            "name": "test",
+            "fields": [
+                {"name": "h1", "type": {"type": "record", "name": "Helper",
+                    "fields": [{"name": "x", "type": "int"}]}},
+                {"name": "h2", "type": "Helper"}
+            ]
+        }
+        "#;
+        let schema = Schema {
+            schema_type: Some("AVRO".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: None,
+            schema: schema_str.to_string(),
+        };
+        let helper = |n| Record(vec![("x".to_string(), Value::Int(n))]);
+        let fields = vec![("h1".to_string(), helper(1)), ("h2".to_string(), helper(2))];
+        let obj = Record(fields.clone());
+        let ser =
+            AvroSerializer::new(&client, Some(&schema), None, SerializerConfig::default()).unwrap();
+        let ser_ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Avro,
+            headers: None,
+        };
+        let bytes = ser.serialize(&ser_ctx, obj).await.unwrap();
+
+        let deser = AvroDeserializer::new(&client, None, DeserializerConfig::default()).unwrap();
+        let obj2 = deser.deserialize(&ser_ctx, &bytes).await.unwrap();
+        if let Record(v) = obj2.value {
+            assert_eq!(v, fields);
+        } else {
+            panic!("expected record")
+        }
+    }
+
+    #[tokio::test]
     async fn test_basic_serialization() {
         let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
         let client = MockSchemaRegistryClient::new(client_conf);
@@ -1651,6 +1724,529 @@ mod tests {
         }
     }
 
+    const MULTI_BRANCH_SCHEMA: &str = r#"
+    {
+        "type": "record",
+        "name": "U",
+        "fields": [{"name": "u", "type": ["string", "int"]}]
+    }
+    "#;
+
+    /// A message-level result lands on the union branch that *accepts* it, not on the first
+    /// non-null one.
+    ///
+    /// `union_variant_index` took the first non-null branch unconditionally - right for the
+    /// `[null, T]` nullable shape, wrong wherever the union offers a choice. An int result for
+    /// `["string", "int"]` went to the string branch and the writer refused the record with
+    /// "Value does not match schema", where the reference writes it to the int branch.
+    #[tokio::test]
+    async fn test_cel_message_result_picks_the_accepting_union_branch() {
+        for (name, expr, want) in [
+            (
+                "int takes the int branch",
+                r#"{"u": 7}"#,
+                Value::Union(1, Box::new(Value::Int(7))),
+            ),
+            (
+                "string still takes the string branch",
+                r#"{"u": "kept"}"#,
+                Value::Union(0, Box::new(Value::String("kept".to_string()))),
+            ),
+        ] {
+            let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+            let client = MockSchemaRegistryClient::new(client_conf);
+            let ser_conf = SerializerConfig::new(
+                false,
+                Some(SchemaSelector::LatestVersion),
+                true,
+                false,
+                HashMap::new(),
+            );
+            let rule = Rule {
+                name: "r".to_string(),
+                doc: None,
+                kind: Some(Kind::Transform),
+                mode: Some(Mode::Write),
+                r#type: "CEL".to_string(),
+                tags: None,
+                params: None,
+                expr: Some(expr.to_string()),
+                on_success: None,
+                on_failure: None,
+                disabled: None,
+            };
+            let schema = Schema {
+                schema_type: Some("AVRO".to_string()),
+                references: None,
+                metadata: None,
+                rule_set: Some(Box::new(RuleSet {
+                    migration_rules: None,
+                    domain_rules: Some(vec![rule]),
+                    encoding_rules: None,
+                    enable_at: None,
+                })),
+                schema: MULTI_BRANCH_SCHEMA.to_string(),
+            };
+            client
+                .register_schema("test-value", &schema, false)
+                .await
+                .unwrap();
+            let rule_registry = RuleRegistry::new();
+            rule_registry.register_executor(CelExecutor::new());
+            let ser =
+                AvroSerializer::new(&client, None, Some(rule_registry.clone()), ser_conf).unwrap();
+            let ser_ctx = SerializationContext {
+                topic: "test".to_string(),
+                serde_type: SerdeType::Value,
+                serde_format: SerdeFormat::Avro,
+                headers: None,
+            };
+            let obj = Record(vec![(
+                "u".to_string(),
+                Value::Union(0, Box::new(Value::String("a".to_string()))),
+            )]);
+            let bytes = ser
+                .serialize(&ser_ctx, obj)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let deser =
+                AvroDeserializer::new(&client, Some(rule_registry), DeserializerConfig::default())
+                    .unwrap();
+            let Record(fields) = deser.deserialize(&ser_ctx, &bytes).await.unwrap().value else {
+                panic!("{name}: expected a record");
+            };
+            let (_, v) = fields.iter().find(|(n, _)| n == "u").unwrap();
+            assert_eq!(*v, want, "{name}");
+        }
+    }
+
+    /// Runs a message-level CEL transform and reports whether the record serialized.
+    async fn message_transform_ok(schema_str: &str, expr: &str, seed: Value) -> bool {
+        message_transform_err(schema_str, expr, seed)
+            .await
+            .is_none()
+    }
+
+    /// The same, returning the failure text so a test can pin which layer refused the record.
+    async fn message_transform_err(schema_str: &str, expr: &str, seed: Value) -> Option<String> {
+        let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+        let client = MockSchemaRegistryClient::new(client_conf);
+        let ser_conf = SerializerConfig::new(
+            false,
+            Some(SchemaSelector::LatestVersion),
+            true,
+            false,
+            HashMap::new(),
+        );
+        let rule = Rule {
+            name: "r".to_string(),
+            doc: None,
+            kind: Some(Kind::Transform),
+            mode: Some(Mode::Write),
+            r#type: "CEL".to_string(),
+            tags: None,
+            params: None,
+            expr: Some(expr.to_string()),
+            on_success: None,
+            on_failure: None,
+            disabled: None,
+        };
+        let schema = Schema {
+            schema_type: Some("AVRO".to_string()),
+            references: None,
+            metadata: None,
+            rule_set: Some(Box::new(RuleSet {
+                migration_rules: None,
+                domain_rules: Some(vec![rule]),
+                encoding_rules: None,
+                enable_at: None,
+            })),
+            schema: schema_str.to_string(),
+        };
+        client
+            .register_schema("test-value", &schema, false)
+            .await
+            .unwrap();
+        let reg = RuleRegistry::new();
+        reg.register_executor(CelExecutor::new());
+        let ser = AvroSerializer::new(&client, None, Some(reg), ser_conf).unwrap();
+        let ctx = SerializationContext {
+            topic: "test".to_string(),
+            serde_type: SerdeType::Value,
+            serde_format: SerdeFormat::Avro,
+            headers: None,
+        };
+        ser.serialize(&ctx, Record(vec![("u".to_string(), seed)]))
+            .await
+            .err()
+            .map(|e| format!("{e:?}"))
+    }
+
+    /// An integer too wide for the field it is written to is refused, not truncated.
+    ///
+    /// The cast was `*v as i32`, and a union made it reachable without any branch accepting the
+    /// value: `branch_accepts` range-checks an int branch, but a value nothing accepted still
+    /// fell back to the first non-null branch, so 2147483648 for `["int", "string"]` was written
+    /// as -2147483648. The reference range-checks in `narrowToInt` and throws
+    /// `UnresolvedUnionException` when no branch accepts.
+    #[tokio::test]
+    async fn test_an_out_of_range_int_result_is_refused() {
+        const UNION: &str =
+            r#"{"type":"record","name":"U","fields":[{"name":"u","type":["int","string"]}]}"#;
+        const PLAIN: &str = r#"{"type":"record","name":"U","fields":[{"name":"u","type":"int"}]}"#;
+        let union_seed = || Value::Union(0, Box::new(Value::Int(1)));
+
+        assert!(
+            !message_transform_ok(UNION, r#"{"u": 2147483648}"#, union_seed()).await,
+            "an out-of-range int was written to the int branch anyway"
+        );
+        assert!(
+            !message_transform_ok(PLAIN, r#"{"u": 2147483648}"#, Value::Int(1)).await,
+            "an out-of-range int was truncated into the field"
+        );
+        // The twins: the same rule one below the boundary still serializes, so the two above
+        // cannot be passing because the transform stopped working.
+        assert!(message_transform_ok(UNION, r#"{"u": 2147483647}"#, union_seed()).await);
+        assert!(message_transform_ok(PLAIN, r#"{"u": 2147483647}"#, Value::Int(1)).await);
+    }
+
+    /// A result no branch of a multi-branch union accepts is refused rather than forced onto one.
+    ///
+    /// The reference throws `UnresolvedUnionException`; a union with a single non-null branch
+    /// keeps the old fallback, as JS does, since that branch cannot be mis-selected.
+    #[tokio::test]
+    async fn test_a_result_no_union_branch_accepts_is_refused() {
+        // Pinned on the message, not just on failure: forcing the value onto the first branch
+        // also failed, but from inside apache-avro and without naming the union.
+        let err = message_transform_err(
+            r#"{"type":"record","name":"U","fields":[{"name":"u","type":["int","boolean"]}]}"#,
+            r#"{"u": "text"}"#,
+            Value::Union(0, Box::new(Value::Int(1))),
+        )
+        .await
+        .expect("a string was forced onto a numeric branch");
+        assert!(
+            err.contains("does not match any branch of union"),
+            "refused by the writer rather than by branch resolution: {err}"
+        );
+        assert!(
+            message_transform_ok(
+                r#"{"type":"record","name":"U","fields":[{"name":"u","type":["int","string"]}]}"#,
+                r#"{"u": "text"}"#,
+                Value::Union(0, Box::new(Value::Int(1)))
+            )
+            .await
+        );
+    }
+
+    /// An integer result reaches Avro's integer-backed logical types.
+    ///
+    /// The reference accepts a plain integer at a `date` or `timestamp-millis` branch before it
+    /// looks at the logical type at all - `branchAccepts` switches on the *base* type, INT or
+    /// LONG. apache-avro hoists each logical type into its own `Schema` variant, so the
+    /// schema-driven arms matched none of them: a rule returning an integer for a `date`,
+    /// `time-millis`, `timestamp-nanos` or `local-timestamp-nanos` field was refused outright,
+    /// and every one of them was unreachable inside a union.
+    #[tokio::test]
+    async fn test_integer_result_reaches_an_integer_backed_logical_type() {
+        const TYPES: [&str; 9] = [
+            r#"{"type":"int","logicalType":"date"}"#,
+            r#"{"type":"int","logicalType":"time-millis"}"#,
+            r#"{"type":"long","logicalType":"time-micros"}"#,
+            r#"{"type":"long","logicalType":"timestamp-millis"}"#,
+            r#"{"type":"long","logicalType":"timestamp-micros"}"#,
+            r#"{"type":"long","logicalType":"timestamp-nanos"}"#,
+            r#"{"type":"long","logicalType":"local-timestamp-millis"}"#,
+            r#"{"type":"long","logicalType":"local-timestamp-micros"}"#,
+            r#"{"type":"long","logicalType":"local-timestamp-nanos"}"#,
+        ];
+        for field in TYPES {
+            // Bare, then in a union where nothing else could have been selected by accident.
+            for shape in [field.to_string(), format!(r#"[{field},"string"]"#)] {
+                let schema = format!(
+                    r#"{{"type":"record","name":"U","fields":[{{"name":"u","type":{shape}}}]}}"#
+                );
+                // The seed is a string so that a union arrives on the *other* branch: the
+                // result has to move it, which is what the old code could not do.
+                let seed = if shape.starts_with('[') {
+                    Value::Union(1, Box::new(Value::String("x".to_string())))
+                } else {
+                    Value::Long(1)
+                };
+                if let Some(err) = message_transform_err(&schema, r#"{"u": 20000}"#, seed).await {
+                    panic!("{shape}: {err}");
+                }
+            }
+        }
+    }
+
+    /// The range check reaches them too, and names the width the *field* has rather than an
+    /// intermediate one - a CEL uint is checked against int, not against long first.
+    #[tokio::test]
+    async fn test_an_out_of_range_integer_names_the_fields_width() {
+        for (field, expr) in [
+            (
+                r#"{"type":"int","logicalType":"date"}"#,
+                r#"{"u": 2147483648}"#,
+            ),
+            ("\"int\"", r#"{"u": uint("18446744073709551615")}"#),
+        ] {
+            let schema = format!(
+                r#"{{"type":"record","name":"U","fields":[{{"name":"u","type":{field}}}]}}"#
+            );
+            let err = message_transform_err(&schema, expr, Value::Int(1))
+                .await
+                .unwrap_or_else(|| panic!("{field}: an out-of-range integer was accepted"));
+            assert!(err.contains("out of range for INT field"), "{field}: {err}");
+        }
+    }
+
+    /// A 16-byte result reaches a uuid backed by bytes or by fixed.
+    ///
+    /// The reference's BYTES and FIXED cases accept raw bytes of the declared width whatever the
+    /// logical type; apache-avro's `Schema::Uuid` variant took neither, so only a union with one
+    /// non-null branch worked - by falling through to the input-shaped conversion rather than by
+    /// resolving.
+    #[tokio::test]
+    async fn test_byte_result_reaches_a_byte_backed_uuid() {
+        for field in [
+            r#"{"type":"fixed","name":"F","size":16,"logicalType":"uuid"}"#,
+            r#"{"type":"bytes","logicalType":"uuid"}"#,
+        ] {
+            let schema = format!(
+                r#"{{"type":"record","name":"U","fields":[{{"name":"u","type":[{field},"string"]}}]}}"#
+            );
+            let seed = Value::Union(1, Box::new(Value::String("x".to_string())));
+            if let Some(err) =
+                message_transform_err(&schema, r#"{"u": b"0123456789abcdef"}"#, seed).await
+            {
+                panic!("{field}: {err}");
+            }
+        }
+    }
+
+    /// Every Avro logical type survives an identity transform, and reaches the rule as a value.
+    ///
+    /// D49 gave the write side arms for the logical types apache-avro hoists into their own
+    /// `Schema` variants. The read side still had none: `from_avro_value`'s trailing arm turned
+    /// `Date`, `TimeMillis`, `TimeMicros`, the three local timestamps and `Uuid` into CEL **null**,
+    /// so a rule saw the field as absent and echoing it erased it. Only decimal and the three
+    /// timestamps had arms. The reference binds the library's own value (a `LocalDate`, a `UUID`)
+    /// and C++ states the rule the others follow: everything but decimal and the timestamps is
+    /// the plain int, long or string it is encoded as.
+    ///
+    /// The sibling `label` field is the discriminator - an echoed value that came back intact
+    /// would look the same whether the rule ran or not.
+    #[tokio::test]
+    async fn test_every_logical_type_survives_an_identity_transform() {
+        for (name, field, seed) in [
+            (
+                "uuid-string",
+                r#"{"type":"string","logicalType":"uuid"}"#,
+                Value::Uuid(uuid::Uuid::nil()),
+            ),
+            (
+                "uuid-fixed",
+                r#"{"type":"fixed","name":"F","size":16,"logicalType":"uuid"}"#,
+                Value::Uuid(uuid::Uuid::nil()),
+            ),
+            (
+                "uuid-bytes",
+                r#"{"type":"bytes","logicalType":"uuid"}"#,
+                Value::Uuid(uuid::Uuid::nil()),
+            ),
+            (
+                "date",
+                r#"{"type":"int","logicalType":"date"}"#,
+                Value::Date(20000),
+            ),
+            (
+                "time-millis",
+                r#"{"type":"int","logicalType":"time-millis"}"#,
+                Value::TimeMillis(123),
+            ),
+            (
+                "time-micros",
+                r#"{"type":"long","logicalType":"time-micros"}"#,
+                Value::TimeMicros(123),
+            ),
+            (
+                "local-timestamp-millis",
+                r#"{"type":"long","logicalType":"local-timestamp-millis"}"#,
+                Value::LocalTimestampMillis(123),
+            ),
+            (
+                "local-timestamp-micros",
+                r#"{"type":"long","logicalType":"local-timestamp-micros"}"#,
+                Value::LocalTimestampMicros(123),
+            ),
+            (
+                "local-timestamp-nanos",
+                r#"{"type":"long","logicalType":"local-timestamp-nanos"}"#,
+                Value::LocalTimestampNanos(123),
+            ),
+            (
+                "timestamp-millis",
+                r#"{"type":"long","logicalType":"timestamp-millis"}"#,
+                Value::TimestampMillis(123),
+            ),
+            (
+                "duration",
+                r#"{"type":"fixed","name":"D","size":12,"logicalType":"duration"}"#,
+                Value::Duration(apache_avro::Duration::from([
+                    1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0,
+                ])),
+            ),
+        ] {
+            let schema_str = format!(
+                r#"{{"type":"record","name":"U","fields":[{{"name":"u","type":["null",{field}]}},{{"name":"label","type":"string"}}]}}"#
+            );
+            let client_conf = ClientConfig::new(vec!["mock://".to_string()]);
+            let client = MockSchemaRegistryClient::new(client_conf);
+            let rule = Rule {
+                name: "r".to_string(),
+                doc: None,
+                kind: Some(Kind::Transform),
+                mode: Some(Mode::Write),
+                r#type: "CEL".to_string(),
+                tags: None,
+                params: None,
+                expr: Some(
+                    r#"{"u": message.u, "label": message.u == null ? "IS-NULL" : "NOT-NULL"}"#
+                        .to_string(),
+                ),
+                on_success: None,
+                on_failure: None,
+                disabled: None,
+            };
+            let schema = Schema {
+                schema_type: Some("AVRO".to_string()),
+                references: None,
+                metadata: None,
+                rule_set: Some(Box::new(RuleSet {
+                    migration_rules: None,
+                    domain_rules: Some(vec![rule]),
+                    encoding_rules: None,
+                    enable_at: None,
+                })),
+                schema: schema_str.to_string(),
+            };
+            client
+                .register_schema("test-value", &schema, false)
+                .await
+                .unwrap();
+            let reg = RuleRegistry::new();
+            reg.register_executor(CelExecutor::new());
+            let ser = AvroSerializer::new(
+                &client,
+                None,
+                Some(reg.clone()),
+                SerializerConfig::new(
+                    false,
+                    Some(SchemaSelector::LatestVersion),
+                    true,
+                    false,
+                    HashMap::new(),
+                ),
+            )
+            .unwrap();
+            let ser_ctx = SerializationContext {
+                topic: "test".to_string(),
+                serde_type: SerdeType::Value,
+                serde_format: SerdeFormat::Avro,
+                headers: None,
+            };
+            let obj = Record(vec![
+                ("u".to_string(), Value::Union(1, Box::new(seed.clone()))),
+                ("label".to_string(), Value::String("seed".to_string())),
+            ]);
+            let bytes = ser
+                .serialize(&ser_ctx, obj)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let deser =
+                AvroDeserializer::new(&client, Some(reg), DeserializerConfig::default()).unwrap();
+            let Record(fields) = deser.deserialize(&ser_ctx, &bytes).await.unwrap().value else {
+                panic!("{name}: expected a record");
+            };
+            let field_of = |n: &str| {
+                fields
+                    .iter()
+                    .find(|(k, _)| k == n)
+                    .map(|(_, v)| v.clone())
+                    .unwrap()
+            };
+            assert_eq!(
+                field_of("label"),
+                Value::String("NOT-NULL".to_string()),
+                "{name}: the field reached the rule as null"
+            );
+            assert_eq!(
+                field_of("u"),
+                Value::Union(1, Box::new(seed)),
+                "{name}: the echoed value did not survive"
+            );
+        }
+    }
+
+    /// What `branch_accepts` admits, `to_avro_value_with_schema` must be able to write.
+    ///
+    /// `branch_accepts` takes a CEL uint at a float or double branch, mirroring the reference's
+    /// `value instanceof Number`. The conversion had arms for Int but not UInt, so the value fell
+    /// through to the input-shaped fallback, came out a Long, and the writer refused the record.
+    /// JS and C++ cannot have this: both convert against the resolved branch with no input value
+    /// to shape from, where Rust's fallback consults the value the field already held.
+    #[tokio::test]
+    async fn test_unsigned_result_reaches_a_float_branch() {
+        for (name, schema_str) in [
+            (
+                "float",
+                r#"{"type":"record","name":"U","fields":[{"name":"u","type":["float","string"]}]}"#,
+            ),
+            (
+                "double",
+                r#"{"type":"record","name":"U","fields":[{"name":"u","type":["double","string"]}]}"#,
+            ),
+        ] {
+            assert!(
+                message_transform_ok(
+                    schema_str,
+                    r#"{"u": 7u}"#,
+                    Value::Union(1, Box::new(Value::String("a".to_string())))
+                )
+                .await,
+                "a uint result must be writable at the {name} branch it was accepted for"
+            );
+        }
+    }
+
+    /// A string reaches a *string-backed* uuid and no other, which is the reference's rule: its
+    /// STRING case takes any CharSequence whatever the logical type, and its FIXED case has no
+    /// string arm at all. apache-avro models uuid as its own schema variant rather than a logical
+    /// annotation, so this has to be said explicitly here where the other clients get it free.
+    #[tokio::test]
+    async fn test_string_reaches_only_the_string_backed_uuid() {
+        const UUID: &str = r#"{"u": "f81d4fae-7dec-11d0-a765-00a0c91e6bf6"}"#;
+        let seed = || Value::String("f81d4fae-7dec-11d0-a765-00a0c91e6bf6".to_string());
+        assert!(
+            message_transform_ok(
+                r#"{"type":"record","name":"U","fields":[{"name":"u","type":{"type":"string","logicalType":"uuid"}}]}"#,
+                UUID,
+                seed()
+            )
+            .await
+        );
+        assert!(
+            !message_transform_ok(
+                r#"{"type":"record","name":"U","fields":[{"name":"u","type":{"type":"fixed","name":"F","size":16,"logicalType":"uuid"}}]}"#,
+                UUID,
+                seed()
+            )
+            .await,
+            "a fixed-backed uuid wants 16 bytes; the reference does not accept a string there"
+        );
+    }
+
     /// Replace, not merge: the rule's map is the whole new record, so a field the rule does not
     /// name takes the schema's declared default rather than the value it had on the way in.
     ///
@@ -1935,6 +2531,87 @@ mod tests {
         ser.serialize(&ser_ctx, Record(fields)).await
     }
 
+    const NESTED_SCHEMA: &str = r#"
+    {
+        "type": "record",
+        "name": "Outer",
+        "fields": [
+            {"name": "inner", "type": {
+                "type": "record", "name": "Inner",
+                "fields": [
+                    {"name": "amount",
+                     "type": {"type":"bytes","logicalType":"decimal","precision":12,"scale":4}},
+                    {"name": "label", "type": "string", "confluent:tags": ["LABEL"]}
+                ]}}
+        ]
+    }
+    "#;
+
+    /// A value inside a *nested* record reaches a rule the way a root-level one does.
+    ///
+    /// `message_binding` converted against `parsed_target`, which describes only the root, so a
+    /// nested record matched none of its fields and its decimals stayed unscaled: `12.3400`
+    /// arrived as `123400`. The reference reads the schema off the record it was handed.
+    #[tokio::test]
+    async fn test_nested_record_reaches_a_rule_at_its_schema_scale() {
+        // 0x01E208 = 123400 unscaled, i.e. 12.3400 at scale 4.
+        let unscaled = || Value::Decimal(vec![0x01u8, 0xE2, 0x08].into());
+        let label_after =
+            |schema: &'static str, expr: &'static str, fields: Vec<(String, Value)>| async move {
+                let got = serialize_with_cel_field_transform(schema, expr, fields).await;
+                let Ok(Record(fields)) = got.map(|v| v.value) else {
+                    panic!("the transform failed");
+                };
+                fields.iter().find(|(n, _)| n == "inner").map_or_else(
+                    || match &fields.iter().find(|(n, _)| n == "label").unwrap().1 {
+                        Value::String(s) => s.clone(),
+                        other => panic!("label = {other:?}"),
+                    },
+                    |(_, v)| match v {
+                        Value::Record(inner) => {
+                            match &inner.iter().find(|(n, _)| n == "label").unwrap().1 {
+                                Value::String(s) => s.clone(),
+                                other => panic!("inner.label = {other:?}"),
+                            }
+                        }
+                        other => panic!("inner = {other:?}"),
+                    },
+                )
+            };
+
+        let inner = Value::Record(vec![
+            ("amount".to_string(), unscaled()),
+            ("label".to_string(), Value::String("usd".to_string())),
+        ]);
+        assert_eq!(
+            label_after(
+                NESTED_SCHEMA,
+                "name == 'label' ; string(message.amount)",
+                vec![("inner".to_string(), inner)]
+            )
+            .await,
+            "12.3400",
+            "a nested sibling decimal must arrive at its declared scale"
+        );
+
+        // The control that localises it: the same field on the root record always worked.
+        const FLAT_SCHEMA: &str = r#"{"type":"record","name":"Flat","fields":[
+            {"name":"amount","type":{"type":"bytes","logicalType":"decimal","precision":12,"scale":4}},
+            {"name":"label","type":"string","confluent:tags":["LABEL"]}]}"#;
+        assert_eq!(
+            label_after(
+                FLAT_SCHEMA,
+                "name == 'label' ; string(message.amount)",
+                vec![
+                    ("amount".to_string(), unscaled()),
+                    ("label".to_string(), Value::String("usd".to_string())),
+                ]
+            )
+            .await,
+            "12.3400"
+        );
+    }
+
     const DECIMAL_SCHEMA: &str = r#"
     {
         "type": "record",
@@ -2081,6 +2758,44 @@ mod tests {
             AvroDeserializer::new(&client, Some(rule_registry), DeserializerConfig::default())
                 .unwrap();
         deser.deserialize(&ser_ctx, &bytes).await
+    }
+
+    /// A field rule reaches inside a record that arrives through a *named reference*.
+    ///
+    /// apache-avro leaves a `Schema::Ref` unresolved in the parsed tree, and the walk had no arm
+    /// for one: a record reached through a second use of a named type fell to the leaf path,
+    /// where it is not primitive, so no rule ran anywhere inside it. The first, inline use of
+    /// the same record worked, which is what made it look like a rule-matching problem rather
+    /// than a walk one. Every other client's library resolves the name at parse time; Go, whose
+    /// does not, unwraps its `RefSchema` in the same place.
+    #[tokio::test]
+    async fn test_a_field_rule_reaches_inside_a_referenced_record() {
+        let schema_str = r#"{"type":"record","name":"Outer","fields":[
+            {"name":"inline","type":{"type":"record","name":"Inner","fields":[{"name":"s","type":"string"}]}},
+            {"name":"referenced","type":"Inner"},
+            {"name":"plain","type":"string"}]}"#;
+        let inner = |v: &str| Record(vec![("s".to_string(), Value::String(v.to_string()))]);
+        let out = serialize_with_cel_field_transform(
+            schema_str,
+            "value + '!'",
+            vec![
+                ("inline".to_string(), inner("a")),
+                ("referenced".to_string(), inner("b")),
+                ("plain".to_string(), Value::String("c".to_string())),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let Record(fields) = out.value else {
+            panic!("expected a record");
+        };
+        let field_of = |n: &str| fields.iter().find(|(k, _)| k == n).unwrap().1.clone();
+        // The inline use is the control: it was already working, so a failure on both would mean
+        // the rule stopped running rather than that the reference is unreachable.
+        assert_eq!(field_of("inline"), inner("a!"));
+        assert_eq!(field_of("referenced"), inner("b!"));
+        assert_eq!(field_of("plain"), Value::String("c!".to_string()));
     }
 
     #[tokio::test]

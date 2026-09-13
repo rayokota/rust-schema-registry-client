@@ -10,6 +10,7 @@ use crate::serdes::serde::{
 };
 use apache_avro::Schema as AvroSchema;
 use apache_avro::schema::Name as AvroName;
+use apache_avro::schema::UuidSchema;
 use async_trait::async_trait;
 use bigdecimal::BigDecimal;
 use bigdecimal::RoundingMode;
@@ -68,7 +69,18 @@ impl CelExecutor {
         if let SerdeValue::Avro(v) = msg {
             return match ctx.parsed_target.as_ref() {
                 Some(SerdeSchema::Avro((schema, named))) => {
-                    from_avro_value_with_schema(v, schema, &avro_definitions(schema, named))
+                    let defs = avro_definitions(schema, named);
+                    // The record this value actually *is*, which for a nested one is not the
+                    // root. apache-avro's Value::Record carries neither its schema nor its
+                    // name, so the name comes from the field context - `record.field` - and is
+                    // resolved against the target's named schemas, the way JS does it. A
+                    // message-level rule has no field context and converts against the root.
+                    let containing = ctx
+                        .current_field()
+                        .and_then(|f| containing_record_name(&f.full_name))
+                        .and_then(|n| AvroName::new(n).ok())
+                        .and_then(|n| defs.get(&n).copied());
+                    from_avro_value_with_schema(v, containing.unwrap_or(schema), &defs)
                 }
                 _ => from_avro_value(v),
             };
@@ -271,6 +283,27 @@ fn from_avro_value(value: &apache_avro::types::Value) -> Value {
             decimal_value(BigDecimal::new(BigInt::from(d.clone()), 0))
         }
         apache_avro::types::Value::Union(_, inner) => from_avro_value(inner),
+        // Avro's remaining logical types. apache-avro hoists each into its own variant, and the
+        // trailing arm below turned every one of them into CEL null - so a rule saw a date,
+        // time, local timestamp or uuid field as absent, and an identity transform erased it.
+        // They read as the plain int, long or string they are encoded as, which is the rule C++
+        // states: only decimal and the timestamps become semantic CEL values.
+        apache_avro::types::Value::Date(v) | apache_avro::types::Value::TimeMillis(v) => {
+            Value::Int(i64::from(*v))
+        }
+        apache_avro::types::Value::TimeMicros(v)
+        | apache_avro::types::Value::LocalTimestampMillis(v)
+        | apache_avro::types::Value::LocalTimestampMicros(v)
+        | apache_avro::types::Value::LocalTimestampNanos(v) => Value::Int(*v),
+        // Canonical text, which is the string-backed form and the only one derivable without a
+        // schema; `from_avro_value_with_schema` gives the byte-backed forms their 16 bytes.
+        apache_avro::types::Value::Uuid(u) => Value::String(Arc::new(u.to_string())),
+        // A duration is a fixed(12) with a logical type, and the reference reads it as one: Avro
+        // has no Java conversion for `duration`, so it arrives as a GenericFixed and
+        // `toCelValue` wraps it as bytes.
+        apache_avro::types::Value::Duration(d) => {
+            Value::Bytes(Arc::new(<[u8; 12]>::from(*d).to_vec()))
+        }
         apache_avro::types::Value::Null => Value::Null,
         _ => Value::Null,
     }
@@ -346,6 +379,10 @@ pub(crate) fn from_avro_value_with_schema(
             None => from_avro_value(inner),
         },
         // The only place the schema is load-bearing: the scale that a bare decimal lacks.
+        // A byte-backed uuid reads as its 16 bytes, which is what the writer takes back.
+        (AV::Uuid(u), AvroSchema::Uuid(UuidSchema::Bytes | UuidSchema::Fixed(_))) => {
+            Value::Bytes(Arc::new(u.as_bytes().to_vec()))
+        }
         (AV::Decimal(d), AvroSchema::Decimal(ds)) => {
             decimal_value(BigDecimal::new(BigInt::from(d.clone()), ds.scale as i64))
         }
@@ -359,6 +396,11 @@ fn avro_record_full_name(rs: &apache_avro::schema::RecordSchema) -> String {
         Some(ns) => format!("{ns}.{}", rs.name.name()),
         None => rs.name.name().to_string(),
     }
+}
+
+/// The record half of a field context's `record.field` full name.
+fn containing_record_name(full_name: &str) -> Option<&str> {
+    full_name.rsplit_once('.').map(|(record, _)| record)
 }
 
 /// Resolves a named `Schema::Ref` to its definition in `defs`; any other schema is returned as-is.
@@ -1034,6 +1076,58 @@ fn to_avro_value_with_schema(
             }
             Ok(AV::Map(out))
         }
+        // Scalars the *schema* decides, not the input. The fallback below shapes a number from
+        // whatever the field already held, which is right while the shape still applies and
+        // wrong the moment a union resolves to a different branch: an int result routed to an
+        // `int` branch came out as a Long and the writer refused the record. These mirror
+        // `branch_accepts` one for one, which is what keeps accept and produce in step.
+        // Narrowing is checked, as the reference's narrowToInt is ("Value 2147483648 out of range
+        // for INT field") and C++'s numericToAvro is. CEL has one integer width, so an unchecked
+        // cast is the difference between a rejected transform and a silently wrong record.
+        (AvroSchema::Int, Value::Int(v)) => Ok(AV::Int(narrow_int(i128::from(*v))?)),
+        (AvroSchema::Int, Value::UInt(v)) => Ok(AV::Int(narrow_int(i128::from(*v))?)),
+        (AvroSchema::Long, Value::Int(v)) => Ok(AV::Long(*v)),
+        (AvroSchema::Long, Value::UInt(v)) => Ok(AV::Long(narrow_long(i128::from(*v))?)),
+        (AvroSchema::Float, Value::Float(v)) => Ok(AV::Float(*v as f32)),
+        (AvroSchema::Float, Value::Int(v)) => Ok(AV::Float(*v as f32)),
+        (AvroSchema::Float, Value::UInt(v)) => Ok(AV::Float(*v as f32)),
+        (AvroSchema::Double, Value::Float(v)) => Ok(AV::Double(*v)),
+        (AvroSchema::Double, Value::Int(v)) => Ok(AV::Double(*v as f64)),
+        (AvroSchema::Double, Value::UInt(v)) => Ok(AV::Double(*v as f64)),
+        (AvroSchema::Boolean, Value::Bool(v)) => Ok(AV::Boolean(*v)),
+        // Only the *string-backed* uuid takes a string: the reference accepts a CharSequence at
+        // a STRING branch whatever its logical type, and its FIXED case has no string arm at all.
+        // A fixed- or bytes-backed uuid wants 16 bytes, which apache-avro checks and rejects.
+        (AvroSchema::String | AvroSchema::Uuid(UuidSchema::String), Value::String(v)) => {
+            Ok(AV::String(v.to_string()))
+        }
+        (AvroSchema::Enum(e), Value::String(v)) => {
+            match e.symbols.iter().position(|sym| sym == v.as_str()) {
+                Some(i) => Ok(AV::Enum(i as u32, v.to_string())),
+                None => Ok(AV::String(v.to_string())),
+            }
+        }
+        (AvroSchema::Bytes, Value::Bytes(v)) => Ok(AV::Bytes((**v).clone())),
+        (AvroSchema::Fixed(f), Value::Bytes(v)) if v.len() == f.size => {
+            Ok(AV::Fixed(f.size, (**v).clone()))
+        }
+        // The byte-backed uuids, which the reference takes at its BYTES and FIXED cases - both
+        // accept raw bytes of the declared width whatever the logical type. apache-avro wants
+        // exactly 16 either way.
+        (AvroSchema::Uuid(UuidSchema::Bytes), Value::Bytes(v)) if v.len() == 16 => {
+            Ok(AV::Bytes((**v).clone()))
+        }
+        (AvroSchema::Uuid(UuidSchema::Fixed(f)), Value::Bytes(v))
+            if f.size == 16 && v.len() == 16 =>
+        {
+            Ok(AV::Fixed(f.size, (**v).clone()))
+        }
+        // The reference's FIXED case takes raw bytes of the declared width whatever the logical
+        // type, and a duration is a fixed(12).
+        (AvroSchema::Duration(_), Value::Bytes(v)) if v.len() == 12 => {
+            let bytes: [u8; 12] = v[..].try_into().expect("length checked by the guard");
+            Ok(AV::Duration(apache_avro::Duration::from(bytes)))
+        }
         // Unions are transparent in CEL, so pick the variant matching the result's kind and
         // recurse into it (handles the common `[null, T]` nullable field).
         (AvroSchema::Union(u), _) => {
@@ -1054,16 +1148,33 @@ fn to_avro_value_with_schema(
                         )?),
                     ))
                 }
-                None => Ok(to_avro_value(input, value)),
+                // The reference's UnresolvedUnionException. Falling back to the loose conversion
+                // here produced a bare value for a union slot, which the writer then refused
+                // without naming the branch that was wrong.
+                None => Err(SerdeError::Rule(format!(
+                    "CEL result does not match any branch of union {variants:?}"
+                ))),
             }
         }
         // Primitives (and anything the schema does not inform) use the loose conversion.
-        _ => Ok(to_avro_value(input, value)),
+        _ => match integer_logical(schema, value) {
+            Some(converted) => converted,
+            None => Ok(to_avro_value(input, value)),
+        },
     }
 }
 
-/// Picks the union variant a CEL result belongs to: the `null` branch for null, otherwise the
-/// first non-null branch (the `[null, T]` nullable-field shape).
+/// Picks the union variant a CEL result belongs to: the `null` branch for null, else the first
+/// branch that accepts the value.
+///
+/// Picking the first non-null branch was all this did, which is the right answer for the
+/// `[null, T]` nullable shape and wrong for any union offering a real choice: an int result for
+/// `["string", "int"]` took the string branch. The reference resolves by value
+/// (`AvroResultWriter.branchAccepts`) and throws `UnresolvedUnionException` when nothing accepts,
+/// so a value no branch takes returns `None` here rather than being forced onto one.
+///
+/// The single-non-null-branch case keeps the old fallback, as JS's `pickAvroWriteBranch` does:
+/// that branch cannot be mis-selected, so a genuine mismatch is left to the writer to report.
 fn union_variant_index(
     variants: &[AvroSchema],
     value: &Value,
@@ -1074,9 +1185,112 @@ fn union_variant_index(
             .iter()
             .position(|v| matches!(resolve_avro_ref(v, defs), AvroSchema::Null));
     }
-    variants
+    if let Some(i) = variants.iter().position(|v| branch_accepts(v, value, defs)) {
+        return Some(i);
+    }
+    let mut non_null = variants
         .iter()
-        .position(|v| !matches!(resolve_avro_ref(v, defs), AvroSchema::Null))
+        .enumerate()
+        .filter(|(_, v)| !matches!(resolve_avro_ref(v, defs), AvroSchema::Null));
+    match (non_null.next(), non_null.next()) {
+        (Some((i, _)), None) => Some(i),
+        _ => None,
+    }
+}
+
+/// A CEL integer as an Avro `int`, or a rule error naming the value. Signed and unsigned CEL
+/// integers both arrive as an i128 so that a failure names the field's width rather than an
+/// intermediate one.
+fn narrow_int(v: i128) -> Result<i32, SerdeError> {
+    i32::try_from(v).map_err(|_| SerdeError::Rule(format!("Value {v} out of range for INT field")))
+}
+
+/// A CEL integer as an Avro `long`, or a rule error naming the value.
+fn narrow_long(v: i128) -> Result<i64, SerdeError> {
+    i64::try_from(v).map_err(|_| SerdeError::Rule(format!("Value {v} out of range for LONG field")))
+}
+
+/// Avro's integer-backed logical types written from a CEL integer, or `None` when the schema is
+/// not one of them or the value is not an integer.
+///
+/// The reference reaches these through the INT and LONG cases of `branchAccepts` and
+/// `narrowToInt`/`narrowToLong`, because there a logical type is a property of the base schema
+/// and a plain integer is accepted before the logical type is even consulted. apache-avro hoists
+/// each one into its own `Schema` variant instead, so they need matching here or a rule returning
+/// an integer for a `date` field has no arm at all.
+fn integer_logical(
+    schema: &AvroSchema,
+    value: &Value,
+) -> Option<Result<apache_avro::types::Value, SerdeError>> {
+    use apache_avro::types::Value as AV;
+    let v = match value {
+        Value::Int(v) => i128::from(*v),
+        Value::UInt(v) => i128::from(*v),
+        _ => return None,
+    };
+    Some(match schema {
+        AvroSchema::Date => narrow_int(v).map(AV::Date),
+        AvroSchema::TimeMillis => narrow_int(v).map(AV::TimeMillis),
+        AvroSchema::TimeMicros => narrow_long(v).map(AV::TimeMicros),
+        AvroSchema::TimestampMillis => narrow_long(v).map(AV::TimestampMillis),
+        AvroSchema::TimestampMicros => narrow_long(v).map(AV::TimestampMicros),
+        AvroSchema::TimestampNanos => narrow_long(v).map(AV::TimestampNanos),
+        AvroSchema::LocalTimestampMillis => narrow_long(v).map(AV::LocalTimestampMillis),
+        AvroSchema::LocalTimestampMicros => narrow_long(v).map(AV::LocalTimestampMicros),
+        AvroSchema::LocalTimestampNanos => narrow_long(v).map(AV::LocalTimestampNanos),
+        _ => return None,
+    })
+}
+
+/// Whether `value` can be written as `schema`.
+///
+/// The pairs here are exactly the ones [`to_avro_value_with_schema`] knows how to write, and they
+/// have to stay that way: an asymmetry between what a branch *accepts* and what the writer can
+/// *produce* is the one thing union resolution must not have. The CEL wrapper types are tested
+/// first because a Variant is a record and would otherwise match any record branch.
+fn branch_accepts(
+    schema: &AvroSchema,
+    value: &Value,
+    defs: &HashMap<AvroName, &AvroSchema>,
+) -> bool {
+    let schema = resolve_avro_ref(schema, defs);
+    match (schema, value) {
+        (AvroSchema::Null, Value::Null) => true,
+        (_, Value::Null) => false,
+        (AvroSchema::Decimal(_), Value::Opaque(o)) => o.runtime_type_name() == DECIMAL_TYPE_NAME,
+        (AvroSchema::Record(rs), Value::Opaque(o)) => {
+            o.runtime_type_name() == VARIANT_TYPE_NAME
+                && avro_record_full_name(rs) == VARIANT_TYPE_NAME
+        }
+        (_, Value::Opaque(_)) => false,
+        (
+            AvroSchema::TimestampMillis | AvroSchema::TimestampMicros | AvroSchema::TimestampNanos,
+            Value::Timestamp(_),
+        ) => true,
+        (_, Value::Timestamp(_)) => false,
+        (AvroSchema::Boolean, Value::Bool(_)) => true,
+        (AvroSchema::Int, Value::Int(v)) => narrow_int(i128::from(*v)).is_ok(),
+        (AvroSchema::Int, Value::UInt(v)) => narrow_int(i128::from(*v)).is_ok(),
+        (AvroSchema::Long, Value::Int(_)) => true,
+        (AvroSchema::Long, Value::UInt(v)) => narrow_long(i128::from(*v)).is_ok(),
+        // The reference's FLOAT/DOUBLE case is `value instanceof Number`, which an integer
+        // satisfies too, so a widened CEL int resolves to a float branch declared ahead of a long.
+        (
+            AvroSchema::Float | AvroSchema::Double,
+            Value::Float(_) | Value::Int(_) | Value::UInt(_),
+        ) => true,
+        (AvroSchema::String | AvroSchema::Uuid(UuidSchema::String), Value::String(_)) => true,
+        (AvroSchema::Enum(e), Value::String(s)) => e.symbols.iter().any(|sym| sym == s.as_str()),
+        (AvroSchema::Bytes, Value::Bytes(_)) => true,
+        (AvroSchema::Fixed(f), Value::Bytes(b)) => b.len() == f.size,
+        (AvroSchema::Uuid(UuidSchema::Bytes), Value::Bytes(b)) => b.len() == 16,
+        (AvroSchema::Uuid(UuidSchema::Fixed(f)), Value::Bytes(b)) => f.size == 16 && b.len() == 16,
+        (AvroSchema::Duration(_), Value::Bytes(b)) => b.len() == 12,
+        (AvroSchema::Array(_), Value::List(_)) => true,
+        (AvroSchema::Map(_) | AvroSchema::Record(_), Value::Map(_)) => true,
+        // Same source as the conversion's, so accept and produce cannot drift apart here.
+        _ => matches!(integer_logical(schema, value), Some(Ok(_))),
+    }
 }
 
 /// Converts a CEL result back to a protobuf value, shaped by the value the field already held.
