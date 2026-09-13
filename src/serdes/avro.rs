@@ -803,8 +803,12 @@ async fn transform(
                 // that changes the value's type is rejected under the old index. Keep the
                 // arriving branch while it still accepts the result, so two structurally
                 // identical variants are never swapped.
+                // Validated against the names map, not with `validate`: that one builds its own
+                // from the branch alone and *panics* ("Schemata didn't successfully resolve") on
+                // a branch that is a `Schema::Ref`, so a nullable field of a reused named type
+                // brought the process down rather than failing the rule.
                 let index = match union.variants().get(*index as usize) {
-                    Some(variant) if result.validate(variant) => *index,
+                    Some(variant) if result.validate_with_names(variant, names) => *index,
                     _ => resolve_union(union, &result)
                         .map(|(i, _)| i as u32)
                         .unwrap_or(*index),
@@ -2187,6 +2191,52 @@ mod tests {
                 "{name}: the echoed value did not survive"
             );
         }
+    }
+
+    /// A reused named type inside a union, an array and a map - the positions D54's fix reaches
+    /// through, plus the one that did not survive it.
+    ///
+    /// The nullable field *panicked*: the union write-back keeps the arriving branch while it
+    /// still accepts the result, and `Value::validate` builds its own names map from the branch
+    /// alone, which for a `Schema::Ref` resolves nothing and `expect`s - "Schemata didn't
+    /// successfully resolve". Validating against the walk's map instead answers the same question
+    /// without building a second one.
+    #[tokio::test]
+    async fn test_a_reused_name_inside_a_container_is_walked() {
+        let schema = r#"{"type":"record","name":"Outer","fields":[
+            {"name":"inline","type":{"type":"record","name":"Inner","fields":[{"name":"s","type":"string"}]}},
+            {"name":"opt","type":["null","Inner"]},
+            {"name":"items","type":{"type":"array","items":"Inner"}},
+            {"name":"lookup","type":{"type":"map","values":"Inner"}}]}"#;
+        let inner = |v: &str| Record(vec![("s".to_string(), Value::String(v.to_string()))]);
+        let out = serialize_with_cel_field_transform(
+            schema,
+            "value + '!'",
+            vec![
+                ("inline".to_string(), inner("a")),
+                ("opt".to_string(), Value::Union(1, Box::new(inner("b")))),
+                ("items".to_string(), Value::Array(vec![inner("c")])),
+                (
+                    "lookup".to_string(),
+                    Value::Map(HashMap::from([("k".to_string(), inner("d"))])),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let Record(fields) = out.value else {
+            panic!("expected a record");
+        };
+        let field_of = |n: &str| fields.iter().find(|(k, _)| k == n).unwrap().1.clone();
+        // The inline use is the control: it was reached before D54 and still is.
+        assert_eq!(field_of("inline"), inner("a!"));
+        assert_eq!(field_of("opt"), Value::Union(1, Box::new(inner("b!"))));
+        assert_eq!(field_of("items"), Value::Array(vec![inner("c!")]));
+        assert_eq!(
+            field_of("lookup"),
+            Value::Map(HashMap::from([("k".to_string(), inner("d!"))]))
+        );
     }
 
     /// What `branch_accepts` admits, `to_avro_value_with_schema` must be able to write.
